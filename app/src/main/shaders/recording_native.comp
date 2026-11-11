@@ -1,0 +1,109 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#define UNSPEKTRA_PREVIEW_SCALAR_SHADING 1
+#define UNSPEKTRA_PREVIEW_SHADING_REUSE 1
+#define UNSPEKTRA_RAW_UNPACK_PASS 1
+#define UNSPEKTRA_RAW_CELL_FULL 1
+#include "raw_input.glsl"
+#ifndef UNSPEKTRA_PREVIEW_LIGHTWEIGHT
+#define UNSPEKTRA_DEMOSAIC_SAMPLE rawNormalized
+#include "raw_mhc.glsl"
+#endif
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D recordingOutput;
+
+vec4 nativeCell(ivec2 origin, ivec4 levels)
+{
+#ifdef UNSPEKTRA_RAW_CELL_INPUT
+    vec4 values = texelFetch(rawCellImage,
+        clamp(origin / 2, ivec2(0), textureSize(rawCellImage, 0) - 1), 0);
+    return vec4(values[levels.x], values[levels.y], values[levels.z], values[levels.w]);
+#else
+    vec4 values = vec4(rawInteger(origin), rawInteger(origin + ivec2(1, 0)),
+        rawInteger(origin + ivec2(0, 1)), rawInteger(origin + 1));
+    vec4 black = vec4(rawParams.blackLevel[levels.x], rawParams.blackLevel[levels.y],
+        rawParams.blackLevel[levels.z], rawParams.blackLevel[levels.w]);
+    vec4 white = vec4(rawParams.whiteLevel[levels.x], rawParams.whiteLevel[levels.y],
+        rawParams.whiteLevel[levels.z], rawParams.whiteLevel[levels.w]);
+    return max(values - black, vec4(0.0)) / max(white - black, vec4(1.0));
+#endif
+}
+
+ivec2 nativeOutputPosition(ivec2 source)
+{
+    ivec2 size = rawParams.dimensions.zw;
+    ivec2 position = source;
+    if (frameGeometry.transform.x == 1) position = ivec2(size.x - 1 - source.y, source.x);
+    else if (frameGeometry.transform.x == 2) position = size - 1 - source;
+    else if (frameGeometry.transform.x == 3) position = ivec2(source.y, size.y - 1 - source.x);
+    if (frameGeometry.transform.y != 0) position.x = size.x - 1 - position.x;
+    return position;
+}
+
+void nativePixel(ivec2 source, ivec2 center, vec4 shading, float clipped,
+                 float value, vec4 axial, vec4 distant, vec4 corners)
+{
+    ivec2 outputPosition = nativeOutputPosition(source);
+    if (all(greaterThanEqual(outputPosition, ivec2(0))) &&
+        all(lessThan(outputPosition, rawParams.dimensions.zw))) {
+        int color = cfaColor(center);
+        bool redHorizontal = cfaColor(center + ivec2(1, 0)) == CFA_RED;
+#ifdef UNSPEKTRA_PREVIEW_LIGHTWEIGHT
+        vec2 opposite = vec2(axial.x + axial.y, axial.z + axial.w) * 0.5;
+        vec3 atGreen = redHorizontal ? vec3(opposite.x, value, opposite.y) : vec3(opposite.y, value, opposite.x);
+        float green = dot(axial, vec4(0.25));
+        float diagonal = dot(corners, vec4(0.25));
+        vec3 atRedBlue = color == CFA_RED ? vec3(value, green, diagonal) : vec3(diagonal, green, value);
+        vec3 rgb = color == CFA_GREEN ? atGreen : atRedBlue;
+#else
+        vec3 rgb = mhcInterpolate(value, axial, distant, corners, color, redHorizontal);
+#endif
+        vec3 processed = rawColor.reserved1.w > 0.001 || rawColor.geometryControls.x > 0.5 ? rgb :
+            rawColorProcessWithShading(rgb, shading, true);
+        imageStore(recordingOutput, outputPosition, vec4(processed, 1.0 + clipped));
+    }
+}
+
+void main()
+{
+    ivec2 cropOrigin = ivec2(round(frameGeometry.sourceCrop.xy * vec2(rawParams.dimensions.xy)));
+    ivec2 origin = (cropOrigin & ~ivec2(1)) + ivec2(gl_GlobalInvocationID.xy) * 2;
+    ivec2 source = origin - cropOrigin;
+    ivec2 size = (frameGeometry.transform.x & 1) != 0 ? rawParams.dimensions.wz : rawParams.dimensions.zw;
+    if (any(greaterThanEqual(source, size))) return;
+    ivec4 levels = ivec4(cfaLevelIndex(ivec2(0, 0)), cfaLevelIndex(ivec2(1, 0)),
+        cfaLevelIndex(ivec2(0, 1)), cfaLevelIndex(ivec2(1, 1)));
+    // Share the neighborhood across four distinct output pixels, including both green sites.
+    vec4 center = nativeCell(origin, levels);
+    vec4 left = nativeCell(origin + ivec2(-2, 0), levels);
+    vec4 right = nativeCell(origin + ivec2(2, 0), levels);
+    vec4 top = nativeCell(origin + ivec2(0, -2), levels);
+    vec4 bottom = nativeCell(origin + ivec2(0, 2), levels);
+    vec4 outer = vec4(nativeCell(origin - 2, levels).w, 0.0, 0.0,
+        nativeCell(origin + 2, levels).x);
+    outer.y = nativeCell(origin + ivec2(2, -2), levels).z;
+    outer.z = nativeCell(origin + ivec2(-2, 2), levels).y;
+    float clipped = rawColor.reserved1.z > 0.5 && any(greaterThanEqual(center, vec4(0.98))) ? 1.0 : 0.0;
+    vec2 sourceUv = (vec2(origin) + 1.0) / vec2(rawParams.dimensions.xy);
+    vec4 shading = rawLensGains(geometryLensShadingUv(sourceUv, rawParams.dimensions.xy));
+    vec4 scale = shading * rawColor.whiteBalanceExposure.rggb;
+    vec4 cellScale = vec4(scale[levels.x], scale[levels.y], scale[levels.z], scale[levels.w]);
+    center *= cellScale;
+    left *= cellScale;
+    right *= cellScale;
+    top *= cellScale;
+    bottom *= cellScale;
+    outer *= cellScale.wzyx;
+    nativePixel(source, origin, shading, clipped, center.x, vec4(left.y, center.y, top.z, center.z),
+        vec4(left.x, right.x, top.x, bottom.x), vec4(outer.x, top.w, left.w, center.w));
+    nativePixel(source + ivec2(1, 0), origin + ivec2(1, 0), shading, clipped, center.y,
+        vec4(center.x, right.x, top.w, center.w), vec4(left.y, right.y, top.y, bottom.y),
+        vec4(top.z, outer.y, center.z, right.z));
+    nativePixel(source + ivec2(0, 1), origin + ivec2(0, 1), shading, clipped, center.z,
+        vec4(left.w, center.w, center.x, bottom.x), vec4(left.z, right.z, top.z, bottom.z),
+        vec4(left.y, center.y, outer.z, bottom.y));
+    nativePixel(source + 1, origin + 1, shading, clipped, center.w, vec4(center.z, right.z, center.y, bottom.y),
+        vec4(left.w, right.w, top.w, bottom.w), vec4(center.x, right.x, bottom.x, outer.w));
+}

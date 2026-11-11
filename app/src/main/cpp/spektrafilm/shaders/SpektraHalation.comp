@@ -1,0 +1,451 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "SpektraStorageBuffer.glsl"
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+#if defined(SPEKTRA_PREVIEW_OPTIMIZATIONS)
+layout(constant_id = 0) const uint specializedOperation = 0xffffffffu;
+#define SPEKTRA_OPERATION (specializedOperation == 0xffffffffu ? params.operation : specializedOperation)
+#define SPEKTRA_COMPONENT (params.component & 0xffffu)
+#else
+#define SPEKTRA_OPERATION params.operation
+#define SPEKTRA_COMPONENT params.component
+#endif
+
+
+const float kLog10E = 0.4342944819032518;
+const uint kOpClear = 0u;
+const uint kOpBlurX = 1u;
+const uint kOpBlurYStore = 2u;
+const uint kOpBlurYAccumulate = 3u;
+const uint kOpScatterResolve = 4u;
+const uint kOpBounceResolveLog = 5u;
+const uint kOpRawToLog = 6u;
+const uint kOpBoostMax = 7u;
+const uint kOpBoostReduceMax = 8u;
+const uint kOpBoostApply = 9u;
+const uint kSigmaScatterCore = 0u;
+const uint kSigmaScatterTail = 1u;
+const uint kSigmaBounce = 2u;
+
+const uint kFrameFilmPixelSizeUm = 29u;
+const uint kFrameScatterAmount = 30u;
+const uint kFrameScatterScale = 31u;
+const uint kFrameHalationAmount = 32u;
+const uint kFrameHalationScale = 33u;
+const uint kFrameHalationStrengthR = 34u;
+const uint kFrameHalationStrengthG = 35u;
+const uint kFrameHalationStrengthB = 36u;
+const uint kFrameHalationFirstSigmaR = 37u;
+const uint kFrameHalationFirstSigmaG = 38u;
+const uint kFrameHalationFirstSigmaB = 39u;
+const uint kFrameHalationBoostEv = 75u;
+const uint kFrameHalationBoostRange = 76u;
+const uint kFrameHalationProtectEv = 77u;
+
+SPEKTRA_READ_BUFFER(0, vec4, 16u, in0)
+
+SPEKTRA_BUFFER(1, vec4, 16u, buf1)
+
+SPEKTRA_READ_BUFFER(2, vec4, 16u, in2)
+
+SPEKTRA_BUFFER(3, vec4, 16u, buf3)
+
+layout(std430, binding = 27) readonly buffer FrameFloats {
+  float frameFloats[];
+};
+
+layout(push_constant) uniform CoreParams {
+  uint width;
+  uint height;
+  float filmExposureEv;
+  float filmGamma;
+  uint exposureCount;
+  int inputColorSpace;
+  int rgbToRawMethod;
+  uint colorSpaceCount;
+  uint transferLutSize;
+  float colorDecodeMin;
+  float colorDecodeMax;
+  uint hanatosWidth;
+  uint hanatosHeight;
+  uint operation;
+  uint sigmaMode;
+  uint component;
+  int filmPushPullMode;
+  float filmPushPullStops;
+  uint fullWidth;
+  uint fullHeight;
+  uint tileOriginX;
+  uint tileOriginY;
+  uint activeOriginX;
+  uint activeOriginY;
+  uint activeWidth;
+  uint activeHeight;
+} params;
+
+vec4 loadIn0Pixel(uint index) { return read_in0(index); }
+vec4 loadIn2Pixel(uint index) { return read_in2(index); }
+vec4 loadBuf1Pixel(uint index) { return read_buf1(index); }
+void storeBuf1Pixel(uint index, vec4 value) { write_buf1(index, value); }
+void storeBuf3Pixel(uint index, vec4 value) { write_buf3(index, value); }
+vec4 loadIn0Float(uint index) { return read_in0(index); }
+vec4 loadIn2Float(uint index) { return read_in2(index); }
+void storeBuf1Float(uint index, vec4 value) { write_buf1(index, value); }
+
+float f(uint index) {
+  return frameFloats[index];
+}
+
+uint safeIndex(int index, uint size) {
+  if (size <= 1u) {
+    return 0u;
+  }
+  return uint(clamp(index, 0, int(size) - 1));
+}
+
+#if defined(SPEKTRA_PREVIEW_OPTIMIZATIONS)
+vec4 loadBlurSource(int x, int y) {
+  const uint sx = safeIndex(x, params.width);
+  const uint sy = safeIndex(y, params.height);
+  return loadIn0Pixel(sy * params.width + sx);
+}
+
+#include "SpektraBlurTile.glsl"
+
+vec4 sampleRaw(int x, int y) {
+  return sampleBlurTile(x, y);
+}
+
+#else
+vec4 sampleRaw(int x, int y) {
+  const uint sx = safeIndex(x, params.width);
+  const uint sy = safeIndex(y, params.height);
+  return loadIn0Pixel(sy * params.width + sx);
+}
+
+#endif
+
+float max3(vec3 value) {
+  return max(max(value.r, value.g), value.b);
+}
+
+float scatterTailWeight(uint component) {
+  return component == 0u ? 0.1633 : (component == 1u ? 0.6496 : 0.1870);
+}
+
+vec3 sigmaForMode() {
+  const float pixelSizeUm = max(f(kFrameFilmPixelSizeUm), 1.0e-6)
+#if defined(SPEKTRA_PREVIEW_OPTIMIZATIONS)
+    * float(max(params.component >> 16u, 1u))
+#endif
+    ;
+  if (params.sigmaMode == kSigmaScatterCore) {
+    return vec3(2.2, 2.0, 1.6) * max(f(kFrameScatterScale), 0.0) / pixelSizeUm;
+  }
+  if (params.sigmaMode == kSigmaScatterTail) {
+    const float ratio = SPEKTRA_COMPONENT == 0u ? 0.5360 : (SPEKTRA_COMPONENT == 1u ? 1.5236 : 2.7684);
+    return vec3(9.3, 9.7, 9.1) * ratio * max(f(kFrameScatterScale), 0.0) / pixelSizeUm;
+  }
+  const vec3 firstSigma = max(vec3(
+    f(kFrameHalationFirstSigmaR),
+    f(kFrameHalationFirstSigmaG),
+    f(kFrameHalationFirstSigmaB)
+  ), vec3(1.0e-6));
+  return firstSigma * max(f(kFrameHalationScale), 0.0) * sqrt(float(SPEKTRA_COMPONENT + 1u)) / pixelSizeUm;
+}
+
+vec4 gaussianSampleX(uvec2 gid, vec3 sigma) {
+  const float maxSigma = max3(sigma);
+  if (maxSigma <= 1.0e-4) {
+    return sampleRaw(int(gid.x), int(gid.y));
+  }
+
+  const int radius = min(int(ceil(3.0 * maxSigma)), 256);
+  const int x = int(gid.x);
+  const int y = int(gid.y);
+  const vec3 safeSigma = max(sigma, vec3(1.0e-6));
+  const vec3 invSigma2 = 1.0 / max(safeSigma * safeSigma, vec3(1.0e-8));
+  vec3 weight = exp(-0.5 * invSigma2);
+  vec3 ratio = exp(-1.5 * invSigma2);
+  const vec3 ratioStep = exp(-invSigma2);
+  vec4 value = sampleRaw(x, y);
+  vec3 weightSum = vec3(1.0);
+  for (int offset = 1; offset <= radius; ++offset) {
+    const vec4 samplePair = sampleRaw(x - offset, y) + sampleRaw(x + offset, y);
+    value.rgb += samplePair.rgb * weight;
+    value.a += samplePair.a;
+    weightSum += 2.0 * weight;
+    weight *= ratio;
+    ratio *= ratioStep;
+  }
+  value.rgb /= max(weightSum, vec3(1.0e-8));
+  value.a /= float(radius * 2 + 1);
+  return value;
+}
+
+vec4 gaussianSampleY(uvec2 gid, vec3 sigma) {
+  const float maxSigma = max3(sigma);
+  if (maxSigma <= 1.0e-4) {
+    return sampleRaw(int(gid.x), int(gid.y));
+  }
+
+  const int radius = min(int(ceil(3.0 * maxSigma)), 256);
+  const int x = int(gid.x);
+  const int y = int(gid.y);
+  const vec3 safeSigma = max(sigma, vec3(1.0e-6));
+  const vec3 invSigma2 = 1.0 / max(safeSigma * safeSigma, vec3(1.0e-8));
+  vec3 weight = exp(-0.5 * invSigma2);
+  vec3 ratio = exp(-1.5 * invSigma2);
+  const vec3 ratioStep = exp(-invSigma2);
+  vec4 value = sampleRaw(x, y);
+  vec3 weightSum = vec3(1.0);
+  for (int offset = 1; offset <= radius; ++offset) {
+    const vec4 samplePair = sampleRaw(x, y - offset) + sampleRaw(x, y + offset);
+    value.rgb += samplePair.rgb * weight;
+    value.a += samplePair.a;
+    weightSum += 2.0 * weight;
+    weight *= ratio;
+    ratio *= ratioStep;
+  }
+  value.rgb /= max(weightSum, vec3(1.0e-8));
+  value.a /= float(radius * 2 + 1);
+  return value;
+}
+
+float halationBoostChannel(float value, float rawX0, float maxRaw, float a, float k) {
+  if (value <= rawX0) {
+    return value;
+  }
+  const float dx = (value - rawX0) / max(maxRaw, 1.0e-10);
+  const float boost = k * maxRaw * (exp(a * dx) - a * dx - 1.0);
+  return value + boost;
+}
+
+#if defined(SPEKTRA_PREVIEW_OPTIMIZATIONS)
+shared vec3 previewSharp;
+
+vec3 previewGaussianCenterWeight(vec3 sigma) {
+  const float maxSigma = max3(sigma);
+  if (maxSigma <= 1.0e-4) return vec3(1.0);
+  const int radius = min(int(ceil(3.0 * maxSigma)), 256);
+  const vec3 invSigma2 = 1.0 / max(sigma * sigma, vec3(1.0e-8));
+  vec3 weight = exp(-0.5 * invSigma2);
+  vec3 ratio = exp(-1.5 * invSigma2);
+  const vec3 ratioStep = exp(-invSigma2);
+  vec3 weightSum = vec3(1.0);
+  for (int offset = 1; offset <= radius; ++offset) {
+    weightSum += 2.0 * weight;
+    weight *= ratio;
+    ratio *= ratioStep;
+  }
+  return 1.0 / (weightSum * weightSum);
+}
+
+vec3 previewSharpWeight(uint scale) {
+  const float pixelSizeUm = max(f(kFrameFilmPixelSizeUm), 1.0e-6) * float(scale);
+  const float scatter = f(kFrameScatterScale) > 0.0 ? clamp(f(kFrameScatterAmount), 0.0, 1.0) : 0.0;
+  vec3 scatterSharp = vec3(1.0 - scatter);
+  if (scatter > 0.0) {
+    const float scatterSigmaScale = f(kFrameScatterScale) / pixelSizeUm;
+    const vec3 core = previewGaussianCenterWeight(vec3(2.2, 2.0, 1.6) * scatterSigmaScale);
+    vec3 tail = vec3(0.0);
+    for (uint component = 0u; component < 3u; ++component) {
+      const float ratio = component == 0u ? 0.5360 : (component == 1u ? 1.5236 : 2.7684);
+      tail += scatterTailWeight(component) * previewGaussianCenterWeight(vec3(9.3, 9.7, 9.1) * ratio * scatterSigmaScale);
+    }
+    scatterSharp += scatter * mix(core, tail, vec3(0.78, 0.65, 0.67));
+  }
+  const vec3 bounce = f(kFrameHalationScale) > 0.0
+    ? max(vec3(f(kFrameHalationStrengthR), f(kFrameHalationStrengthG), f(kFrameHalationStrengthB)), vec3(0.0)) * max(f(kFrameHalationAmount), 0.0)
+    : vec3(0.0);
+  vec3 bounceSharp = vec3(0.0);
+  if (max3(bounce) > 0.0) {
+    const vec3 sigma = max(vec3(f(kFrameHalationFirstSigmaR), f(kFrameHalationFirstSigmaG),
+      f(kFrameHalationFirstSigmaB)), vec3(1.0e-6)) * f(kFrameHalationScale) / pixelSizeUm;
+    for (uint component = 0u; component < 3u; ++component) {
+      bounceSharp += pow(0.5, float(component)) / 1.75 *
+        previewGaussianCenterWeight(sigma * sqrt(float(component + 1u)));
+    }
+  }
+  // Keep each blur's center contribution sharp and upsample only its surrounding glow.
+  return scatterSharp * (vec3(1.0) + bounce * bounceSharp) / (vec3(1.0) + bounce);
+}
+
+vec3 previewGlow(ivec2 position, uvec2 size, vec3 sharpWeight) {
+  const uvec2 clamped = uvec2(clamp(position, ivec2(0), ivec2(size) - ivec2(1)));
+  const uint index = clamped.y * size.x + clamped.x;
+  const vec3 processed = exp(loadBuf1Pixel(index).rgb / kLog10E) - vec3(1.0e-10);
+  return processed - sharpWeight * loadIn2Pixel(index).rgb;
+}
+
+bool renderPreviewResample(uvec2 gid) {
+  if (SPEKTRA_OPERATION != 10u && SPEKTRA_OPERATION != 11u) return false;
+  const uint scale = max(params.sigmaMode, 1u);
+  const uvec2 reduced = (uvec2(params.width, params.height) + uvec2(scale - 1u)) / scale;
+  if (SPEKTRA_OPERATION == 10u) {
+    if (any(greaterThanEqual(gid, reduced))) return true;
+    vec4 value = vec4(0.0);
+    for (uint y = 0u; y < scale; ++y) {
+      for (uint x = 0u; x < scale; ++x) {
+        const uvec2 position = min(gid * scale + uvec2(x, y), uvec2(params.width - 1u, params.height - 1u));
+        value += loadIn0Pixel(position.y * params.width + position.x);
+      }
+    }
+    storeBuf1Pixel(gid.y * reduced.x + gid.x, value / float(scale * scale));
+    return true;
+  }
+  if (gl_LocalInvocationIndex == 0u) previewSharp = previewSharpWeight(scale);
+  barrier();
+  const uvec2 activeSize = uvec2(params.activeWidth == 0u ? params.width : params.activeWidth,
+                               params.activeHeight == 0u ? params.height : params.activeHeight);
+  const uvec2 position = gid + uvec2(params.activeOriginX, params.activeOriginY);
+  if (any(greaterThanEqual(gid, activeSize)) || any(greaterThanEqual(position, uvec2(params.width, params.height)))) return true;
+  const vec2 reducedPosition = (vec2(position) + vec2(0.5)) / float(scale) - vec2(0.5);
+  const ivec2 base = ivec2(floor(reducedPosition));
+  const vec2 fraction = fract(reducedPosition);
+  const vec3 sharpWeight = previewSharp;
+  const vec3 top = mix(previewGlow(base, reduced, sharpWeight), previewGlow(base + ivec2(1, 0), reduced, sharpWeight), fraction.x);
+  const vec3 bottom = mix(previewGlow(base + ivec2(0, 1), reduced, sharpWeight), previewGlow(base + ivec2(1), reduced, sharpWeight), fraction.x);
+  const uint index = position.y * params.width + position.x;
+  const vec4 source = loadIn0Pixel(index);
+  const vec3 color = sharpWeight * source.rgb + mix(top, bottom, fraction.y);
+  storeBuf3Pixel(index, vec4(log(max(color, vec3(0.0)) + vec3(1.0e-10)) * kLog10E, source.a));
+  return true;
+}
+#endif
+
+void main() {
+  const uvec2 gid = gl_GlobalInvocationID.xy;
+#if defined(SPEKTRA_PREVIEW_OPTIMIZATIONS)
+  if (renderPreviewResample(gid)) return;
+#endif
+#if defined(SPEKTRA_PREVIEW_OPTIMIZATIONS)
+  if (SPEKTRA_OPERATION == kOpBlurX || SPEKTRA_OPERATION == kOpBlurYStore ||
+      SPEKTRA_OPERATION == kOpBlurYAccumulate) {
+    const float sigma = max3(sigmaForMode());
+    const int radius = sigma <= 1.0e-4 ? 0 : min(int(ceil(3.0 * sigma)), 256);
+    prepareBlurTile(ivec2(params.activeOriginX, params.activeOriginY), SPEKTRA_OPERATION == kOpBlurX, radius);
+  }
+
+#endif
+  if (SPEKTRA_OPERATION == kOpBoostMax) {
+    if (gid.y != 0u) {
+      return;
+    }
+    const uint chunkPixels = max(params.sigmaMode, 1u);
+    const uint count = params.width * params.height;
+    const uint start = gid.x * chunkPixels;
+    if (start >= count) {
+      return;
+    }
+    const uint end = min(start + chunkPixels, count);
+    float maxRaw = 0.0;
+    for (uint rawIndex = start; rawIndex < end; ++rawIndex) {
+      maxRaw = max(maxRaw, max3(loadIn0Pixel(rawIndex).rgb));
+    }
+    storeBuf1Float(gid.x, vec4(maxRaw, 0.0, 0.0, 0.0));
+    return;
+  }
+  if (SPEKTRA_OPERATION == kOpBoostReduceMax) {
+    if (gid.x != 0u || gid.y != 0u) {
+      return;
+    }
+    float maxRaw = 0.0;
+    for (uint chunkIndex = 0u; chunkIndex < params.sigmaMode; ++chunkIndex) {
+      maxRaw = max(maxRaw, loadIn0Float(chunkIndex).r);
+    }
+    const float rawX0 = clamp(0.184 * exp2(f(kFrameHalationProtectEv)), 0.0, maxRaw);
+    const float boostRange = clamp(f(kFrameHalationBoostRange), 0.0, 1.0);
+    const float a = pow(28.0, 1.0 - boostRange);
+    const float x0 = maxRaw > 0.0 ? rawX0 / maxRaw : 1.0;
+    const float denom = exp(a * (1.0 - x0)) - a * (1.0 - x0) - 1.0;
+    const float k = (maxRaw > 0.0 && rawX0 < maxRaw && denom > 1.0e-10)
+      ? (exp2(max(f(kFrameHalationBoostEv), 0.0)) - 1.0) / denom
+      : 0.0;
+    storeBuf1Float(0u, vec4(maxRaw, rawX0, a, k));
+    return;
+  }
+  const uvec2 activeGid = gid;
+  const uint activeWidth = params.activeWidth == 0u ? params.width : params.activeWidth;
+  const uint activeHeight = params.activeHeight == 0u ? params.height : params.activeHeight;
+  if (activeGid.x >= activeWidth || activeGid.y >= activeHeight) {
+    return;
+  }
+
+  const uvec2 localGid = activeGid + uvec2(params.activeOriginX, params.activeOriginY);
+  if (localGid.x >= params.width || localGid.y >= params.height) {
+    return;
+  }
+  const uvec2 gid2 = localGid;
+  const uint index = gid2.y * params.width + gid2.x;
+  if (SPEKTRA_OPERATION == kOpBoostApply) {
+    const vec4 raw = loadIn0Pixel(index);
+    if (f(kFrameHalationBoostEv) <= 0.0) {
+      storeBuf1Pixel(index, raw);
+      return;
+    }
+    const vec4 boostInfo = loadIn2Float(0u);
+    const float frameMax = boostInfo.x;
+    const float rawX0 = boostInfo.y;
+    const float a = boostInfo.z;
+    const float k = boostInfo.w;
+    if (frameMax <= 0.0 || k <= 0.0 || rawX0 >= frameMax || max3(raw.rgb) <= rawX0) {
+      storeBuf1Pixel(index, raw);
+      return;
+    }
+    storeBuf1Pixel(index, vec4(
+      vec3(
+        halationBoostChannel(raw.r, rawX0, frameMax, a, k),
+        halationBoostChannel(raw.g, rawX0, frameMax, a, k),
+        halationBoostChannel(raw.b, rawX0, frameMax, a, k)
+      ),
+      raw.a
+    ));
+    return;
+  }
+  if (SPEKTRA_OPERATION == kOpClear) {
+    storeBuf1Pixel(index, vec4(0.0, 0.0, 0.0, loadIn0Pixel(index).a));
+    return;
+  }
+  if (SPEKTRA_OPERATION == kOpBlurX) {
+    storeBuf1Pixel(index, gaussianSampleX(gid2, sigmaForMode()));
+    return;
+  }
+  if (SPEKTRA_OPERATION == kOpBlurYStore) {
+    storeBuf1Pixel(index, gaussianSampleY(gid2, sigmaForMode()));
+    return;
+  }
+  if (SPEKTRA_OPERATION == kOpBlurYAccumulate) {
+    const vec4 blurred = gaussianSampleY(gid2, sigmaForMode());
+    const float weight = params.sigmaMode == kSigmaBounce
+      ? pow(0.5, float(SPEKTRA_COMPONENT)) / 1.75
+      : scatterTailWeight(SPEKTRA_COMPONENT);
+    storeBuf1Pixel(index, vec4(loadBuf1Pixel(index).rgb + weight * blurred.rgb, blurred.a));
+    return;
+  }
+  if (SPEKTRA_OPERATION == kOpScatterResolve) {
+    const vec4 raw = loadIn0Pixel(index);
+    const vec3 tailMix = vec3(0.78, 0.65, 0.67);
+    const vec3 scattered = (vec3(1.0) - tailMix) * loadBuf1Pixel(index).rgb + tailMix * loadIn2Pixel(index).rgb;
+    const float amount = clamp(f(kFrameScatterAmount), 0.0, 1.0);
+    storeBuf3Pixel(index, vec4(mix(raw.rgb, scattered, amount), raw.a));
+    return;
+  }
+  if (SPEKTRA_OPERATION == kOpBounceResolveLog) {
+    const vec4 raw = loadIn0Pixel(index);
+    const vec3 amount = max(vec3(
+      f(kFrameHalationStrengthR),
+      f(kFrameHalationStrengthG),
+      f(kFrameHalationStrengthB)
+    ), vec3(0.0)) * max(f(kFrameHalationAmount), 0.0);
+    const vec3 resolved = (raw.rgb + amount * loadBuf1Pixel(index).rgb) / (vec3(1.0) + amount);
+    storeBuf3Pixel(index, vec4(log(max(resolved, vec3(0.0)) + vec3(1.0e-10)) * kLog10E, raw.a));
+    return;
+  }
+  if (SPEKTRA_OPERATION == kOpRawToLog) {
+    const vec4 raw = loadIn0Pixel(index);
+    storeBuf3Pixel(index, vec4(log(max(raw.rgb, vec3(0.0)) + vec3(1.0e-10)) * kLog10E, raw.a));
+  }
+}

@@ -1,0 +1,111 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#ifndef UNSPEKTRA_RECORDING_TILE
+#define UNSPEKTRA_LIVE_STABILIZATION 1
+#endif
+#define UNSPEKTRA_PREVIEW_SCALAR_SHADING
+#define UNSPEKTRA_PREVIEW_SHADING_REUSE 1
+#include "raw_input.glsl"
+
+#ifdef UNSPEKTRA_PREVIEW_FRAGMENT
+layout(location = 0) out vec4 recordingOutput;
+#else
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D recordingOutput;
+#endif
+
+vec4 recordingCell(ivec2 cell, ivec2 red, ivec2 green)
+{
+#ifdef UNSPEKTRA_RAW_CELL_INPUT
+    ivec2 position = clamp(cell / 2, ivec2(0), textureSize(rawCellImage, 0) - 1);
+    return texelFetch(rawCellImage, position, 0);
+#else
+    vec4 sensor = vec4(rawInteger(cell + red), rawInteger(cell + green),
+        rawInteger(cell + (green ^ ivec2(1))), rawInteger(cell + (red ^ ivec2(1))));
+    return max(sensor - rawParams.blackLevel, vec4(0.0)) /
+        max(rawParams.whiteLevel - rawParams.blackLevel, vec4(1.0));
+#endif
+}
+
+#ifdef UNSPEKTRA_RAW_CELL_INPUT
+float recordingPlane(vec2 center, int channel)
+{
+    vec2 uv = (center + 0.5) / vec2(textureSize(rawCellImage, 0));
+    return textureLod(rawCellImage, uv, 0.0)[channel];
+}
+#endif
+
+#ifdef UNSPEKTRA_RECORDING_TILE
+#include "recording_tile.glsl"
+#endif
+
+void main()
+{
+#ifdef UNSPEKTRA_PREVIEW_FRAGMENT
+    ivec2 outputPosition = ivec2(gl_FragCoord.xy);
+#else
+    ivec2 outputPosition = ivec2(gl_GlobalInvocationID.xy);
+#ifndef UNSPEKTRA_RECORDING_TILE
+    if (any(greaterThanEqual(outputPosition, rawParams.dimensions.zw))) return;
+#endif
+#endif
+    vec2 sourceUv = geometrySourceUv(outputPosition);
+    vec2 center = sourceUv * vec2(rawParams.dimensions.xy);
+    ivec2 outputSize = (frameGeometry.transform.x & 1) != 0 ? rawParams.dimensions.wz : rawParams.dimensions.zw;
+    vec2 footprint = frameGeometry.sourceCrop.zw * vec2(rawParams.dimensions.xy) / vec2(outputSize);
+    // Reconstruct each Bayer plane at its own sample positions, widening the
+    // tent with the reduction ratio before discarding any sensor samples.
+    vec2 radius = max(vec2(2.0), footprint);
+    ivec2 first = (ivec2(floor((center - radius - 1.5) * 0.5)) + 1) * 2;
+    ivec2 end = ivec2(ceil((center + radius - 0.5) * 0.5)) * 2;
+    int cfa = UNSPEKTRA_INPUT_CFA;
+    ivec2 red = ivec2(cfa & 1, cfa >> 1);
+    ivec2 green = ivec2(red.y == 0 ? 1 - red.x : red.x, 0);
+    vec4 offsetX = vec4(red.x, green.x, 1 - green.x, 1 - red.x) + 0.5;
+    vec4 offsetY = vec4(red.y, 0, 1, 1 - red.y) + 0.5;
+    vec4 sum = vec4(0.0);
+    vec4 weights = vec4(0.0);
+    float clipped = 0.0;
+#ifdef UNSPEKTRA_RECORDING_TILE
+    sum = recordingTile(outputPosition, radius, offsetX, offsetY, red, green, clipped);
+    weights = vec4(1.0);
+    if (any(greaterThanEqual(outputPosition, rawParams.dimensions.zw))) return;
+#else
+#ifdef UNSPEKTRA_RAW_CELL_INPUT
+    if (previewTextureShading && rawColor.reserved1.z <= 0.5 && all(lessThanEqual(radius, vec2(2.0)))) {
+        sum = vec4(
+            recordingPlane((center - vec2(offsetX.r, offsetY.r)) * 0.5, 0),
+            recordingPlane((center - vec2(offsetX.g, offsetY.g)) * 0.5, 1),
+            recordingPlane((center - vec2(offsetX.b, offsetY.b)) * 0.5, 2),
+            recordingPlane((center - vec2(offsetX.a, offsetY.a)) * 0.5, 3));
+        weights = vec4(1.0);
+    } else
+#endif
+    {
+        for (int y = first.y; y < end.y; y += 2) {
+            vec4 wy = max(vec4(0.0), 1.0 - abs(float(y) + offsetY - center.y) / radius.y);
+            for (int x = first.x; x < end.x; x += 2) {
+                vec4 wx = max(vec4(0.0), 1.0 - abs(float(x) + offsetX - center.x) / radius.x);
+                vec4 weight = wx * wy;
+                vec4 value = recordingCell(ivec2(x, y), red, green);
+                sum += value * weight;
+                weights += weight;
+                if (rawColor.reserved1.z > 0.5 &&
+                    dot(vec4(greaterThanEqual(value, vec4(0.98))), weight) > 0.0) clipped = 1.0;
+            }
+        }
+    }
+#endif
+    vec4 shading = rawLensGains(geometryLensShadingUv(sourceUv, rawParams.dimensions.xy));
+    vec4 balanced = sum / max(weights, vec4(0.000001)) * shading * rawColor.whiteBalanceExposure.rggb;
+    vec3 rgb = vec3(balanced.r, 0.5 * (balanced.g + balanced.b), balanced.a);
+    vec3 processed = rawColor.reserved1.w > 0.001 || rawColor.geometryControls.x > 0.5 ? rgb :
+        rawColorProcessWithShading(rgb, shading, true);
+    vec4 result = vec4(processed, 1.0 + clipped);
+#ifdef UNSPEKTRA_PREVIEW_FRAGMENT
+    recordingOutput = result;
+#else
+    imageStore(recordingOutput, outputPosition, result);
+#endif
+}

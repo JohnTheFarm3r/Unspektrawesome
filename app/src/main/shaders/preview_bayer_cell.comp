@@ -1,0 +1,115 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#define UNSPEKTRA_PREVIEW_SCALAR_SHADING
+#define UNSPEKTRA_PREVIEW_SHADING_REUSE 1
+#include "raw_input.glsl"
+
+#ifdef UNSPEKTRA_PREVIEW_FRAGMENT
+layout(location = 0) out vec4 previewOutput;
+#else
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D previewOutput;
+#endif
+
+vec4 previewCell(ivec2 grid, int step)
+{
+    ivec2 dimensions = rawParams.dimensions.xy;
+#ifdef UNSPEKTRA_PREVIEW_REMOSAIC
+    if (previewRemosaic) dimensions = previewRemosaicSize;
+#endif
+    ivec2 size = (dimensions + step - 1) / step;
+    grid = clamp(grid, ivec2(0), size - 1);
+#ifdef UNSPEKTRA_RAW_CELL_INPUT
+    return textureLod(rawCellImage, (vec2(grid) + 0.5) /
+        vec2(textureSize(rawCellImage, 0)), 0.0);
+#else
+    ivec2 cell = grid * step;
+    int cfa = UNSPEKTRA_INPUT_CFA;
+    ivec2 red = ivec2(cfa & 1, cfa >> 1);
+    ivec2 green = ivec2(red.y == 0 ? 1 - red.x : red.x, 0);
+    vec4 sensor;
+#ifndef UNSPEKTRA_RAW_IMAGE_INPUT
+    if (!previewRemosaic && UNSPEKTRA_INPUT_FORMAT == RAW_FORMAT_SENSOR &&
+        (rawParams.layoutInfo.x & 3) == 0 &&
+        all(greaterThanEqual(cell, frameGeometry.rawBounds.xy)) &&
+        all(lessThan(cell + 1, frameGeometry.rawBounds.xy + frameGeometry.rawBounds.zw))) {
+        // Each aligned word contains both samples in one Bayer row.
+        uint stride = uint(rawParams.layoutInfo.x) / 4u;
+        uint index = uint(cell.y) * stride + uint(cell.x) / 2u;
+        uint top = rawInput.words[index];
+        uint bottom = rawInput.words[index + stride];
+        vec4 sites = vec4(uvec4(top, top >> 16u, bottom, bottom >> 16u) & 65535u);
+        sensor = vec4(sites[cfa], sites[green.x], sites[3 - green.x], sites[cfa ^ 3]);
+    } else
+#endif
+    {
+        sensor = vec4(rawInteger(cell + red), rawInteger(cell + green),
+            rawInteger(cell + (green ^ ivec2(1))), rawInteger(cell + (red ^ ivec2(1))));
+    }
+    return max(sensor - rawParams.blackLevel, vec4(0.0)) /
+        max(rawParams.whiteLevel - rawParams.blackLevel, vec4(1.0));
+#endif
+}
+
+void main()
+{
+#ifdef UNSPEKTRA_PREVIEW_FRAGMENT
+    ivec2 outputPosition = ivec2(gl_FragCoord.xy);
+#else
+    ivec2 outputPosition = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(outputPosition, rawParams.dimensions.zw))) return;
+#endif
+    vec2 sourceUv = geometrySourceUv(outputPosition);
+    // Keep exact Bayer-cell boundaries stable after normalized-coordinate rounding.
+    ivec2 position = ivec2(floor(sourceUv * vec2(rawParams.dimensions.xy) + vec2(0.001)));
+#ifdef UNSPEKTRA_PREVIEW_REMOSAIC
+    if (previewRemosaic) {
+        previewRemosaicSize = (frameGeometry.transform.x & 1) != 0 ?
+            rawParams.dimensions.wz : rawParams.dimensions.zw;
+        position = geometryUnrotatePosition(outputPosition);
+    }
+#endif
+    ivec2 outputSize = (frameGeometry.transform.x & 1) != 0 ? rawParams.dimensions.wz : rawParams.dimensions.zw;
+    vec2 footprint = frameGeometry.sourceCrop.zw * vec2(rawParams.dimensions.xy) / vec2(outputSize);
+    int cellStep = max(2, int(ceil(max(footprint.x, footprint.y) * 0.5)) * 2);
+#ifdef UNSPEKTRA_PREVIEW_REMOSAIC
+    if (previewRemosaic) cellStep = 2;
+#endif
+    vec4 normalized;
+    float clipped = 0.0;
+    if (min(rawParams.dimensions.z, rawParams.dimensions.w) <= 720 && cellStep > 2) {
+        // Reconstruct between Bayer-cell centers instead of repeating cells at
+        // uneven intervals. Effects still run at the selected preview size.
+        vec2 coordinate = (sourceUv * vec2(rawParams.dimensions.xy) - 1.0) / float(cellStep);
+        ivec2 first = ivec2(floor(coordinate));
+        vec2 fraction = fract(coordinate);
+        vec4 a = previewCell(first, cellStep);
+        vec4 b = previewCell(first + ivec2(1, 0), cellStep);
+        vec4 c = previewCell(first + ivec2(0, 1), cellStep);
+        vec4 d = previewCell(first + ivec2(1, 1), cellStep);
+        normalized = mix(mix(a, b, fraction.x), mix(c, d, fraction.x), fraction.y);
+        if (rawColor.reserved1.z > 0.5) {
+            vec4 weights = vec4(1.0 - fraction.x, fraction.x, 1.0 - fraction.x, fraction.x) *
+                vec4(1.0 - fraction.y, 1.0 - fraction.y, fraction.y, fraction.y);
+            vec4 peaks = max(max(vec4(a.r, b.r, c.r, d.r), vec4(a.g, b.g, c.g, d.g)),
+                max(vec4(a.b, b.b, c.b, d.b), vec4(a.a, b.a, c.a, d.a)));
+            if (dot(vec4(greaterThanEqual(peaks, vec4(0.98))), vec4(greaterThan(weights, vec4(0.0)))) > 0.0)
+                clipped = 1.0;
+        }
+    } else {
+        normalized = previewCell(position / cellStep, cellStep);
+        if (rawColor.reserved1.z > 0.5 && any(greaterThanEqual(normalized, vec4(0.98)))) clipped = 1.0;
+    }
+    vec4 shading = rawLensGains(geometryLensShadingUv(sourceUv, rawParams.dimensions.xy));
+    vec4 balanced = normalized * shading * rawColor.whiteBalanceExposure.rggb;
+    vec3 rgb = vec3(balanced.r, 0.5 * (balanced.g + balanced.b), balanced.a);
+    vec3 processed = rawColor.reserved1.w > 0.001 || rawColor.geometryControls.x > 0.5 ? rgb :
+        rawColorProcessWithShading(rgb, shading, true);
+    vec4 result = vec4(processed, 1.0 + clipped);
+#ifdef UNSPEKTRA_PREVIEW_FRAGMENT
+    previewOutput = result;
+#else
+    imageStore(previewOutput, outputPosition, result);
+#endif
+}

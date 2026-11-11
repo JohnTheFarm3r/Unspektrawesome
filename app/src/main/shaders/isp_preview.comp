@@ -1,0 +1,177 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+// ISP viewfinder: the camera's processed stream replaces RAW decoding and
+// writes the same linear working-space processing image as the RAW preview.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+#ifdef UNSPEKTRA_ISP_IMAGE_INPUT
+layout(set = 0, binding = 0) uniform sampler2D ispImage;
+#else
+layout(set = 0, binding = 0, std430) readonly buffer IspPlanes {
+    uint words[];
+} ispPlanes;
+#endif
+
+layout(set = 0, binding = 1, std140) uniform IspParameters {
+    ivec4 source;
+    vec4 exposure;
+    ivec4 planeY;
+    ivec4 planeU;
+    ivec4 planeV;
+    // Linear light for each 8-bit output code; xyz hold red, green and blue.
+    vec4 inverseCurve[256];
+} isp;
+
+layout(set = 0, binding = 3, std140) uniform RawColorParameters {
+    vec4 whiteBalanceExposure;
+    vec4 colorMatrix0;
+    vec4 colorMatrix1;
+    vec4 colorMatrix2;
+    vec4 reserved0;
+    vec4 lensControls;
+    vec4 reserved1;
+    vec4 reserved2;
+    vec4 geometryControls;
+} rawColor;
+
+#include "frame_geometry.glsl"
+
+#ifdef UNSPEKTRA_SENSOR_METER
+layout(set = 0, binding = 11, std430) writeonly buffer MeterPixels {
+    vec4 pixels[];
+} meterOutput;
+layout(push_constant) uniform MeterRegion {
+    uvec2 origin;
+    uvec2 extent;
+    uvec2 samples;
+} meterRegion;
+#else
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D previewOutput;
+#endif
+
+const int ISP_FULL_RANGE = 1;
+const int ISP_DRIVER_RGB = 2;
+
+#ifndef UNSPEKTRA_ISP_IMAGE_INPUT
+float ispByte(int offset)
+{
+    uint word = ispPlanes.words[offset >> 2];
+    return float((word >> uint((offset & 3) * 8)) & 0xFFu) / 255.0;
+}
+
+// Y, Cb and Cr in the same channel order the YCbCr sampler returns: G = Y, B = Cb, R = Cr.
+vec3 ispPlaneSample(ivec2 position)
+{
+    ivec2 full = clamp(position, ivec2(0), isp.source.xy - 1);
+    ivec2 chroma = clamp(position >> 1, ivec2(0), (isp.source.xy >> 1) - 1);
+    float y = ispByte(isp.planeY.x + full.y * isp.planeY.y + full.x * isp.planeY.z);
+    float cb = ispByte(isp.planeU.x + chroma.y * isp.planeU.y + chroma.x * isp.planeU.z);
+    float cr = ispByte(isp.planeV.x + chroma.y * isp.planeV.y + chroma.x * isp.planeV.z);
+    return vec3(cr, y, cb);
+}
+
+vec3 ispSample(vec2 uv)
+{
+    vec2 pixel = uv * vec2(isp.source.xy) - 0.5;
+    ivec2 first = ivec2(floor(pixel));
+    vec2 fraction = fract(pixel);
+    vec3 top = mix(ispPlaneSample(first), ispPlaneSample(first + ivec2(1, 0)), fraction.x);
+    vec3 bottom = mix(ispPlaneSample(first + ivec2(0, 1)), ispPlaneSample(first + ivec2(1, 1)), fraction.x);
+    return mix(top, bottom, fraction.y);
+}
+#else
+vec3 ispSample(vec2 uv)
+{
+    return textureLod(ispImage, uv, 0.0).rgb;
+}
+#endif
+
+vec3 ispEncodedRgb(vec3 sampled)
+{
+    if ((isp.source.z & ISP_DRIVER_RGB) != 0) return clamp(sampled, vec3(0.0), vec3(1.0));
+    float y = sampled.g;
+    float cb = sampled.b;
+    float cr = sampled.r;
+    if ((isp.source.z & ISP_FULL_RANGE) != 0) {
+        cb -= 0.5;
+        cr -= 0.5;
+    } else {
+        y = (y * 255.0 - 16.0) / 219.0;
+        cb = (cb * 255.0 - 128.0) / 224.0;
+        cr = (cr * 255.0 - 128.0) / 224.0;
+    }
+    return clamp(vec3(y + 1.402 * cr, y - 0.344136 * cb - 0.714136 * cr, y + 1.772 * cb),
+                 vec3(0.0), vec3(1.0));
+}
+
+// Invert the tone curve the ISP applied, sampled at 8-bit output codes. Components are
+// selected with constant swizzles because older Adreno compilers mishandle dynamic ones.
+vec3 ispLinear(vec3 encoded)
+{
+    vec3 position = clamp(encoded, vec3(0.0), vec3(1.0)) * 255.0;
+    ivec3 lower = min(ivec3(position), ivec3(254));
+    vec3 fraction = position - vec3(lower);
+    float red = mix(isp.inverseCurve[lower.x].x, isp.inverseCurve[lower.x + 1].x, fraction.x);
+    float green = mix(isp.inverseCurve[lower.y].y, isp.inverseCurve[lower.y + 1].y, fraction.y);
+    float blue = mix(isp.inverseCurve[lower.z].z, isp.inverseCurve[lower.z + 1].z, fraction.z);
+    return max(vec3(red, green, blue), vec3(0.0));
+}
+
+vec3 ispFinish(vec3 working)
+{
+    float lum = dot(working, vec3(0.2126, 0.7152, 0.0722));
+    float highlights = rawColor.reserved0.z;
+    float highlightScale = 1.0;
+    if (rawColor.reserved2.w < 1.0 && abs(highlights) > 0.001) {
+        float perceptualLum = pow(clamp(lum, 0.0, 1.0), 1.0 / 2.2);
+        float highlightMask = smoothstep(0.3, 1.0, perceptualLum);
+        highlightScale = exp2(highlights * highlightMask * 1.2);
+    } else if (abs(highlights) > 0.001) {
+        float start = clamp(rawColor.reserved2.w - 1.0, 0.0, 1.0);
+        float threshold = pow(start, 2.2);
+        if (lum > threshold) {
+            if (highlights < 0.0) {
+                float strength = exp2(-3.5 * highlights) - 1.0;
+                float excess = lum - threshold;
+                float x = strength * excess;
+                float shoulder = x < 0.001 ? 1.0 - 0.5 * x + x * x / 3.0 : log(1.0 + x) / x;
+                highlightScale = (threshold + excess * shoulder) / lum;
+            } else {
+                float perceptualLum = pow(lum, 1.0 / 2.2);
+                float highlightMask = smoothstep(start, max(1.0, start + 0.01), perceptualLum);
+                highlightScale = exp2(highlights * highlightMask * 1.2);
+            }
+        }
+    }
+    if (rawColor.reserved0.x > 0.5) {
+        vec3 positive = max(working * highlightScale, vec3(0.0));
+        return mix(12.92 * positive, 1.055 * pow(positive, vec3(1.0 / 2.4)) - 0.055,
+                   step(vec3(0.0031308), positive));
+    }
+    return working * highlightScale;
+}
+
+void main()
+{
+#ifdef UNSPEKTRA_SENSOR_METER
+    uvec2 samplePosition = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(samplePosition, meterRegion.samples))) return;
+    ivec2 outputPosition = ivec2(meterRegion.origin + samplePosition * meterRegion.extent / meterRegion.samples);
+#else
+    ivec2 outputPosition = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(outputPosition, frameGeometry.transform.zw))) return;
+#endif
+    vec2 sourceUv = geometrySourceUv(outputPosition);
+    vec3 encoded = ispEncodedRgb(ispSample(sourceUv));
+    vec3 working = ispLinear(encoded) * isp.exposure.x;
+#ifdef UNSPEKTRA_SENSOR_METER
+    meterOutput.pixels[samplePosition.y * meterRegion.samples.x + samplePosition.x] = vec4(working, 1.0);
+#else
+    // Shadows and highlight passes finish the color like the RAW preview.
+    vec3 processed = rawColor.reserved1.w > 0.001 || rawColor.geometryControls.x > 0.5 ? working : ispFinish(working);
+    float warning = rawColor.reserved1.z > 0.5 && any(greaterThanEqual(encoded, vec3(0.996))) ? 1.0 : 0.0;
+    imageStore(previewOutput, outputPosition, vec4(processed, 1.0 + warning));
+#endif
+}

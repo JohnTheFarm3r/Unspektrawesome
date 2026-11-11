@@ -1,0 +1,52 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "SpektraStorageBuffer.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#include "SpektraLinearDispatch.h"
+
+layout(binding = 0, rgba16f) uniform image2D image;
+
+SPEKTRA_BUFFER(1, uint, 4u, words)
+
+layout(push_constant) uniform ImageFormatConvertParams {
+  uint pixelCount;
+  uint mode;
+  uint width;
+  uint originX;
+  uint originY;
+  uint centerX;
+  uint centerY;
+  uint centerWidth;
+} params;
+
+void main() {
+  const uint pixelIndex = spektraLinearIndex();
+  if (pixelIndex >= params.pixelCount) {
+    return;
+  }
+
+  const ivec2 coord = params.mode == 2u ? ivec2(
+    int((pixelIndex % params.width) * params.originX / params.width),
+    int((pixelIndex / params.width) * params.originY / (params.pixelCount / params.width))
+  ) : ivec2(
+    int(pixelIndex % params.width + params.originX),
+    int(pixelIndex / params.width + params.originY)
+  );
+  const uint wordOffset = pixelIndex * 4u;
+  if (params.mode == 0u || params.mode == 2u) {
+    const vec4 color = imageLoad(image, coord);
+    write_words(wordOffset, floatBitsToUint(color.r));
+    write_words(wordOffset + 1u, floatBitsToUint(color.g));
+    write_words(wordOffset + 2u, floatBitsToUint(color.b));
+    write_words(wordOffset + 3u, floatBitsToUint(color.a));
+  } else {
+    // Only the tile center is complete; overlap pixels belong to neighboring tiles.
+    const uvec2 local = uvec2(pixelIndex % params.centerWidth + params.centerX,
+                             pixelIndex / params.centerWidth + params.centerY);
+    const uint sourceIndex = local.y * params.width + local.x;
+    const vec2 rg = unpackHalf2x16(read_words(sourceIndex * 2u));
+    const vec2 ba = unpackHalf2x16(read_words(sourceIndex * 2u + 1u));
+    imageStore(image, ivec2(local + uvec2(params.originX, params.originY)), vec4(rg, ba));
+  }
+}

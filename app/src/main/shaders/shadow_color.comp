@@ -1,0 +1,22 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "raw_input.glsl"
+#include "raw_color.glsl"
+#include "frame_geometry.glsl"
+#include "shadows.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D outputImage;
+layout(set = 0, binding = 7) uniform sampler2D inputImage;
+
+void main() {
+    ivec2 position = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(position, frameGeometry.transform.zw))) return;
+    vec4 source = texelFetch(inputImage, position, 0);
+    vec2 guideCoord = (vec2(position) + 0.5) / vec2(frameGeometry.transform.zw);
+    vec3 adjusted = applyShadows(source.rgb, guideCoord, rawColor.reserved1.w);
+    vec2 shadingUv = geometryLensShadingUv(geometrySourceUv(position), rawParams.dimensions.xy);
+    imageStore(outputImage, position, vec4(rawColorProcess(source.rgb, shadingUv, 0.0,
+        true, adjusted, rawColor.geometryControls.x > 0.5), source.a));
+}

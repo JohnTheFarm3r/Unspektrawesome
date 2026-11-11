@@ -1,0 +1,299 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "SpektraStorageBuffer.glsl"
+#include "SpektraAutoExposureConfig.h"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+SPEKTRA_READ_BUFFER(0, vec4, 16u, src)
+
+SPEKTRA_READ_BUFFER(5, float, 4u, colorDecodeLuts)
+
+SPEKTRA_READ_BUFFER(6, uint, 4u, colorTransferKinds)
+
+layout(std430, binding = 8) readonly buffer InputMeterXyzMatrices {
+  float inputMeterXyz[];
+};
+
+layout(std430, binding = 29) buffer AutoExposureLuminance {
+  uint scratch[];
+};
+
+layout(std430, binding = 30) buffer AutoExposureResult {
+  float autoExposureEv[];
+};
+
+layout(push_constant) uniform CoreParams {
+  uint width;
+  uint height;
+  float filmExposureEv;
+  float filmGamma;
+  uint exposureCount;
+  int inputColorSpace;
+  int rgbToRawMethod;
+  uint colorSpaceCount;
+  uint transferLutSize;
+  float colorDecodeMin;
+  float colorDecodeMax;
+  uint hanatosWidth;
+  uint hanatosHeight;
+  uint _pad0;
+  uint _pad1;
+  uint _pad2;
+  int filmPushPullMode;
+  float filmPushPullStops;
+  uint fullWidth;
+  uint fullHeight;
+  uint tileOriginX;
+  uint tileOriginY;
+  uint activeOriginX;
+  uint activeOriginY;
+  uint activeWidth;
+  uint activeHeight;
+} params;
+
+shared float sharedWeightedSum[256];
+shared float sharedWeightSum[256];
+shared uint sharedCounts[256];
+shared uint sharedMin[256];
+shared uint sharedMax[256];
+
+uint colorSpaceIndex() {
+  return uint(clamp(params.inputColorSpace, 0, int(max(params.colorSpaceCount, 1u)) - 1));
+}
+
+float sampleDecodeLut(float value, uint colorSpace) {
+  const uint lutSize = max(params.transferLutSize, 2u);
+  const float range = max(params.colorDecodeMax - params.colorDecodeMin, 1.0e-6);
+  const float step = range / float(lutSize - 1u);
+  const uint offset = colorSpace * lutSize;
+  if (value <= params.colorDecodeMin) {
+    const float y0 = read_colorDecodeLuts(offset);
+    const float y1 = read_colorDecodeLuts(offset + 1u);
+    return y0 + (value - params.colorDecodeMin) * ((y1 - y0) / max(step, 1.0e-12));
+  }
+  if (value >= params.colorDecodeMax) {
+    const float y0 = read_colorDecodeLuts(offset + lutSize - 2u);
+    const float y1 = read_colorDecodeLuts(offset + lutSize - 1u);
+    return y1 + (value - params.colorDecodeMax) * ((y1 - y0) / max(step, 1.0e-12));
+  }
+  const float position =
+    ((value - params.colorDecodeMin) / range) * float(lutSize - 1u);
+  const uint lo = uint(floor(position));
+  const uint hi = min(lo + 1u, lutSize - 1u);
+  return mix(
+    read_colorDecodeLuts(offset + lo),
+    read_colorDecodeLuts(offset + hi),
+    position - float(lo)
+  );
+}
+
+float meterLuminance(vec3 rgb, uint colorSpace) {
+  if (read_colorTransferKinds(colorSpace) != 0u) {
+    rgb = vec3(
+      sampleDecodeLut(rgb.r, colorSpace),
+      sampleDecodeLut(rgb.g, colorSpace),
+      sampleDecodeLut(rgb.b, colorSpace)
+    );
+  }
+  const uint matrixOffset = colorSpace * 9u;
+  return inputMeterXyz[matrixOffset + 3u] * rgb.r +
+         inputMeterXyz[matrixOffset + 4u] * rgb.g +
+         inputMeterXyz[matrixOffset + 5u] * rgb.b;
+}
+
+uint orderedFloatKey(float value) {
+  const uint bits = floatBitsToUint(value);
+  return (bits & 0x80000000u) != 0u ? ~bits : bits ^ 0x80000000u;
+}
+
+float floatFromOrderedKey(uint key) {
+  const uint bits = (key & 0x80000000u) != 0u ? key ^ 0x80000000u : ~key;
+  return uintBitsToFloat(bits);
+}
+
+uint regionIndex(uint index, uint origin, uint regionWidth, uint stride) {
+  return origin + (regionWidth == stride ? index : (index / regionWidth) * stride + index % regionWidth);
+}
+
+uint stateOffset(uint region) {
+  // Each region stores its prefix, remaining rank, lower key, and final luminance.
+  return SPEKTRA_AE_MAX_SAMPLES + region * SPEKTRA_AE_REGION_WORDS;
+}
+
+uint histogramOffset(uint region, uint group) {
+  return stateOffset(region) + 4u + group * SPEKTRA_AE_BINS * 3u;
+}
+
+float sampleLuminance(uint index, uvec2 preview, uvec2 source) {
+  const uint sourceX = min(source.x - 1u, ((index % preview.x) * source.x) / preview.x);
+  const uint sourceY = min(source.y - 1u, ((index / preview.x) * source.y) / preview.y);
+  const uint sourceIndex = params._pad1 == 1u || params._pad1 == 2u ? index : sourceY * source.x + sourceX;
+  return meterLuminance(read_src(sourceIndex).rgb, colorSpaceIndex());
+}
+
+void reduceWeights() {
+  const uint lane = gl_LocalInvocationIndex;
+  barrier();
+  for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+    if (lane < stride) {
+      sharedWeightedSum[lane] += sharedWeightedSum[lane + stride];
+      sharedWeightSum[lane] += sharedWeightSum[lane + stride];
+    }
+    barrier();
+  }
+}
+
+void sampleRegion(uint region, uint origin, uvec2 size, uvec2 preview, uvec2 source) {
+  const uint lane = gl_LocalInvocationIndex;
+  const uint group = gl_WorkGroupID.x;
+  const uint count = size.x * size.y;
+  const uint begin = group * SPEKTRA_AE_GROUP_SAMPLES;
+  if (begin >= count) return;
+  const uint end = min(begin + SPEKTRA_AE_GROUP_SAMPLES, count);
+  const uint outputOffset = histogramOffset(region, group);
+  if (params._pad0 != 1u) {
+    const float longestEdge = float(max(size.x, size.y));
+    const float normX = float(size.x) / longestEdge;
+    const float normY = float(size.y) / longestEdge;
+    float weighted = 0.0;
+    float weights = 0.0;
+    for (uint index = begin + lane; index < end; index += 256u) {
+      const float xf = (float(index % size.x) / float(size.x) - 0.5) * normX;
+      const float yf = (float(index / size.x) / float(size.y) - 0.5) * normY;
+      const float weight = exp(-(xf * xf + yf * yf) / 0.08);
+      weighted += sampleLuminance(regionIndex(index, origin, size.x, preview.x), preview, source) * weight;
+      weights += weight;
+    }
+    sharedWeightedSum[lane] = weighted;
+    sharedWeightSum[lane] = weights;
+    reduceWeights();
+    if (lane == 0u) {
+      scratch[outputOffset] = floatBitsToUint(sharedWeightedSum[0]);
+      scratch[outputOffset + 1u] = floatBitsToUint(sharedWeightSum[0]);
+    }
+    return;
+  }
+
+  const uint state = stateOffset(region);
+  if (params._pad2 > 0u && scratch[state + 1u] == 0xffffffffu) return;
+  const uint shift = 24u - (params._pad2 / 2u) * 8u;
+  const uint mask = params._pad2 == 0u ? 0u : 0xffffffffu << (shift + 8u);
+  const uint prefix = params._pad2 == 0u ? 0u : scratch[state];
+  sharedCounts[lane] = 0u;
+  sharedMin[lane] = 0xffffffffu;
+  sharedMax[lane] = 0u;
+  barrier();
+  for (uint index = begin + lane; index < end; index += 256u) {
+    const uint sampleIndex = regionIndex(index, origin, size.x, preview.x);
+    uint key;
+    if (params._pad2 == 0u) {
+      key = orderedFloatKey(sampleLuminance(sampleIndex, preview, source));
+      if (region == 0u) scratch[sampleIndex] = key;
+    } else {
+      key = scratch[sampleIndex];
+    }
+    if ((key & mask) == prefix) {
+      const uint bin = (key >> shift) & 255u;
+      atomicAdd(sharedCounts[bin], 1u);
+      atomicMin(sharedMin[bin], key);
+      atomicMax(sharedMax[bin], key);
+    }
+  }
+  barrier();
+  scratch[outputOffset + lane] = sharedCounts[lane];
+  scratch[outputOffset + 256u + lane] = sharedMin[lane];
+  scratch[outputOffset + 512u + lane] = sharedMax[lane];
+}
+
+void reduceRegion(uint region, uint count) {
+  const uint lane = gl_LocalInvocationIndex;
+  const uint groups = (count + SPEKTRA_AE_GROUP_SAMPLES - 1u) / SPEKTRA_AE_GROUP_SAMPLES;
+  const uint state = stateOffset(region);
+  barrier();
+  if (params._pad0 != 1u) {
+    const uint inputOffset = histogramOffset(region, lane);
+    sharedWeightedSum[lane] = lane < groups ? uintBitsToFloat(scratch[inputOffset]) : 0.0;
+    sharedWeightSum[lane] = lane < groups ? uintBitsToFloat(scratch[inputOffset + 1u]) : 0.0;
+    reduceWeights();
+    if (lane == 0u) scratch[state + 3u] = floatBitsToUint(sharedWeightedSum[0] / max(sharedWeightSum[0], 1.0e-30));
+    return;
+  }
+  if (params._pad2 > 1u && scratch[state + 1u] == 0xffffffffu) return;
+  const uint rank = params._pad2 == 1u ? count / 2u : scratch[state + 1u];
+  const uint prefix = params._pad2 == 1u ? 0u : scratch[state];
+  const uint previousLower = params._pad2 == 1u ? 0u : scratch[state + 2u];
+  uint binCount = 0u;
+  uint binMin = 0xffffffffu;
+  uint binMax = 0u;
+  for (uint group = 0u; group < groups; ++group) {
+    const uint offset = histogramOffset(region, group) + lane;
+    binCount += scratch[offset];
+    binMin = min(binMin, scratch[offset + 256u]);
+    binMax = max(binMax, scratch[offset + 512u]);
+  }
+  sharedCounts[lane] = binCount;
+  sharedMax[lane] = binMax;
+  barrier();
+  for (uint stride = 1u; stride < 256u; stride <<= 1u) {
+    const uint beforeCount = lane >= stride ? sharedCounts[lane - stride] : 0u;
+    const uint beforeMax = lane >= stride ? sharedMax[lane - stride] : 0u;
+    barrier();
+    sharedCounts[lane] += beforeCount;
+    sharedMax[lane] = max(sharedMax[lane], beforeMax);
+    barrier();
+  }
+  const uint preceding = sharedCounts[lane] - binCount;
+  if (preceding <= rank && rank < sharedCounts[lane]) {
+    const uint lowerKey = max(previousLower, lane == 0u ? 0u : sharedMax[lane - 1u]);
+    const uint remainingRank = rank - preceding;
+    scratch[state] = prefix | (lane << (24u - (params._pad2 / 2u) * 8u));
+    scratch[state + 1u] = remainingRank;
+    scratch[state + 2u] = lowerKey;
+    if (binMin == binMax) {
+      // Retain the exact lower middle value when the upper middle starts a new bucket.
+      const float upper = floatFromOrderedKey(binMin);
+      const float lower = remainingRank > 0u ? upper : floatFromOrderedKey(lowerKey);
+      const float value = (count & 1u) == 0u ? 0.5 * (lower + upper) : upper;
+      scratch[state + 3u] = floatBitsToUint(value);
+      scratch[state + 1u] = 0xffffffffu;
+    }
+  }
+}
+
+void main() {
+  const uvec2 source = max(uvec2(params.fullWidth, params.fullHeight), uvec2(1u));
+  const uint longEdge = max(source.x, source.y);
+  const uvec2 preview = longEdge <= 256u ? source : max(uvec2(1u), uvec2(floor(vec2(source) * 256.0 / float(longEdge) + 0.5)));
+  uvec2 tappedSize = uvec2(1u);
+  uint tappedOrigin = 0u;
+  if (params._pad1 == 2u) {
+    tappedSize = max(uvec2(1u), uvec2(vec2(preview) * 0.12));
+    const uvec2 center = min(preview - 1u, uvec2(params.activeOriginX, params.activeOriginY) * preview / source);
+    const uvec2 origin = uvec2(clamp(ivec2(center) - ivec2(tappedSize / 2u), ivec2(0), ivec2(preview - tappedSize)));
+    tappedOrigin = origin.y * preview.x + origin.x;
+  }
+  if ((params._pad2 & 1u) == 0u) {
+    const uint region = gl_WorkGroupID.y;
+    sampleRegion(region, region == 0u ? 0u : tappedOrigin, region == 0u ? preview : tappedSize, preview, source);
+    return;
+  }
+
+  reduceRegion(0u, preview.x * preview.y);
+  if (params._pad1 == 2u) reduceRegion(1u, tappedSize.x * tappedSize.y);
+  memoryBarrierBuffer();
+  barrier();
+  if (gl_LocalInvocationIndex == 0u && (params._pad0 != 1u || params._pad2 == SPEKTRA_AE_MEDIAN_PASSES - 1u)) {
+    float meteredY = uintBitsToFloat(scratch[stateOffset(0u) + 3u]);
+    if (params._pad1 == 2u) {
+      const float tappedY = uintBitsToFloat(scratch[stateOffset(1u) + 3u]);
+      if (meteredY > 0.0 && tappedY >= 0.0) {
+        // Keep the full scene in the reading and bound the tap's influence to one stop.
+        meteredY = clamp(0.5 * (meteredY + tappedY), 0.5 * meteredY, 2.0 * meteredY);
+      }
+    }
+    const float exposure = meteredY / 0.184;
+    const float ev = exposure > 0.0 ? -log2(exposure) : 0.0;
+    autoExposureEv[0] = (isnan(ev) || isinf(ev)) ? 0.0 : ev;
+  }
+}

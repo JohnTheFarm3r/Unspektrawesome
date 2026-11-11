@@ -1,0 +1,41 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Clipped-channel estimate of darktable's "inpaint opposed" highlight reconstruction:
+// https://github.com/darktable-org/darktable/blob/master/src/iop/hlreconstruct/opposed.c
+// Copyright (C) 2022-2026 darktable developers. GNU General Public License version 3 or later.
+// Modified for Vulkan shaders.
+#include "amaze/amaze_common.glsl"
+#include "highlight_recovery.glsl"
+
+layout(local_size_x_id = 12, local_size_y_id = 13, local_size_z = 1) in;
+layout(set = 0, binding = 7) uniform sampler2D demosaicImage;
+layout(set = 0, binding = 2, rgba16f) writeonly uniform image2D hrTmpImage;
+layout(set = 0, binding = 10, rgba16f) writeonly uniform image2D hrMaskImage;
+
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    if (pos.x >= AMAZE_WIDTH || pos.y >= AMAZE_HEIGHT) return;
+    highp vec3 wb = hrWhiteBalance(rawColor.whiteBalanceExposure.xyz);
+    highp vec3 clips = hrClips(wb);
+    highp vec3 scaled = max(texelFetch(demosaicImage, pos, 0).rgb * wb, vec3(0.0));
+    highp vec3 tmp = scaled;
+    highp vec3 mask = vec3(0.0);
+
+    if (pos.x > 0 && pos.y > 0 && pos.x < AMAZE_WIDTH - 1 && pos.y < AMAZE_HEIGHT - 1 &&
+        hrAnyClipped(scaled, clips)) {
+        highp vec3 mean = vec3(0.0);
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                mean += max(texelFetch(demosaicImage, pos + ivec2(dx, dy), 0).rgb * wb, vec3(0.0));
+            }
+        }
+        highp vec3 refavg = hrRefavg(mean);
+        if (scaled.r >= clips.r) { tmp.r = refavg.r; mask.r = 1.0; }
+        if (scaled.g >= clips.g) { tmp.g = refavg.g; mask.g = 1.0; }
+        if (scaled.b >= clips.b) { tmp.b = refavg.b; mask.b = 1.0; }
+    }
+
+    imageStore(hrTmpImage, pos, vec4(tmp, 1.0));
+    imageStore(hrMaskImage, pos, vec4(mask, 1.0));
+}

@@ -1,0 +1,24 @@
+#version 450
+
+layout(local_size_x = 128) in;
+layout(binding = 0, rgba8) uniform readonly image2D source;
+layout(std430, binding = 1) buffer Histogram { uint bins[]; };
+shared uint counts[768];
+
+void main() {
+    const uint localIndex = gl_LocalInvocationIndex;
+    for (uint bin = localIndex; bin < 768u; bin += 128u) counts[bin] = 0u;
+    barrier();
+
+    const uint pixel = gl_GlobalInvocationID.x;
+    const uvec3 level = uvec3(round(imageLoad(source, ivec2(pixel % 128u, pixel / 128u)).rgb * 255.0));
+    atomicAdd(counts[level.r], 1u);
+    atomicAdd(counts[256u + level.g], 1u);
+    atomicAdd(counts[512u + level.b], 1u);
+    barrier();
+
+    for (uint bin = localIndex; bin < 768u; bin += 128u) {
+        const uint count = counts[bin];
+        if (count != 0u) atomicAdd(bins[bin], count);
+    }
+}

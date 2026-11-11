@@ -1,0 +1,27 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "SpektraStorageBuffer.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#include "SpektraLinearDispatch.h"
+layout(binding = 0, rgba16f) uniform writeonly image2D image;
+SPEKTRA_READ_BUFFER(1, vec4, 16u, pixels)
+layout(push_constant) uniform OutputParams {
+  uint pixelCount;
+  uint mode;
+  uint width;
+  uint originX;
+  uint originY;
+} params;
+
+#include "SpektraHalfDither.glsl"
+
+void main() {
+  const uint index = spektraLinearIndex();
+  if (index >= params.pixelCount) return;
+  const vec4 color = read_pixels(index);
+  const vec3 rgb = ditherRgbForHalf(color.rgb, index);
+  const vec2 rg = unpackHalf2x16(packHalf2x16(rgb.rg));
+  const vec2 ba = unpackHalf2x16(packHalf2x16(vec2(rgb.b, color.a)));
+  imageStore(image, ivec2(index % params.width + params.originX, index / params.width + params.originY), vec4(rg, ba));
+}

@@ -1,0 +1,127 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Preview pass of darktable's "inpaint opposed" highlight reconstruction:
+// https://github.com/darktable-org/darktable/blob/master/src/iop/hlreconstruct/opposed.c
+// Copyright (C) 2022-2026 darktable developers. GNU General Public License version 3 or later.
+// Modified for Vulkan shaders.
+
+#include "raw_color.glsl"
+#include "frame_geometry.glsl"
+#include "highlight_recovery.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 0) uniform sampler2D sourceImage;
+layout(set = 0, binding = 1, std140) uniform RawDimensions {
+    ivec4 dimensions;
+} rawParams;
+layout(set = 0, binding = 2, rgba16f) writeonly uniform image2D outputImage;
+layout(set = 0, binding = 5) uniform sampler2D temporaryImage;
+layout(set = 0, binding = 7) uniform sampler2D maskImage;
+layout(set = 0, binding = 8, rgba16f) writeonly uniform image2D maskOutput;
+layout(set = 0, binding = 9) buffer HrReduce {
+    int chromaSum[3];
+    uint chromaCount[3];
+} hrReduce;
+
+vec2 shadingUvAt(ivec2 position) {
+    return geometryLensShadingUv(geometrySourceUv(position), rawParams.dimensions.xy);
+}
+
+vec3 shadingAt(ivec2 position) {
+    vec4 gains = rawLensGains(shadingUvAt(position));
+    return max(vec3(gains.r, 0.5 * (gains.g + gains.b), gains.a), vec3(0.000001));
+}
+
+vec3 scaledAt(ivec2 position) {
+    // The preview already contains white balance and lens shading gains.
+    return max(texelFetch(sourceImage, position, 0).rgb / shadingAt(position), vec3(0.0));
+}
+
+#if PREVIEW_HR_STAGE == 0
+void main() {
+    ivec2 position = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = frameGeometry.transform.zw;
+    if (any(greaterThanEqual(position, size))) return;
+    vec3 scaled = scaledAt(position);
+    vec3 clips = hrClips(hrWhiteBalance(rawColor.whiteBalanceExposure.xyz));
+    vec3 temporary = scaled;
+    vec3 mask = vec3(0.0);
+    if (all(greaterThan(position, ivec2(0))) && all(lessThan(position, size - 1)) &&
+        hrAnyClipped(scaled, clips)) {
+        vec3 mean = vec3(0.0);
+        for (int y = -1; y <= 1; ++y)
+            for (int x = -1; x <= 1; ++x)
+                mean += scaledAt(position + ivec2(x, y));
+        vec3 reference = hrRefavg(mean);
+        for (int channel = 0; channel < 3; ++channel) {
+            if (scaled[channel] >= clips[channel]) {
+                temporary[channel] = reference[channel];
+                mask[channel] = 1.0;
+            }
+        }
+    }
+    imageStore(outputImage, position, vec4(temporary, 1.0));
+    imageStore(maskOutput, position, vec4(mask, 1.0));
+}
+#elif PREVIEW_HR_STAGE == 1
+shared int workgroupSum[3];
+shared uint workgroupCount[3];
+
+bool adjacentClipping(ivec2 position, int channel) {
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x)
+            if (texelFetch(maskImage, position + ivec2(x, y), 0)[channel] > 0.5) return true;
+    return false;
+}
+
+void main() {
+    uint index = gl_LocalInvocationIndex;
+    if (index < 3u) {
+        workgroupSum[index] = 0;
+        workgroupCount[index] = 0u;
+    }
+    barrier();
+    ivec2 position = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = frameGeometry.transform.zw;
+    if (all(greaterThanEqual(position, ivec2(HR_BORDER))) &&
+        all(lessThan(position, size - HR_BORDER))) {
+        vec3 clips = hrClips(hrWhiteBalance(rawColor.whiteBalanceExposure.xyz));
+        vec3 clipdark = hrClipDark(clips);
+        vec3 scaled = scaledAt(position);
+        vec3 temporary = texelFetch(temporaryImage, position, 0).rgb;
+        for (int channel = 0; channel < 3; ++channel) {
+            if (scaled[channel] > clipdark[channel] && scaled[channel] < clips[channel] &&
+                adjacentClipping(position, channel)) {
+                atomicAdd(workgroupSum[channel], int(round((scaled[channel] - temporary[channel]) * HR_REDUCE_SCALE)));
+                atomicAdd(workgroupCount[channel], 1u);
+            }
+        }
+    }
+    barrier();
+    if (index < 3u) {
+        atomicAdd(hrReduce.chromaSum[index], workgroupSum[index]);
+        atomicAdd(hrReduce.chromaCount[index], workgroupCount[index]);
+    }
+}
+#else
+void main() {
+    ivec2 position = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(position, frameGeometry.transform.zw))) return;
+    vec4 source = texelFetch(sourceImage, position, 0);
+    vec3 shading = shadingAt(position);
+    vec3 wb = hrWhiteBalance(rawColor.whiteBalanceExposure.xyz);
+    vec3 sensor = max(source.rgb / (shading * wb), vec3(0.0));
+    vec3 chroma = vec3(0.0);
+    for (int channel = 0; channel < 3; ++channel)
+        if (hrReduce.chromaCount[channel] > 0u)
+            chroma[channel] = float(hrReduce.chromaSum[channel]) /
+                (HR_REDUCE_SCALE * float(hrReduce.chromaCount[channel]));
+    vec3 recovered = applyOpposedHighlightRecovery(sensor,
+        texelFetch(temporaryImage, position, 0).rgb, chroma, wb) * wb * shading;
+    // Keep unaffected channels unchanged through the extra intermediate image.
+    recovered = mix(source.rgb, recovered, greaterThanEqual(sensor, vec3(HR_CLIP_VALUE)));
+    vec3 processed = rawColor.reserved1.w > 0.001 ? recovered :
+        rawColorProcess(recovered, shadingUvAt(position), 0.0, true, recovered, true);
+    imageStore(outputImage, position, vec4(processed, source.a));
+}
+#endif

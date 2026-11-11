@@ -1,0 +1,19 @@
+uniform float2 resolution;
+uniform int field;
+
+half4 main(float2 position) {
+    float2 uv = position / resolution;
+    if (field == 0) {
+        float center = 0.38 + 0.20 * sin(uv.y * 6.28318530718);
+        float wave = 1.0 - smoothstep(0.0, 0.26, abs(uv.x - center));
+        return half4((0.19 / 0.265) * wave * wave, 0.0, 0.0, 1.0);
+    }
+    if (field == 1) {
+        float center = 0.76 + 0.15 * sin(uv.y * 6.28318530718);
+        float wave = 1.0 - smoothstep(0.0, 0.21, abs(uv.x - center));
+        return half4((0.075 / 0.265) * wave * wave, 0.0, 0.0, 1.0);
+    }
+    float glow = 1.0 - smoothstep(0.0, 1.0, length(uv * 2.0 - 1.0));
+    // Full-range fields are combined, colored and dithered after enlargement.
+    return half4(0.0, glow * glow, 0.0, 1.0);
+}

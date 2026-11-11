@@ -1,0 +1,17 @@
+#version 450
+
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0) uniform usampler2D rawImage;
+layout(std430, set = 0, binding = 1) writeonly buffer Samples { uint values[]; } samples;
+layout(push_constant) uniform Parameters { ivec2 size; } parameters;
+
+void main()
+{
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= 9u * 5u * 16u) return;
+    int cell = int(index) / 16;
+    int offset = int(index) % 16;
+    ivec2 origin = (max(parameters.size - 4, ivec2(0)) * ivec2(cell % 9, cell / 9) / ivec2(8, 4)) & ~1;
+    ivec2 position = min(origin + ivec2(offset % 4, offset / 4), parameters.size - 1);
+    samples.values[index] = texelFetch(rawImage, position, 0).r;
+}

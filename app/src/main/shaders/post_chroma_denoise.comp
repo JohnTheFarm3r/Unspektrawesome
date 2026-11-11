@@ -1,0 +1,582 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D inputImage;
+layout(set = 0, binding = 1, rgba16f) writeonly uniform image2D outputImage;
+
+layout(push_constant) uniform PushConstants {
+    int width;
+    int height;
+    float sharpenAmount;
+    float sharpenRadius;
+    float sharpenThreshold;
+    float chromaDenoiseStrength;
+    float nlmStrength;
+    float localContrastStrength;
+    float pixelSizeX;
+    float pixelSizeY;
+    int colorSpace;
+    float noiseProfileS;
+    float noiseProfileO;
+    float wbR;
+    float wbG;
+    float wbB;
+} pc;
+
+const float KERNEL[5] = float[](0.0625, 0.25, 0.375, 0.25, 0.0625);
+const float KERNEL_ENERGY = 0.07476806640625;
+
+vec3 getLumaCoeffs() {
+    if (pc.colorSpace == 2 || pc.colorSpace == 11) {
+        return vec3(0.2625727, 0.6780925, 0.0593346);
+    }
+    if (pc.colorSpace == 3) {
+        return vec3(0.2682694, 0.7152068, 0.0165652);
+    }
+    if (pc.colorSpace == 4) {
+        return vec3(0.2605450, 0.7750038, -0.0355489);
+    }
+    if (pc.colorSpace == 5) {
+        return vec3(0.2739690, 0.8737529, -0.1477220);
+    }
+    if (pc.colorSpace == 6) {
+        return vec3(0.2676918, 0.6743654, 0.0579858);
+    }
+    if (pc.colorSpace == 7) {
+        return vec3(0.2611107, 0.8697614, -0.1308722);
+    }
+    if (pc.colorSpace == 8) {
+        return vec3(0.2708338, 0.7867251, -0.0575590);
+    }
+    if (pc.colorSpace == 9) {
+        return vec3(0.2149476, 0.8851707, -0.1001184);
+    }
+    if (pc.colorSpace == 10) {
+        return vec3(0.2918320, 0.8239383, -0.1157704);
+    }
+    return vec3(0.2126, 0.7152, 0.0722);
+}
+
+vec3 rgbToYCbCr(vec3 rgb, vec3 w) {
+    float y = dot(rgb, w);
+    return vec3(
+        y,
+        (rgb.b - y) / (2.0 * (1.0 - w.b)),
+        (rgb.r - y) / (2.0 * (1.0 - w.r))
+    );
+}
+
+vec3 yCbCrToRgb(vec3 yuv, vec3 w) {
+    float r = yuv.x + 2.0 * (1.0 - w.r) * yuv.z;
+    float b = yuv.x + 2.0 * (1.0 - w.b) * yuv.y;
+    float g = (yuv.x - w.r * r - w.b * b) / max(w.g, 1e-6);
+    return vec3(r, g, b);
+}
+
+vec3 inverseSrgbToWorking(vec3 encoded) {
+    vec3 v = clamp(encoded, 0.0, 1.0);
+    bvec3 lowRange = lessThanEqual(v, vec3(0.04045));
+    vec3 low = v / 12.92;
+    vec3 high = pow(max((v + 0.055) / 1.055, vec3(0.0)), vec3(2.4));
+    return mix(high, low, lowRange);
+}
+
+vec3 workingToSrgb(vec3 linear) {
+    vec3 v = clamp(linear, 0.0, 1.0);
+    bvec3 lowRange = lessThanEqual(v, vec3(0.0031308));
+    vec3 low = 12.92 * v;
+    vec3 high = 1.055 * pow(v, vec3(1.0 / 2.4)) - 0.055;
+    return mix(high, low, lowRange);
+}
+
+vec3 inverseBt709ToWorking(vec3 encoded) {
+    vec3 v = clamp(encoded, 0.0, 1.0);
+    bvec3 lowRange = lessThan(v, vec3(0.081));
+    vec3 low = v / 4.5;
+    vec3 high = pow(max((v + 0.099) / 1.099, vec3(0.0)), vec3(1.0 / 0.45));
+    return mix(high, low, lowRange);
+}
+
+vec3 workingToBt709(vec3 linear) {
+    vec3 v = clamp(linear, 0.0, 1.0);
+    bvec3 lowRange = lessThan(v, vec3(0.018));
+    vec3 low = 4.5 * v;
+    vec3 high = 1.099 * pow(v, vec3(0.45)) - 0.099;
+    return mix(high, low, lowRange);
+}
+
+vec3 inversePqToWorking(vec3 encoded) {
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 128.0;
+    const float c3 = 2392.0 / 128.0;
+    vec3 n = pow(clamp(encoded, 0.0, 1.0), vec3(1.0 / m2));
+    vec3 absoluteLinear = pow(
+        max(n - c1, vec3(0.0)) / max(c2 - c3 * n, vec3(1e-6)),
+        vec3(1.0 / m1));
+    return absoluteLinear * 10.0;
+}
+
+vec3 workingToPq(vec3 linear) {
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 128.0;
+    const float c3 = 2392.0 / 128.0;
+    vec3 absoluteLinear = clamp(linear * 0.1, 0.0, 1.0);
+    vec3 lm = pow(absoluteLinear, vec3(m1));
+    return pow((c1 + c2 * lm) / (1.0 + c3 * lm), vec3(m2));
+}
+
+vec3 inverseHlgToWorking(vec3 encoded) {
+    const float a = 0.17883277;
+    const float b = 0.28466892;
+    const float c = 0.55991073;
+    vec3 v = clamp(encoded, 0.0, 1.0);
+    bvec3 lowRange = lessThanEqual(v, vec3(0.5));
+    vec3 low = (v * v) / 3.0;
+    vec3 high = (exp((v - c) / a) + b) / 12.0;
+    return mix(high, low, lowRange);
+}
+
+vec3 workingToHlg(vec3 linear) {
+    const float a = 0.17883277;
+    const float b = 0.28466892;
+    const float c = 0.55991073;
+    vec3 v = clamp(linear, 0.0, 1.0);
+    bvec3 lowRange = lessThanEqual(v, vec3(1.0 / 12.0));
+    vec3 low = sqrt(3.0 * v);
+    vec3 high = a * log(max(12.0 * v - b, vec3(1e-6))) + c;
+    return mix(high, low, lowRange);
+}
+
+float log10Safe(float value) {
+    return log(max(value, 1e-6)) / log(10.0);
+}
+
+vec3 inverseCineonToWorking(vec3 encoded) {
+    const float blackOffset = 0.0107977516;
+    vec3 v = max(encoded, vec3(0.0));
+    return (pow(vec3(10.0), (1023.0 * v - 685.0) / 300.0) - blackOffset) /
+        (1.0 - blackOffset);
+}
+
+vec3 workingToCineon(vec3 linear) {
+    const float blackOffset = 0.0107977516;
+    vec3 density = max(linear * (1.0 - blackOffset) + blackOffset, vec3(1e-6));
+    vec3 code = (685.0 + 300.0 * vec3(
+        log10Safe(density.r), log10Safe(density.g), log10Safe(density.b))) / 1023.0;
+    return clamp(code, 0.0, 1.0);
+}
+
+float inverseVLogChannel(float value) {
+    if (value < 0.181) return (value - 0.125) / 5.6;
+    return pow(10.0, (value - 0.598206) / 0.241514) - 0.00873;
+}
+
+float encodeVLogChannel(float value) {
+    if (value < 0.01) return 5.6 * value + 0.125;
+    return 0.241514 * log10Safe(value + 0.00873) + 0.598206;
+}
+
+vec3 inverseVLogToWorking(vec3 encoded) {
+    return vec3(
+        inverseVLogChannel(encoded.r),
+        inverseVLogChannel(encoded.g),
+        inverseVLogChannel(encoded.b));
+}
+
+vec3 workingToVLog(vec3 linear) {
+    return clamp(vec3(
+        encodeVLogChannel(linear.r),
+        encodeVLogChannel(linear.g),
+        encodeVLogChannel(linear.b)), 0.0, 1.0);
+}
+
+float inverseDaVinciIntermediateChannel(float value) {
+    if (value <= 0.02740668) return value / 10.44426855;
+    return exp2(value / 0.07329248 - 7.0) - 0.0075;
+}
+
+float encodeDaVinciIntermediateChannel(float value) {
+    if (value <= 0.00262409) return 10.44426855 * value;
+    return (log2(value + 0.0075) + 7.0) * 0.07329248;
+}
+
+vec3 inverseDaVinciIntermediateToWorking(vec3 encoded) {
+    return vec3(
+        inverseDaVinciIntermediateChannel(encoded.r),
+        inverseDaVinciIntermediateChannel(encoded.g),
+        inverseDaVinciIntermediateChannel(encoded.b));
+}
+
+vec3 workingToDaVinciIntermediate(vec3 linear) {
+    return clamp(vec3(
+        encodeDaVinciIntermediateChannel(linear.r),
+        encodeDaVinciIntermediateChannel(linear.g),
+        encodeDaVinciIntermediateChannel(linear.b)), 0.0, 1.0);
+}
+
+float inverseAcescctChannel(float value) {
+    if (value <= 0.15525114) {
+        return (value - 0.0729055341958355) / 10.5402377416545;
+    }
+    return exp2(value * 17.52 - 9.72);
+}
+
+float encodeAcescctChannel(float value) {
+    if (value <= 0.0078125) return 10.5402377416545 * value + 0.0729055341958355;
+    return (log2(value) + 9.72) / 17.52;
+}
+
+vec3 inverseAcescctToWorking(vec3 encoded) {
+    return vec3(
+        inverseAcescctChannel(encoded.r),
+        inverseAcescctChannel(encoded.g),
+        inverseAcescctChannel(encoded.b));
+}
+
+vec3 workingToAcescct(vec3 linear) {
+    return clamp(vec3(
+        encodeAcescctChannel(linear.r),
+        encodeAcescctChannel(linear.g),
+        encodeAcescctChannel(linear.b)), 0.0, 1.0);
+}
+
+float inverseCanonLog3Channel(float value) {
+    if (value < 0.097465473) {
+        return -(pow(10.0, (0.12783901 - value) / 0.36726845) - 1.0) / 14.98325;
+    }
+    if (value <= 0.15277891) return (value - 0.12512219) / 1.9754798;
+    return (pow(10.0, (value - 0.12240537) / 0.36726845) - 1.0) / 14.98325;
+}
+
+float encodeCanonLog3Channel(float value) {
+    if (value < -0.014) {
+        return -0.36726845 * log10Safe(1.0 - 14.98325 * value) + 0.12783901;
+    }
+    if (value <= 0.014) return 1.9754798 * value + 0.12512219;
+    return 0.36726845 * log10Safe(14.98325 * value + 1.0) + 0.12240537;
+}
+
+vec3 inverseCanonLog3ToWorking(vec3 encoded) {
+    return vec3(
+        inverseCanonLog3Channel(encoded.r),
+        inverseCanonLog3Channel(encoded.g),
+        inverseCanonLog3Channel(encoded.b));
+}
+
+vec3 workingToCanonLog3(vec3 linear) {
+    return clamp(vec3(
+        encodeCanonLog3Channel(linear.r),
+        encodeCanonLog3Channel(linear.g),
+        encodeCanonLog3Channel(linear.b)), 0.0, 1.0);
+}
+
+float inverseSLog3Channel(float value) {
+    float code = value * 1023.0;
+    if (code >= 171.2102946929) {
+        return 0.19 * pow(10.0, (code - 420.0) / 261.5) - 0.01;
+    }
+    return (code - 95.0) * 0.01125 / (171.2102946929 - 95.0);
+}
+
+float encodeSLog3Channel(float value) {
+    if (value >= 0.01125) {
+        return (420.0 + 261.5 * log10Safe((value + 0.01) / 0.19)) / 1023.0;
+    }
+    return (95.0 + (171.2102946929 - 95.0) * value / 0.01125) / 1023.0;
+}
+
+vec3 inverseSLog3ToWorking(vec3 encoded) {
+    return vec3(
+        inverseSLog3Channel(encoded.r),
+        inverseSLog3Channel(encoded.g),
+        inverseSLog3Channel(encoded.b));
+}
+
+vec3 workingToSLog3(vec3 linear) {
+    return clamp(vec3(
+        encodeSLog3Channel(linear.r),
+        encodeSLog3Channel(linear.g),
+        encodeSLog3Channel(linear.b)), 0.0, 1.0);
+}
+
+float inverseLogC3Channel(float value) {
+    if (value > 0.149658) {
+        return (pow(10.0, (value - 0.385537) / 0.247190) - 0.052272) / 5.555556;
+    }
+    return (value - 0.092809) / 5.367655;
+}
+
+float encodeLogC3Channel(float value) {
+    if (value > 0.010591) {
+        return 0.247190 * log10Safe(5.555556 * value + 0.052272) + 0.385537;
+    }
+    return 5.367655 * value + 0.092809;
+}
+
+vec3 inverseLogC3ToWorking(vec3 encoded) {
+    return vec3(
+        inverseLogC3Channel(encoded.r),
+        inverseLogC3Channel(encoded.g),
+        inverseLogC3Channel(encoded.b));
+}
+
+vec3 workingToLogC3(vec3 linear) {
+    return clamp(vec3(
+        encodeLogC3Channel(linear.r),
+        encodeLogC3Channel(linear.g),
+        encodeLogC3Channel(linear.b)), 0.0, 1.0);
+}
+
+float inverseFLogChannel(float value) {
+    if (value >= 0.1005377752) {
+        return (pow(10.0, (value - 0.790453) / 0.344676) - 0.009468) / 0.555556;
+    }
+    return (value - 0.092864) / 8.735631;
+}
+
+float encodeFLogChannel(float value) {
+    if (value >= 0.00089) {
+        return 0.344676 * log10Safe(0.555556 * value + 0.009468) + 0.790453;
+    }
+    return 8.735631 * value + 0.092864;
+}
+
+vec3 inverseFLogToWorking(vec3 encoded) {
+    return vec3(
+        inverseFLogChannel(encoded.r),
+        inverseFLogChannel(encoded.g),
+        inverseFLogChannel(encoded.b));
+}
+
+vec3 workingToFLog(vec3 linear) {
+    return clamp(vec3(
+        encodeFLogChannel(linear.r),
+        encodeFLogChannel(linear.g),
+        encodeFLogChannel(linear.b)), 0.0, 1.0);
+}
+
+float inverseMiLogChannel(float value) {
+    const float r0 = -0.09023729;
+    const float c = 18.10531998;
+    const float gamma = 0.09271529;
+    const float beta = 0.01384578;
+    const float delta = 0.67291850;
+    const float point = 0.2189912907;
+    if (value < 0.0) return r0;
+    if (value < point) return sqrt(max(value, 0.0) / c) + r0;
+    return exp2((value - delta) / gamma) - beta;
+}
+
+float encodeMiLogChannel(float value) {
+    const float r0 = -0.09023729;
+    const float c = 18.10531998;
+    const float gamma = 0.09271529;
+    const float beta = 0.01384578;
+    const float delta = 0.67291850;
+    const float point = 0.2189912907;
+    float threshold = sqrt(point / c) + r0;
+    if (value < r0) return 0.0;
+    if (value < threshold) {
+        float difference = value - r0;
+        return c * difference * difference;
+    }
+    return gamma * log2(max(value + beta, 1e-6)) + delta;
+}
+
+vec3 inverseMiLogToWorking(vec3 encoded) {
+    return vec3(
+        inverseMiLogChannel(encoded.r),
+        inverseMiLogChannel(encoded.g),
+        inverseMiLogChannel(encoded.b));
+}
+
+vec3 workingToMiLog(vec3 linear) {
+    return clamp(vec3(
+        encodeMiLogChannel(linear.r),
+        encodeMiLogChannel(linear.g),
+        encodeMiLogChannel(linear.b)), 0.0, 1.0);
+}
+
+vec3 decodeWorkingRgb(vec3 rgb) {
+    if (pc.localContrastStrength < 0.5) return rgb;
+    int transferFunction = int(round(pc.nlmStrength));
+    if (transferFunction == 0) return inverseSrgbToWorking(rgb);
+    if (transferFunction == 1) return inverseBt709ToWorking(rgb);
+    if (transferFunction == 2) return inversePqToWorking(rgb);
+    if (transferFunction == 3) return inverseHlgToWorking(rgb);
+    if (transferFunction == 4) return inverseCineonToWorking(rgb);
+    if (transferFunction == 5) return inverseVLogToWorking(rgb);
+    if (transferFunction == 6) return inverseDaVinciIntermediateToWorking(rgb);
+    if (transferFunction == 7) return inverseAcescctToWorking(rgb);
+    if (transferFunction == 8) return inverseCanonLog3ToWorking(rgb);
+    if (transferFunction == 9) return inverseSLog3ToWorking(rgb);
+    if (transferFunction == 10) return inverseLogC3ToWorking(rgb);
+    if (transferFunction == 11) return inverseFLogToWorking(rgb);
+    if (transferFunction == 12) return max(rgb, vec3(0.0));
+    if (transferFunction == 13) return inverseMiLogToWorking(rgb);
+    return rgb;
+}
+
+vec3 encodeWorkingRgb(vec3 rgb) {
+    if (pc.localContrastStrength < 0.5) return rgb;
+    int transferFunction = int(round(pc.nlmStrength));
+    if (transferFunction == 0) return workingToSrgb(rgb);
+    if (transferFunction == 1) return workingToBt709(rgb);
+    if (transferFunction == 2) return workingToPq(rgb);
+    if (transferFunction == 3) return workingToHlg(rgb);
+    if (transferFunction == 4) return workingToCineon(rgb);
+    if (transferFunction == 5) return workingToVLog(rgb);
+    if (transferFunction == 6) return workingToDaVinciIntermediate(rgb);
+    if (transferFunction == 7) return workingToAcescct(rgb);
+    if (transferFunction == 8) return workingToCanonLog3(rgb);
+    if (transferFunction == 9) return workingToSLog3(rgb);
+    if (transferFunction == 10) return workingToLogC3(rgb);
+    if (transferFunction == 11) return workingToFLog(rgb);
+    if (transferFunction == 12) return max(rgb, vec3(0.0));
+    if (transferFunction == 13) return workingToMiLog(rgb);
+    return rgb;
+}
+
+float noiseSigmaForLuma(float luma) {
+    return sqrt(max(pc.noiseProfileS * max(luma, 0.0) + pc.noiseProfileO, 1e-10));
+}
+
+float propagatedLumaNoiseVariance(float sigmaSquared, vec3 w, vec3 whiteBalance) {
+    vec3 lumaWeights = w * whiteBalance;
+    return sigmaSquared * dot(lumaWeights, lumaWeights);
+}
+
+vec2 propagatedChromaNoiseVariance(float sigmaSquared, vec3 w, vec3 whiteBalance) {
+    float cbDenom = 2.0 * (1.0 - w.b);
+    vec3 cbWeights = vec3(-w.r / cbDenom, -w.g / cbDenom, 0.5);
+    float crDenom = 2.0 * (1.0 - w.r);
+    vec3 crWeights = vec3(0.5, -w.g / crDenom, -w.b / crDenom);
+    vec3 channelVariance = sigmaSquared * whiteBalance * whiteBalance;
+    return vec2(
+        dot(cbWeights * cbWeights, channelVariance),
+        dot(crWeights * crWeights, channelVariance));
+}
+
+float noiseDebiasedEdgeWeight(
+    vec3 centerYuv,
+    vec3 sampleYuv,
+    vec3 w,
+    vec3 whiteBalance) {
+    float centerSigmaSquared = pow(noiseSigmaForLuma(centerYuv.x), 2.0);
+    float sampleSigmaSquared = pow(noiseSigmaForLuma(sampleYuv.x), 2.0);
+    float lumaDifferenceVariance =
+        propagatedLumaNoiseVariance(centerSigmaSquared, w, whiteBalance) +
+        propagatedLumaNoiseVariance(sampleSigmaSquared, w, whiteBalance);
+    vec2 chromaDifferenceVariance =
+        propagatedChromaNoiseVariance(centerSigmaSquared, w, whiteBalance) +
+        propagatedChromaNoiseVariance(sampleSigmaSquared, w, whiteBalance);
+
+    float lumaDifference = sampleYuv.x - centerYuv.x;
+    vec2 chromaDifference = sampleYuv.yz - centerYuv.yz;
+    float lumaDistance = lumaDifference * lumaDifference /
+        max(lumaDifferenceVariance, 1e-10);
+    float chromaDistance = dot(
+        chromaDifference * chromaDifference,
+        1.0 / max(chromaDifferenceVariance, vec2(1e-10)));
+
+    // One luma and two chroma degrees of freedom are expected from noise alone.
+    // Penalize only the distance beyond that expectation, so noise still averages
+    // while actual boundaries stop contributing to broad-radius stages.
+    float structuralDistance = max(lumaDistance - 1.0, 0.0) +
+        max(chromaDistance - 2.0, 0.0);
+    return exp(-0.5 * structuralDistance);
+}
+
+vec3 readYuv(ivec2 coord, vec3 coeffs) {
+    ivec2 clampedCoord = clamp(coord, ivec2(0), ivec2(pc.width - 1, pc.height - 1));
+    vec3 linearRgb = decodeWorkingRgb(texelFetch(inputImage, clampedCoord, 0).rgb);
+    return rgbToYCbCr(linearRgb, coeffs);
+}
+
+void main() {
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    if (gid.x >= pc.width || gid.y >= pc.height) return;
+
+    vec4 original = texelFetch(inputImage, gid, 0);
+    float stageStrength = clamp(pc.chromaDenoiseStrength, 0.0, 1.0);
+    if (stageStrength <= 0.00001) {
+        imageStore(outputImage, gid, original);
+        return;
+    }
+
+    vec3 coeffs = getLumaCoeffs();
+    vec3 centerYuv = rgbToYCbCr(decodeWorkingRgb(original.rgb), coeffs);
+    int sampleScale = max(int(round(pc.sharpenRadius)), 1);
+    int transferFunction = int(round(pc.nlmStrength));
+    bool encodedTransferLinearized = pc.localContrastStrength >= 0.5 &&
+        transferFunction >= 0 && transferFunction <= 13;
+    bool filterIsLinearLight = pc.localContrastStrength < 0.5 ||
+        encodedTransferLinearized;
+    bool protectBroadEdges = filterIsLinearLight && sampleScale >= 4;
+    vec3 whiteBalance = max(abs(vec3(pc.wbR, pc.wbG, pc.wbB)), vec3(1e-3));
+    float weightSum = 0.0;
+    float meanLuma = 0.0;
+    float meanLumaSquared = 0.0;
+    vec2 meanChroma = vec2(0.0);
+    vec2 meanLumaChroma = vec2(0.0);
+
+    for (int y = -2; y <= 2; y++) {
+        for (int x = -2; x <= 2; x++) {
+            float weight = KERNEL[x + 2] * KERNEL[y + 2];
+            vec3 sampleYuv = readYuv(gid + ivec2(x, y) * sampleScale, coeffs);
+            if (protectBroadEdges && (x != 0 || y != 0)) {
+                weight *= noiseDebiasedEdgeWeight(
+                    centerYuv, sampleYuv, coeffs, whiteBalance);
+            }
+            weightSum += weight;
+            meanLuma += sampleYuv.x * weight;
+            meanLumaSquared += sampleYuv.x * sampleYuv.x * weight;
+            meanChroma += sampleYuv.yz * weight;
+            meanLumaChroma += sampleYuv.x * sampleYuv.yz * weight;
+        }
+    }
+
+    float inverseWeightSum = 1.0 / max(weightSum, 1e-10);
+    meanLuma *= inverseWeightSum;
+    meanLumaSquared *= inverseWeightSum;
+    meanChroma *= inverseWeightSum;
+    meanLumaChroma *= inverseWeightSum;
+
+    float lumaVariance = max(meanLumaSquared - meanLuma * meanLuma, 0.0);
+    vec2 lumaChromaCovariance = meanLumaChroma - meanLuma * meanChroma;
+    float sigma = noiseSigmaForLuma(centerYuv.x);
+    float guideEpsilon = max(sigma * sigma * dot(coeffs, coeffs), 1e-6);
+    vec2 linearCoefficient = lumaChromaCovariance / (lumaVariance + guideEpsilon);
+    vec2 guidedChroma = meanChroma +
+        linearCoefficient * (centerYuv.x - meanLuma);
+    // Denoising must not synthesize a chroma extremum on either side of an edge.
+    // Keep the regression prediction inside the center-to-neighborhood interval.
+    guidedChroma = clamp(
+        guidedChroma,
+        min(centerYuv.yz, meanChroma),
+        max(centerYuv.yz, meanChroma));
+
+    vec2 outputChroma = mix(centerYuv.yz, guidedChroma, stageStrength);
+    float neutralizationStrength = clamp(pc.sharpenThreshold, 0.0, 1.0);
+    if (neutralizationStrength > 0.00001) {
+        vec2 profileNoiseVariance = propagatedChromaNoiseVariance(
+            sigma * sigma, coeffs, whiteBalance);
+        float profileNoiseEnergy = profileNoiseVariance.x + profileNoiseVariance.y;
+        float meanNoiseEnergy = profileNoiseEnergy * KERNEL_ENERGY;
+        float measuredChromaEnergy = dot(outputChroma, outputChroma);
+        float reliableChromaGain = measuredChromaEnergy /
+            max(measuredChromaEnergy + meanNoiseEnergy, 1e-10);
+        outputChroma *= mix(1.0, reliableChromaGain, neutralizationStrength);
+    }
+
+    centerYuv.yz = outputChroma;
+    vec3 denoisedRgb = encodeWorkingRgb(yCbCrToRgb(centerYuv, coeffs));
+
+    imageStore(outputImage, gid, vec4(denoisedRgb, original.a));
+}

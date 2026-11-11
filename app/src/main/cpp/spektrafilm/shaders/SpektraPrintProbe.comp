@@ -1,0 +1,22 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "SpektraStorageBuffer.glsl"
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+SPEKTRA_READ_BUFFER(0, vec4, 16u, filmDensity)
+layout(std430, binding = 27) buffer FrameFloats { float frameFloats[]; };
+layout(std430, binding = 28) readonly buffer FrameInts { uint frameInts[]; };
+
+void main() {
+  // Probe the final pass bindings independently of the print shader.
+  const vec4 pixel = read_filmDensity(0u);
+  frameFloats[132] = 1.0;
+  frameFloats[133] = float(frameInts[0]);
+  frameFloats[134] = float(frameInts[8]);
+  frameFloats[135] = float(frameInts[9]);
+  frameFloats[136] = frameFloats[4];
+  frameFloats[137] = pixel.r;
+  frameFloats[138] = pixel.g;
+  frameFloats[139] = pixel.b;
+  frameFloats[140] = pixel.a;
+}

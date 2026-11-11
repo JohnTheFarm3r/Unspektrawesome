@@ -1,0 +1,17 @@
+# JNI_OnLoad resolves this callback by its class name and method signature.
+-keep,allowoptimization class com.unspektrawesome.diagnostics.InternalLogRecorder {
+    public static void recordNative(int, java.lang.String, java.lang.String);
+}
+
+-keep,allowoptimization class com.unspektrawesome.NativeHost {
+    public static android.app.Application application();
+}
+
+# RegisterNatives resolves every native method at library load time.
+-keep,allowoptimization class com.unspektrawesome.vulkan.VulkanRenderer { native <methods>; }
+-keep,allowoptimization class com.unspektrawesome.vulkan.VulkanBridge { native <methods>; }
+-keep,allowoptimization class com.unspektrawesome.vulkan.RawUploadPool { native <methods>; }
+-keep,allowoptimization class com.unspektrawesome.vulkan.RawUpload { native <methods>; }
+-keep,allowoptimization class com.unspektrawesome.preview.RecordingRawBuffer { native <methods>; }
+-keep,allowoptimization class com.unspektrawesome.spektra.SpektraFilmRenderer { native <methods>; }
+-keep,allowoptimization class com.unspektrawesome.burst.RawFrameCompression { native <methods>; }

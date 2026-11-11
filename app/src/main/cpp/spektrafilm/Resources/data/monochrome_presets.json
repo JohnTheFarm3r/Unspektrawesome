@@ -1,0 +1,13 @@
+{
+  "source": "https://github.com/andreavolpato/spektrafilm/tree/6cd00c8d4f30b5b550f50f4bbd3753c9f2a48507/src/spektrafilm/data/presets",
+  "author": "Andrea Volpato",
+  "stocks": {
+    "kodak_trix": {
+      "rms_granularity": 44.0,
+      "density_min": 0.003,
+      "uniformity": 0.6,
+      "particle_scale_sublayers": [1.0, 0.4, 0.25],
+      "same_layer_gamma": 0.2291
+    }
+  }
+}

@@ -1,0 +1,30 @@
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(std430, binding = 0) buffer Results { float results[]; };
+layout(std430, binding = 1) readonly buffer FrameFloats { float frameFloats[]; };
+layout(std430, binding = 2) readonly buffer FrameInts { uint frameInts[]; };
+layout(std430, binding = 3) readonly buffer FilmDensity { vec4 filmDensity[]; };
+layout(push_constant) uniform ProbeStage { uint stage; } probe;
+
+void main() {
+  uint stage = min(probe.stage, 2u);
+  uint offset = stage * 16u;
+  results[offset] = float(stage + 1u);
+  results[offset + 1u] = frameFloats[4];
+  results[offset + 2u] = float(frameInts[0]);
+  results[offset + 3u] = float(frameInts[8]);
+  results[offset + 4u] = float(frameInts[9]);
+  vec4 pixel = filmDensity[0];
+  results[offset + 5u] = pixel.r;
+  results[offset + 6u] = pixel.g;
+  results[offset + 7u] = pixel.b;
+  results[offset + 8u] = pixel.a;
+  results[offset + 9u] = frameFloats[91];
+  results[offset + 10u] = frameFloats[92];
+  results[offset + 11u] = frameFloats[93];
+  results[offset + 12u] = frameFloats[105];
+  results[offset + 13u] = frameFloats[108];
+  results[offset + 14u] = frameFloats[119];
+  results[offset + 15u] = frameFloats[124];
+}

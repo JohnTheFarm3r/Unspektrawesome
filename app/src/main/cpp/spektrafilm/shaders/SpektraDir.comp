@@ -1,0 +1,450 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "SpektraStorageBuffer.glsl"
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+const uint kOpCorrectionFromDensity = 0u;
+const uint kOpBlurX = 1u;
+const uint kOpBlurYStore = 2u;
+const uint kOpTailClear = 3u;
+const uint kOpTailBlurX = 4u;
+const uint kOpTailBlurYAccumulate = 5u;
+const uint kOpRedevelop = 6u;
+// Wide coupler tails run on a reduced grid aligned to absolute image coordinates.
+const uint kOpTailDownsample = 7u;
+const uint kOpTailReducedBlurX = 8u;
+const uint kOpTailReducedBlurYAccumulate = 9u;
+const uint kOpTailUpsampleAccumulate = 10u;
+
+const uint kDirMatrix = 0u;
+const uint kDirDensityMax = 9u;
+const uint kDirBaseSigma = 12u;
+const uint kDirTailSigma = 13u;
+const uint kDirTailWeight = 16u;
+const uint kDirFilmPositive = 17u;
+
+SPEKTRA_READ_BUFFER(0, vec4, 16u, in0)
+
+SPEKTRA_BUFFER(1, vec4, 16u, buf1)
+
+SPEKTRA_READ_BUFFER(2, vec4, 16u, in2)
+
+SPEKTRA_BUFFER(3, vec4, 16u, buf3)
+
+SPEKTRA_READ_BUFFER(4, vec2, 8u, curveExposure)
+
+SPEKTRA_READ_BUFFER(5, float, 4u, densityCurves)
+
+layout(std430, binding = 27) readonly buffer DirFloats {
+  float dirFloats[];
+};
+
+layout(push_constant) uniform CoreParams {
+  uint width;
+  uint height;
+  float filmExposureEv;
+  float filmGamma;
+  uint exposureCount;
+  int inputColorSpace;
+  int rgbToRawMethod;
+  uint colorSpaceCount;
+  uint transferLutSize;
+  float colorDecodeMin;
+  float colorDecodeMax;
+  uint hanatosWidth;
+  uint hanatosHeight;
+  uint operation;
+  uint component;
+  uint _pad2; // reduced tail scale
+  int filmPushPullMode;
+  float filmPushPullStops;
+  uint fullWidth;
+  uint fullHeight;
+  uint tileOriginX;
+  uint tileOriginY;
+  uint activeOriginX;
+  uint activeOriginY;
+  uint activeWidth;
+  uint activeHeight;
+} params;
+
+vec4 loadInput0(uint index) { return read_in0(index); }
+vec4 loadInput2(uint index) { return read_in2(index); }
+vec4 loadBuffer1(uint index) { return read_buf1(index); }
+void storeBuffer1(uint index, vec4 value) { write_buf1(index, value); }
+void storeBuffer3(uint index, vec4 value) { write_buf3(index, value); }
+
+uint safeIndex(int index, uint size) {
+  if (size <= 1u) {
+    return 0u;
+  }
+  return uint(clamp(index, 0, int(size) - 1));
+}
+
+vec4 sampleInput0(int x, int y) {
+  const uint sx = safeIndex(x, params.width);
+  const uint sy = safeIndex(y, params.height);
+  return loadInput0(sy * params.width + sx);
+}
+
+float sigmaForMode() {
+  if (params.operation == kOpTailBlurX || params.operation == kOpTailBlurYAccumulate) {
+    return max(dirFloats[kDirTailSigma + min(params.component, 2u)], 0.0);
+  }
+  return max(dirFloats[kDirBaseSigma], 0.0);
+}
+
+vec4 gaussianSampleInput0(uvec2 gid, float sigma) {
+  if (sigma <= 1.0e-4) {
+    return sampleInput0(int(gid.x), int(gid.y));
+  }
+
+  const int radius = min(int(ceil(3.0 * sigma)), 256);
+  const bool horizontal = params.operation == kOpBlurX || params.operation == kOpTailBlurX;
+  const int x = int(gid.x);
+  const int y = int(gid.y);
+  const float invSigma2 = 1.0 / max(sigma * sigma, 1.0e-8);
+  float weight = exp(-0.5 * invSigma2);
+  float ratio = exp(-1.5 * invSigma2);
+  const float ratioStep = exp(-invSigma2);
+  vec4 value = sampleInput0(x, y);
+  float weightSum = 1.0;
+  for (int offset = 1; offset <= radius; ++offset) {
+    const vec4 samplePair = horizontal
+      ? sampleInput0(x - offset, y) + sampleInput0(x + offset, y)
+      : sampleInput0(x, y - offset) + sampleInput0(x, y + offset);
+    value += samplePair * weight;
+    weightSum += 2.0 * weight;
+    weight *= ratio;
+    ratio *= ratioStep;
+  }
+  return value / max(weightSum, 1.0e-8);
+}
+
+float interpDensityCurve(float logRaw, uint channel) {
+  const uint count = params.exposureCount;
+  if (count == 0u) {
+    return 0.0;
+  }
+  const float lookupRaw = params.filmGamma == 1.0 ? logRaw : logRaw * max(params.filmGamma, 1.0e-6);
+  const float firstX = read_curveExposure(0).x;
+  const float lastX = read_curveExposure(count - 1u).x;
+  if (lookupRaw <= firstX) {
+    return read_densityCurves(channel);
+  }
+  if (lookupRaw >= lastX) {
+    return read_densityCurves((count - 1u) * 3u + channel);
+  }
+
+  uint lo = 0u;
+  uint hi = count - 1u;
+  // Uniform exposure grids can select the same segment without a binary search.
+  const uint candidate = min(uint((lookupRaw - firstX) / (lastX - firstX) * float(count - 1u)), count - 2u);
+  if (read_curveExposure(candidate).x <= lookupRaw && lookupRaw < read_curveExposure(candidate + 1u).x) {
+    lo = candidate;
+    hi = candidate + 1u;
+  }
+  while (hi - lo > 1u) {
+    const uint mid = (lo + hi) >> 1u;
+    if (read_curveExposure(mid).x <= lookupRaw) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+
+  const float x0 = read_curveExposure(lo).x;
+  const float y0 = read_densityCurves(lo * 3u + channel);
+  const float y1 = read_densityCurves(hi * 3u + channel);
+  const float t = clamp((lookupRaw - x0) * read_curveExposure(lo).y, 0.0, 1.0);
+  return mix(y0, y1, t);
+}
+
+float developmentActivity(float stops) {
+  const float clampedStops = clamp(stops, -2.0, 2.0);
+  float developmentSeconds = 180.0;
+  if (clampedStops < 0.0) {
+    developmentSeconds = mix(180.0, 150.0, min(-clampedStops, 1.0));
+  } else if (clampedStops <= 1.0) {
+    developmentSeconds = mix(180.0, 220.0, clampedStops);
+  } else {
+    developmentSeconds = mix(220.0, 280.0, clampedStops - 1.0);
+  }
+  return log(developmentSeconds / 180.0);
+}
+
+float pushPullSpeedGain(float stops) {
+  if (stops > 0.0) {
+    const float pushOne = mix(0.0, 0.33, min(stops, 1.0));
+    return stops <= 1.0 ? pushOne : mix(0.33, 0.5, min(stops - 1.0, 1.0));
+  }
+  if (stops < 0.0) {
+    return mix(0.0, -0.2, min(-stops, 1.0));
+  }
+  return 0.0;
+}
+
+float sigmoid(float u) {
+  return 1.0 / (1.0 + exp(-u));
+}
+
+float pushPullWarpLogRaw(float logRaw, uint channel, float stops) {
+  const float activity = developmentActivity(stops);
+  const float signedActivitySquared = activity * abs(activity);
+  const vec3 toeLinear = vec3(0.0);
+  const vec3 midLinear = vec3(0.25, 0.28, 0.31);
+  const vec3 shoulderLinear = vec3(0.32, 0.38, 0.45);
+  const vec3 toeQuadratic = vec3(0.0);
+  const vec3 midQuadratic = vec3(0.04, 0.06, 0.08);
+  const vec3 shoulderQuadratic = vec3(0.08, 0.12, 0.16);
+  const float toeMask = 1.0 - sigmoid((logRaw + 2.0) / 0.5);
+  const float shoulderMask = sigmoid(logRaw / 0.5);
+  const float midMask = max(1.0 - toeMask - shoulderMask, 0.0);
+  const int channelIndex = int(channel);
+  const float toeShift = toeLinear[channelIndex] * activity + toeQuadratic[channelIndex] * signedActivitySquared;
+  const float midShift = midLinear[channelIndex] * activity + midQuadratic[channelIndex] * signedActivitySquared;
+  const float shoulderShift = shoulderLinear[channelIndex] * activity + shoulderQuadratic[channelIndex] * signedActivitySquared;
+  return logRaw + toeShift * toeMask + midShift * midMask + shoulderShift * shoulderMask;
+}
+
+vec3 experimentalPushPullLogRaw(vec3 logRaw, float stops) {
+  vec3 shifted = logRaw - vec3((stops - pushPullSpeedGain(stops)) * 0.3010299956639812);
+  const float activity = developmentActivity(stops);
+  const float meanLogRaw = (shifted.r + shifted.g + shifted.b) / 3.0;
+  const mat3 coupling = mat3(
+    vec3(0.0, -0.015, 0.015),
+    vec3(0.015, 0.0, -0.015),
+    vec3(-0.015, 0.015, 0.0)
+  );
+  shifted += activity * (coupling * (shifted - vec3(meanLogRaw)));
+  return vec3(
+    pushPullWarpLogRaw(shifted.r, 0u, stops),
+    pushPullWarpLogRaw(shifted.g, 1u, stops),
+    pushPullWarpLogRaw(shifted.b, 2u, stops)
+  );
+}
+
+float experimentalPushPullDensityGain(float logRaw, uint channel, float stops) {
+  const float activity = developmentActivity(stops);
+  const float signedActivitySquared = activity * abs(activity);
+  const vec3 buildLinear = vec3(1.05, 0.95, 1.00);
+  const vec3 buildQuadratic = vec3(-0.90, -0.82, -0.86);
+  const float toeMask = 1.0 - sigmoid((logRaw + 2.0) / 0.5);
+  const float shoulderMask = sigmoid(logRaw / 0.5);
+  const float midMask = max(1.0 - toeMask - shoulderMask, 0.0);
+  const float regionWeight = 0.12 * toeMask + midMask + shoulderMask;
+  const int channelIndex = int(channel);
+  const float build = buildLinear[channelIndex] * activity + buildQuadratic[channelIndex] * signedActivitySquared;
+  return clamp(1.0 + build * regionWeight, 0.35, 2.0);
+}
+
+vec3 developFilmDensity(vec3 logRaw) {
+  if (params.filmPushPullMode == 1) {
+    const vec3 lookupRaw = experimentalPushPullLogRaw(logRaw, params.filmPushPullStops);
+    const vec3 density = vec3(
+      interpDensityCurve(lookupRaw.r, 0u),
+      interpDensityCurve(lookupRaw.g, 1u),
+      interpDensityCurve(lookupRaw.b, 2u)
+    );
+    return density * vec3(
+      experimentalPushPullDensityGain(lookupRaw.r, 0u, params.filmPushPullStops),
+      experimentalPushPullDensityGain(lookupRaw.g, 1u, params.filmPushPullStops),
+      experimentalPushPullDensityGain(lookupRaw.b, 2u, params.filmPushPullStops)
+    );
+  }
+  return vec3(
+    interpDensityCurve(logRaw.r, 0u),
+    interpDensityCurve(logRaw.g, 1u),
+    interpDensityCurve(logRaw.b, 2u)
+  );
+}
+
+vec3 silverDensity(vec3 densityCmy) {
+  if (dirFloats[kDirFilmPositive] > 0.5) {
+    return max(vec3(
+      dirFloats[kDirDensityMax],
+      dirFloats[kDirDensityMax + 1u],
+      dirFloats[kDirDensityMax + 2u]
+    ) - densityCmy, vec3(0.0));
+  }
+  return max(densityCmy, vec3(0.0));
+}
+
+vec3 correctionFromDensity(vec3 densityCmy) {
+  const vec3 silver = silverDensity(densityCmy);
+  return vec3(
+    silver.r * dirFloats[kDirMatrix] + silver.g * dirFloats[kDirMatrix + 3u] + silver.b * dirFloats[kDirMatrix + 6u],
+    silver.r * dirFloats[kDirMatrix + 1u] + silver.g * dirFloats[kDirMatrix + 4u] + silver.b * dirFloats[kDirMatrix + 7u],
+    silver.r * dirFloats[kDirMatrix + 2u] + silver.g * dirFloats[kDirMatrix + 5u] + silver.b * dirFloats[kDirMatrix + 8u]
+  );
+}
+
+float tailAmplitude(uint component) {
+  return component == 0u ? 0.1633 : (component == 1u ? 0.6496 : 0.1870);
+}
+
+uint divCeil(uint value, uint divisor) {
+  divisor = max(divisor, 1u);
+  return (value + divisor - 1u) / divisor;
+}
+
+uint fullWidthSafe() {
+  return max(params.fullWidth, max(params.width, 1u));
+}
+
+uint fullHeightSafe() {
+  return max(params.fullHeight, max(params.height, 1u));
+}
+
+uint tailScale() {
+  return max(params._pad2, 1u);
+}
+
+uvec2 reducedStart() {
+  return uvec2(params.tileOriginX, params.tileOriginY) / tailScale();
+}
+
+uvec2 reducedSize() {
+  const uint scale = tailScale();
+  const uvec2 start = reducedStart();
+  const uvec2 end = uvec2(
+    divCeil(min(params.tileOriginX + params.width, fullWidthSafe()), scale),
+    divCeil(min(params.tileOriginY + params.height, fullHeightSafe()), scale));
+  return max(uvec2(greaterThan(end, start)) * (end - start), uvec2(1u));
+}
+
+vec4 sampleReduced(int x, int y, uvec2 size) {
+  return loadInput0(safeIndex(y, size.y) * size.x + safeIndex(x, size.x));
+}
+
+vec4 tailDownsample(uvec2 gid) {
+  const uint scale = tailScale();
+  const uvec2 base = (reducedStart() + gid) * scale;
+  vec4 value = vec4(0.0);
+  for (uint y = 0u; y < scale; ++y) {
+    for (uint x = 0u; x < scale; ++x) {
+      const uint fullX = min(base.x + x, fullWidthSafe() - 1u);
+      const uint fullY = min(base.y + y, fullHeightSafe() - 1u);
+      value += sampleInput0(int(fullX) - int(params.tileOriginX), int(fullY) - int(params.tileOriginY));
+    }
+  }
+  return value / float(scale * scale);
+}
+
+// Box downsampling and bilinear upsampling widen the kernel by about scale^2 / 4 in
+// variance, so the reduced Gaussian is narrowed to keep the tail width unchanged.
+float reducedTailSigma() {
+  const float sigma = max(dirFloats[kDirTailSigma + min(params.component, 2u)], 0.0);
+  const float scale = float(tailScale());
+  return sqrt(max(sigma * sigma - 0.25 * scale * scale, 0.0)) / scale;
+}
+
+vec4 gaussianSampleReduced(uvec2 gid, uvec2 size, bool horizontal) {
+  const float sigma = reducedTailSigma();
+  if (sigma <= 1.0e-4) {
+    return sampleReduced(int(gid.x), int(gid.y), size);
+  }
+  const int radius = min(int(ceil(3.0 * sigma)), 256);
+  const int x = int(gid.x);
+  const int y = int(gid.y);
+  const float invSigma2 = 1.0 / max(sigma * sigma, 1.0e-8);
+  float weight = exp(-0.5 * invSigma2);
+  float ratio = exp(-1.5 * invSigma2);
+  const float ratioStep = exp(-invSigma2);
+  vec4 value = sampleReduced(x, y, size);
+  float weightSum = 1.0;
+  for (int offset = 1; offset <= radius; ++offset) {
+    const vec4 samplePair = horizontal
+      ? sampleReduced(x - offset, y, size) + sampleReduced(x + offset, y, size)
+      : sampleReduced(x, y - offset, size) + sampleReduced(x, y + offset, size);
+    value += samplePair * weight;
+    weightSum += 2.0 * weight;
+    weight *= ratio;
+    ratio *= ratioStep;
+  }
+  return value / max(weightSum, 1.0e-8);
+}
+
+bool renderReducedTail() {
+  const uvec2 gid = gl_GlobalInvocationID.xy;
+  const uvec2 size = reducedSize();
+  if (params.operation == kOpTailDownsample) {
+    if (gid.x < size.x && gid.y < size.y) storeBuffer1(gid.y * size.x + gid.x, tailDownsample(gid));
+    return true;
+  }
+  if (params.operation == kOpTailReducedBlurX) {
+    if (gid.x < size.x && gid.y < size.y) storeBuffer1(gid.y * size.x + gid.x, gaussianSampleReduced(gid, size, true));
+    return true;
+  }
+  if (params.operation == kOpTailReducedBlurYAccumulate) {
+    if (gid.x >= size.x || gid.y >= size.y) return true;
+    const uint index = gid.y * size.x + gid.x;
+    const vec4 blurred = gaussianSampleReduced(gid, size, false);
+    const vec3 previous = params.component == 0u ? vec3(0.0) : loadBuffer1(index).rgb;
+    storeBuffer1(index, vec4(previous + tailAmplitude(params.component) * blurred.rgb, blurred.a));
+    return true;
+  }
+  return false;
+}
+
+void main() {
+  if (renderReducedTail()) return;
+  const uvec2 activeGid = gl_GlobalInvocationID.xy;
+  const uint activeWidth = params.activeWidth == 0u ? params.width : params.activeWidth;
+  const uint activeHeight = params.activeHeight == 0u ? params.height : params.activeHeight;
+  if (activeGid.x >= activeWidth || activeGid.y >= activeHeight) {
+    return;
+  }
+
+  const uvec2 gid = activeGid + uvec2(params.activeOriginX, params.activeOriginY);
+  if (gid.x >= params.width || gid.y >= params.height) {
+    return;
+  }
+  const uint index = gid.y * params.width + gid.x;
+  if (params.operation == kOpCorrectionFromDensity) {
+    const vec4 density = loadInput0(index);
+    storeBuffer1(index, vec4(correctionFromDensity(density.rgb), density.a));
+    return;
+  }
+  if (params.operation == kOpBlurX || params.operation == kOpBlurYStore || params.operation == kOpTailBlurX) {
+    storeBuffer1(index, gaussianSampleInput0(gid, sigmaForMode()));
+    return;
+  }
+  if (params.operation == kOpTailClear) {
+    const float tailWeight = clamp(dirFloats[kDirTailWeight], 0.0, 1.0);
+    const vec4 input0 = loadInput0(index);
+    storeBuffer1(index, vec4(input0.rgb * (1.0 - tailWeight), input0.a));
+    return;
+  }
+  if (params.operation == kOpTailBlurYAccumulate) {
+    const float tailWeight = clamp(dirFloats[kDirTailWeight], 0.0, 1.0);
+    const vec4 blurred = gaussianSampleInput0(gid, sigmaForMode());
+    storeBuffer1(index, vec4(
+      loadBuffer1(index).rgb + tailWeight * tailAmplitude(params.component) * blurred.rgb,
+      blurred.a
+    ));
+    return;
+  }
+  if (params.operation == kOpTailUpsampleAccumulate) {
+    const float tailWeight = clamp(dirFloats[kDirTailWeight], 0.0, 1.0);
+    const uint scale = tailScale();
+    const uvec2 size = reducedSize();
+    const vec2 reducedPos = (vec2(gid + uvec2(params.tileOriginX, params.tileOriginY)) + vec2(0.5)) / float(scale) - vec2(0.5);
+    const ivec2 baseGlobal = ivec2(floor(reducedPos));
+    const ivec2 base = baseGlobal - ivec2(reducedStart());
+    const vec2 t = clamp(reducedPos - vec2(baseGlobal), vec2(0.0), vec2(1.0));
+    const vec4 upsampled = mix(
+      mix(sampleReduced(base.x, base.y, size), sampleReduced(base.x + 1, base.y, size), t.x),
+      mix(sampleReduced(base.x, base.y + 1, size), sampleReduced(base.x + 1, base.y + 1, size), t.x),
+      t.y);
+    storeBuffer1(index, vec4(loadBuffer1(index).rgb + tailWeight * upsampled.rgb, upsampled.a));
+    return;
+  }
+  if (params.operation == kOpRedevelop) {
+    const vec4 logRaw = loadInput0(index);
+    const vec3 correctedLogRaw = logRaw.rgb - loadInput2(index).rgb;
+    const vec3 density = developFilmDensity(correctedLogRaw);
+    storeBuffer3(index, vec4(max(density, vec3(0.0)), logRaw.a));
+  }
+}

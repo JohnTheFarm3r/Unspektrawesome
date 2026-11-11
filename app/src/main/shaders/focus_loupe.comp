@@ -1,0 +1,495 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+// Focus loupe. A small area of the full-resolution RAW frame, copied by the CPU as 16-bit samples
+// with a halo, is rendered at native resolution for magnified focus checking.
+// LOUPE_PASS 0 normalizes the samples and suppresses hot pixels, 4 remosaics Quad Bayer blocks into a
+// full-resolution Bayer mosaic as the viewfinder does, 1 demosaics and colours the Bayer mosaic,
+// 2 measures edge energy for the focus meter and the loupe peaking threshold, 3 lightly denoises and
+// sharpens the image for display and marks the peaking edges.
+//
+// The focus meter works on a variance-stabilized luminance plane written by pass 1: with the sensor
+// noise profile, every pixel carries noise of about one unit regardless of brightness, so edge energy
+// can be compared against a known noise level in dark and bright areas alike. Pass 2 also stores how
+// far each pixel's smoothed gradient stands above that noise, so grain cannot light peaking edges or
+// be sharpened.
+
+#include "raw_source.glsl"
+#include "raw_color.glsl"
+#include "frame_geometry.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 2, r32f) uniform image2D loupeMosaic;
+layout(set = 0, binding = 5, rgba16f) uniform image2D loupeOutput;
+layout(set = 0, binding = 7, std430) buffer LoupeScore {
+    uint reserved0;
+    uint sumMagnitude;
+    uint groups;
+    uint reserved1;
+    // Per workgroup: edge energy, unused, unused, meter samples.
+    vec4 groupStats[];
+} loupeScore;
+layout(set = 0, binding = 8, r32f) uniform image2D loupeDetail;
+// Normalized Quad Bayer samples before the remosaic pass.
+layout(set = 0, binding = 10, r32f) uniform image2D loupeSource;
+
+layout(push_constant) uniform LoupeParameters {
+    ivec4 region;   // RAW x and y of the first copied sample, copied width and height
+    ivec4 shape;    // samples per row, halo, visible width, visible height
+    vec4 controls;  // noise scale, noise offset, hot pixel suppression, block size
+    vec4 finish;    // peaking strength (0 off), gradient energy of noise alone, unused, unused
+} loupe;
+
+int loupeBlock()
+{
+    return max(int(loupe.controls.w + 0.5), 1);
+}
+
+int loupeCfa()
+{
+    return loupeBlock() > 1 ? rawParams.remosaic.y : rawParams.layoutInfo.z;
+}
+
+// Colour filter site of a position on the camera's block grid. The copy starts on a whole filter period.
+int loupeSite(ivec2 grid)
+{
+    ivec2 parity = grid & ivec2(1);
+    return parity.y * 2 + parity.x;
+}
+
+// Colour of a copied sample in the camera's own pattern.
+int sourceColor(ivec2 position)
+{
+    int site = loupeSite(position / loupeBlock());
+    int cfa = loupeCfa();
+    if (site == cfa) return CFA_RED;
+    if (site == (cfa ^ 3)) return CFA_BLUE;
+    return CFA_GREEN;
+}
+
+// Black and white level index of a copied sample, as RawMosaic.sourceLevel.
+int sourceLevel(ivec2 position)
+{
+    int block = loupeBlock();
+    ivec2 grid = position / block;
+    int site = loupeSite(grid);
+    int cfa = loupeCfa();
+    if (site == cfa) return 0;
+    if (site == (cfa ^ 3)) return 3;
+    return ((grid.y & 1) ^ (block > 1 ? rawParams.remosaic.w & 1 : 0)) + 1;
+}
+
+// Site of a position in the Bayer mosaic the demosaic works on, using the full frame's parity.
+int bayerSite(ivec2 position)
+{
+    ivec2 parity = (loupe.region.xy + position) & ivec2(1);
+    return parity.y * 2 + parity.x;
+}
+
+int bayerColor(ivec2 position)
+{
+    int site = bayerSite(position);
+    int cfa = rawParams.layoutInfo.z;
+    if (site == cfa) return CFA_RED;
+    if (site == (cfa ^ 3)) return CFA_BLUE;
+    return CFA_GREEN;
+}
+
+int bayerLevel(ivec2 position)
+{
+    int site = bayerSite(position);
+    int cfa = rawParams.layoutInfo.z;
+    if (site == cfa) return 0;
+    if (site == (cfa ^ 3)) return 3;
+    return (site >> 1) + 1;
+}
+
+#if LOUPE_PASS == 0
+
+float loupeRawSample(ivec2 position)
+{
+    position = clamp(position, ivec2(0), loupe.region.zw - 1);
+    uint index = uint(position.y * loupe.shape.x + position.x);
+    uint word = rawInput.words[index >> 1u];
+    return float((word >> ((index & 1u) * 16u)) & 65535u);
+}
+
+void main()
+{
+    ivec2 position = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(position, loupe.region.zw))) return;
+    int block = loupeBlock();
+    int level = sourceLevel(position);
+    float black = rawParams.blackLevel[level];
+    float range = max(rawParams.whiteLevel[level] - black, 1.0);
+    float value = max((loupeRawSample(position) - black) / range, 0.0);
+    if (loupe.controls.z > 0.5) {
+        // A hot or dead pixel differs from the nearest samples of its own colour and also stands alone
+        // among its immediate neighbours. Real detail, such as a focused star, lights the pixels next to it.
+        int step = block * 2;
+        float highest = 0.0;
+        float lowest = 1.0e9;
+        float adjacentHigh = 0.0;
+        float adjacentLow = 1.0e9;
+        for (int y = -1; y <= 1; ++y) {
+            for (int x = -1; x <= 1; ++x) {
+                if (x == 0 && y == 0) continue;
+                float neighbour = max((loupeRawSample(position + ivec2(x, y) * step) - black) / range, 0.0);
+                highest = max(highest, neighbour);
+                lowest = min(lowest, neighbour);
+                ivec2 adjacentPosition = position + ivec2(x, y);
+                int adjacentLevel = sourceLevel(clamp(adjacentPosition, ivec2(0), loupe.region.zw - 1));
+                float adjacentBlack = rawParams.blackLevel[adjacentLevel];
+                float adjacent = max((loupeRawSample(adjacentPosition) - adjacentBlack) /
+                    max(rawParams.whiteLevel[adjacentLevel] - adjacentBlack, 1.0), 0.0);
+                adjacentHigh = max(adjacentHigh, adjacent);
+                adjacentLow = min(adjacentLow, adjacent);
+            }
+        }
+        float sigma = sqrt(max(loupe.controls.x * highest + loupe.controls.y, 0.0));
+        float margin = 6.0 * sigma + 0.03;
+        if (value > highest + margin && value > 4.0 * adjacentHigh + margin) value = highest;
+        else if (value < lowest - margin && 4.0 * value + margin < adjacentLow) value = lowest;
+    }
+    ivec2 absolute = loupe.region.xy + position;
+    vec2 sourceUv = (vec2(absolute) + 0.5) / vec2(rawParams.dimensions.xy);
+    float shading = rawLensGains(geometryLensShadingUv(sourceUv, rawParams.dimensions.xy))[level];
+    value *= shading * rawColor.whiteBalanceExposure[sourceColor(position)];
+    if (block > 1) imageStore(loupeSource, position, vec4(value));
+    else imageStore(loupeMosaic, position, vec4(value));
+}
+
+#elif LOUPE_PASS == 4
+
+// Quad Bayer remosaic matching bayer_remosaic.comp: same-colour copy, otherwise the edge direction
+// whose nearest same-colour samples agree best, otherwise an inverse-distance average. Samples are
+// normalized here, so the raw-unit score terms are converted with the target's level range and gain.
+
+float remosaicSource(ivec2 position)
+{
+    return imageLoad(loupeSource, position).r;
+}
+
+bool insideCopy(ivec2 position)
+{
+    return all(greaterThanEqual(position, ivec2(0))) && all(lessThan(position, loupe.region.zw));
+}
+
+void considerDirection(ivec2 position, ivec2 direction, int target, int reach, float unit,
+                       inout float bestValue, inout float bestScore)
+{
+    float values[2];
+    int distances[2];
+    bool found[2];
+    for (int side = 0; side < 2; ++side) {
+        int sign = side * 2 - 1;
+        bool matched = false;
+        int distance = 0;
+        for (int step = 1; step <= 8; ++step) {
+            if (!matched && step <= reach && sourceColor(position + direction * (sign * step)) == target) {
+                matched = true;
+                distance = step;
+            }
+        }
+        ivec2 neighbour = position + direction * (sign * distance);
+        found[side] = matched && insideCopy(neighbour);
+        values[side] = found[side] ? remosaicSource(neighbour) : 0.0;
+        distances[side] = distance;
+    }
+    float value = 0.0;
+    float score = 1.0e9;
+    if (found[0] && found[1]) {
+        float total = float(distances[0] + distances[1]);
+        value = (values[0] * float(distances[1]) + values[1] * float(distances[0])) / total;
+        score = abs(values[1] - values[0]) / total + 0.015 * total * unit;
+    } else if (found[0] || found[1]) {
+        value = found[0] ? values[0] : values[1];
+        score = (256.0 + 8.0 * float(found[0] ? distances[0] : distances[1])) * unit;
+    }
+    if (score < bestScore) {
+        bestScore = score;
+        bestValue = value;
+    }
+}
+
+void main()
+{
+    ivec2 position = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(position, loupe.region.zw))) return;
+    int block = loupeBlock();
+    int target = bayerColor(position);
+    float value = 0.0;
+    if (sourceColor(position) == target) {
+        value = remosaicSource(position);
+    } else {
+        int level = bayerLevel(position);
+        float range = max(rawParams.whiteLevel[level] - rawParams.blackLevel[level], 1.0);
+        // One raw unit of the target colour after normalization and white balance.
+        float unit = max(rawColor.whiteBalanceExposure[target], 1.0e-6) / range;
+        int reach = clamp(2 * block, 1, 8);
+        float bestValue = -1.0;
+        float bestScore = 1.0e9;
+        considerDirection(position, ivec2(1, 0), target, reach, unit, bestValue, bestScore);
+        considerDirection(position, ivec2(0, 1), target, reach, unit, bestValue, bestScore);
+        considerDirection(position, ivec2(1, 1), target, reach, unit, bestValue, bestScore);
+        considerDirection(position, ivec2(1, -1), target, reach, unit, bestValue, bestScore);
+        if (bestValue >= 0.0) {
+            value = bestValue;
+        } else {
+            int radius = max(1, 2 * block - 1);
+            float sum = 0.0;
+            float weights = 0.0;
+            for (int y = -7; y <= 7; ++y) {
+                for (int x = -7; x <= 7; ++x) {
+                    ivec2 neighbour = position + ivec2(x, y);
+                    if (abs(x) <= radius && abs(y) <= radius && (x != 0 || y != 0) && insideCopy(neighbour) &&
+                        sourceColor(neighbour) == target) {
+                        float weight = 1.0 / float(x * x + y * y);
+                        sum += weight * remosaicSource(neighbour);
+                        weights += weight;
+                    }
+                }
+            }
+            value = weights > 1.0e-6 ? sum / weights : 0.0;
+        }
+    }
+    imageStore(loupeMosaic, position, vec4(max(value, 0.0)));
+}
+
+#elif LOUPE_PASS == 1
+
+// The Bayer mosaic: camera samples, or the remosaic of Quad Bayer samples.
+float loupeSiteValue(ivec2 grid)
+{
+    return imageLoad(loupeMosaic, clamp(grid, ivec2(0), loupe.region.zw - 1)).r;
+}
+
+int cfaColor(ivec2 grid)
+{
+    return bayerColor(grid);
+}
+
+#ifndef UNSPEKTRA_PREVIEW_LIGHTWEIGHT
+#define UNSPEKTRA_DEMOSAIC_SAMPLE loupeSiteValue
+#include "raw_mhc.glsl"
+#endif
+
+vec3 loupeDemosaic(ivec2 grid)
+{
+#ifdef UNSPEKTRA_PREVIEW_LIGHTWEIGHT
+    float center = loupeSiteValue(grid);
+    float horizontal = 0.5 * (loupeSiteValue(grid + ivec2(-1, 0)) + loupeSiteValue(grid + ivec2(1, 0)));
+    float vertical = 0.5 * (loupeSiteValue(grid + ivec2(0, -1)) + loupeSiteValue(grid + ivec2(0, 1)));
+    float axial = 0.5 * (horizontal + vertical);
+    float diagonal = 0.25 * (loupeSiteValue(grid + ivec2(-1, -1)) + loupeSiteValue(grid + ivec2(1, -1)) +
+                             loupeSiteValue(grid + ivec2(-1, 1)) + loupeSiteValue(grid + ivec2(1, 1)));
+    int color = cfaColor(grid);
+    bool redHorizontal = cfaColor(grid + ivec2(1, 0)) == CFA_RED;
+    vec3 green = redHorizontal ? vec3(horizontal, center, vertical) : vec3(vertical, center, horizontal);
+    vec3 red = vec3(center, axial, diagonal);
+    vec3 blue = vec3(diagonal, axial, center);
+    return color == CFA_RED ? red : color == CFA_BLUE ? blue : green;
+#else
+    return mhcDemosaic(grid);
+#endif
+}
+
+void main()
+{
+    ivec2 target = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(target, loupe.shape.zw))) return;
+    ivec2 position = target + loupe.shape.y;
+    vec3 rgb = max(loupeDemosaic(position), vec3(0.0));
+    ivec2 absolute = loupe.region.xy + position;
+    vec2 sourceUv = (vec2(absolute) + 0.5) / vec2(rawParams.dimensions.xy);
+    vec2 shadingUv = geometryLensShadingUv(sourceUv, rawParams.dimensions.xy);
+    // Detail plane for the focus meter. Each channel was scaled by white balance, exposure and lens
+    // shading, which scales the sensor noise (variance = scale * signal + offset) with it. The
+    // generalized Anscombe transform then gives the luminance noise a standard deviation near one.
+    vec4 shading = rawLensGains(shadingUv);
+    vec3 gains = max(rawColor.whiteBalanceExposure.xyz * vec3(shading.r, 0.5 * (shading.g + shading.b), shading.a),
+                     vec3(0.000001));
+    float luminance = 0.25 * (rgb.r + 2.0 * rgb.g + rgb.b);
+    float noiseSlope = max(loupe.controls.x * (gains.r + 4.0 * gains.g + gains.b) / 16.0, 1.0e-9);
+    float noiseFloor = max(loupe.controls.y * dot(gains * gains, vec3(1.0, 4.0, 1.0)) / 16.0, 0.0);
+    float stabilized = 2.0 / noiseSlope * sqrt(noiseSlope * luminance + 0.375 * noiseSlope * noiseSlope + noiseFloor);
+    imageStore(loupeDetail, target, vec4(stabilized));
+    vec3 color = rawColorProcess(rgb, shadingUv, 0.0);
+    if (rawColor.reserved0.x <= 0.5) {
+        vec3 positive = clamp(color, vec3(0.0), vec3(1.0));
+        color = mix(12.92 * positive, 1.055 * pow(positive, vec3(1.0 / 2.4)) - 0.055,
+                    step(vec3(0.0031308), positive));
+    }
+    color = clamp(color, vec3(0.0), vec3(1.0));
+    imageStore(loupeOutput, target, vec4(color, dot(color, vec3(0.2126, 0.7152, 0.0722))));
+}
+
+#elif LOUPE_PASS == 2
+
+shared float loupeFine[256];
+shared float loupeSamples[256];
+shared float loupeMagnitudes[256];
+shared float loupeCounts[256];
+
+float loupeLuma(ivec2 position)
+{
+    return imageLoad(loupeOutput, clamp(position, ivec2(0), loupe.shape.zw - 1)).a;
+}
+
+float loupeDetailAt(ivec2 position)
+{
+    return imageLoad(loupeDetail, clamp(position, ivec2(0), loupe.shape.zw - 1)).r;
+}
+
+void main()
+{
+    ivec2 position = ivec2(gl_GlobalInvocationID.xy);
+    uint lane = gl_LocalInvocationIndex;
+    float fine = 0.0;
+    float samples = 0.0;
+    float magnitude = 0.0;
+    float count = 0.0;
+    float significance = 0.0;
+    // Skip the outer rows so clamped edges do not read as detail.
+    if (all(greaterThanEqual(position, ivec2(3))) && all(lessThan(position, loupe.shape.zw - 3))) {
+        // Peaking threshold: plain Sobel magnitude, as the loupe edges are drawn.
+        float a = loupeLuma(position + ivec2(-1, -1));
+        float b = loupeLuma(position + ivec2(0, -1));
+        float c = loupeLuma(position + ivec2(1, -1));
+        float d = loupeLuma(position + ivec2(-1, 0));
+        float f = loupeLuma(position + ivec2(1, 0));
+        float g = loupeLuma(position + ivec2(-1, 1));
+        float h = loupeLuma(position + ivec2(0, 1));
+        float i = loupeLuma(position + ivec2(1, 1));
+        magnitude = length(vec2((c + 2.0 * f + i) - (a + 2.0 * d + g), (g + 2.0 * h + i) - (a + 2.0 * b + c))) * 0.25;
+        count = 1.0;
+        // Smoothed gradients divided by the kernel's response to unit white noise, so sensor noise alone
+        // reads about one before demosaicing correlates it.
+        const float blur5[5] = float[](1.0, 4.0, 6.0, 4.0, 1.0);
+        const float slope5[5] = float[](-1.0, -2.0, 0.0, 2.0, 1.0);
+        float gx = 0.0;
+        float gy = 0.0;
+        for (int y = 0; y < 5; ++y) {
+            for (int x = 0; x < 5; ++x) {
+                float value = loupeDetailAt(position + ivec2(x - 2, y - 2));
+                gx += slope5[x] * blur5[y] * value;
+                gy += blur5[x] * slope5[y] * value;
+            }
+        }
+        float energy = (gx * gx + gy * gy) / 1400.0;
+        // Gradient size in multiples of what noise alone gives after this path's demosaic.
+        significance = sqrt(energy / max(loupe.finish.y, 0.01));
+        // The focus meter samples every other pixel.
+        if (all(equal(position & ivec2(1), ivec2(0)))) {
+            fine = energy;
+            samples = 1.0;
+        }
+    }
+    // The mosaic plane is no longer needed after pass 1 and carries the significance to pass 3.
+    if (all(lessThan(position, loupe.shape.zw))) imageStore(loupeMosaic, position, vec4(significance));
+    loupeFine[lane] = fine;
+    loupeSamples[lane] = samples;
+    loupeMagnitudes[lane] = magnitude;
+    loupeCounts[lane] = count;
+    barrier();
+    for (uint width = 128u; width > 0u; width >>= 1u) {
+        if (lane < width) {
+            loupeFine[lane] += loupeFine[lane + width];
+            loupeSamples[lane] += loupeSamples[lane + width];
+            loupeMagnitudes[lane] += loupeMagnitudes[lane + width];
+            loupeCounts[lane] += loupeCounts[lane + width];
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        // The CPU averages the groups and finds the flattest areas of the loupe.
+        uint group = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+        float sampled = loupeSamples[0];
+        loupeScore.groupStats[group] = vec4(sampled > 0.0 ? loupeFine[0] / sampled : 0.0, 0.0, 0.0, sampled);
+        if (loupeCounts[0] > 0.0) {
+            // Per-group means in 2^20 fixed point; the clamp keeps the totals inside 32 bits.
+            atomicAdd(loupeScore.sumMagnitude, uint(min(loupeMagnitudes[0] / loupeCounts[0], 0.5) * 1048576.0));
+            atomicAdd(loupeScore.groups, 1u);
+        }
+    }
+}
+
+#else
+
+// Display image: colour with the peaking edge amount in alpha.
+layout(set = 0, binding = 9, rgba16f) uniform writeonly image2D loupeDisplay;
+
+vec4 loupeColorAt(ivec2 position)
+{
+    return imageLoad(loupeOutput, clamp(position, ivec2(0), loupe.shape.zw - 1));
+}
+
+float loupeDetailAt(ivec2 position)
+{
+    return imageLoad(loupeDetail, clamp(position, ivec2(0), loupe.shape.zw - 1)).r;
+}
+
+float loupeSignificanceAt(ivec2 position)
+{
+    return imageLoad(loupeMosaic, clamp(position, ivec2(0), loupe.shape.zw - 1)).r;
+}
+
+void main()
+{
+    ivec2 position = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(position, loupe.shape.zw))) return;
+    vec4 center = loupeColorAt(position);
+    float centerDetail = loupeDetailAt(position);
+    vec3 filtered = vec3(0.0);
+    float filteredWeight = 0.0;
+    vec3 blurred = vec3(0.0);
+    vec3 lowest = center.rgb;
+    vec3 highest = center.rgb;
+    float strongest = 0.0;
+    float luma[9];
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 offset = ivec2(x, y);
+            vec4 neighbour = loupeColorAt(position + offset);
+            float spatial = float((2 - abs(x)) * (2 - abs(y)));
+            blurred += spatial * neighbour.rgb;
+            // Edge-preserving weights: differences on the stabilized plane are in units of the noise,
+            // so neighbours across real edges drop out at any brightness.
+            float difference = loupeDetailAt(position + offset) - centerDetail;
+            float weight = spatial * exp(-difference * difference * (1.0 / (2.0 * 1.5 * 1.5)));
+            filtered += weight * neighbour.rgb;
+            filteredWeight += weight;
+            lowest = min(lowest, neighbour.rgb);
+            highest = max(highest, neighbour.rgb);
+            strongest = max(strongest, loupeSignificanceAt(position + offset));
+            luma[(y + 1) * 3 + x + 1] = neighbour.a;
+        }
+    }
+    blurred *= 1.0 / 16.0;
+    filtered /= filteredWeight;
+    // Real detail stands several noise levels above the grain around it.
+    float detail = smoothstep(2.5, 3.5, strongest);
+    // Smooth grain lightly, keep more of the original on detail, and sharpen only real detail.
+    // Staying inside the neighbours' range sharpens edges without bright or dark halos.
+    vec3 color = mix(center.rgb, filtered, 0.8 - 0.4 * detail);
+    color += 0.6 * detail * (center.rgb - blurred);
+    color = clamp(color, lowest, highest);
+
+    float edge = 0.0;
+    float strength = loupe.finish.x;
+    if (strength > 0.5 && loupeScore.groups > 0u &&
+        all(greaterThanEqual(position, ivec2(1))) && all(lessThan(position, loupe.shape.zw - 1))) {
+        float gradient = length(vec2((luma[2] + 2.0 * luma[5] + luma[8]) - (luma[0] + 2.0 * luma[3] + luma[6]),
+                                     (luma[6] + 2.0 * luma[7] + luma[8]) - (luma[0] + 2.0 * luma[1] + luma[2]))) * 0.25;
+        // Edges well above the average detail of the loupe; higher strength marks more of them.
+        float mean = float(loupeScore.sumMagnitude) / (1048576.0 * float(loupeScore.groups));
+        float threshold = max(mean * (4.2 - 0.8 * strength), 0.03);
+        // Edges that grain alone could produce are left unmarked.
+        float gate = 2.8 - 0.3 * strength;
+        edge = smoothstep(threshold, threshold * 1.6, gradient) * smoothstep(gate, gate + 1.0, strongest);
+    }
+    imageStore(loupeDisplay, position, vec4(color, edge));
+}
+
+#endif

@@ -1,0 +1,701 @@
+#version 450
+
+// Zero-shutter-lag multi-frame RAW merge.
+//
+// Frames are aligned on a block-averaged gray pyramid: a whole-frame search
+// around the position predicted from the preceding frames, then a coarse-to-
+// fine tile search. The finest pass records how well each tile matched; tiles
+// whose residual is far above what noise and sub-pixel error explain are
+// rejected, and a frame that overlaps the reference by less than half in
+// either direction is dropped. Tile offsets are interpolated between tile
+// centres so a pan or rolling-shutter skew does not leave seams.
+//
+// Merging follows the HDR+ method. Each CFA plane is split into overlapping
+// 16x16 tiles under a raised-cosine window. Every tile of an alternate frame
+// is transformed to the frequency domain and merged with the reference tile
+// coefficient by coefficient: where the two differ by more than the noise
+// level the reference coefficient wins, otherwise they are averaged. Motion is
+// therefore rejected per frequency and per tile under smooth windows, without
+// per-pixel decisions that would leave patches or outlines. The reference
+// frame always contributes with weight one, so output brightness matches the
+// viewfinder.
+//
+// MERGE_STAGE selects the compute pass compiled into this variant:
+//   0 gray          block average of one packed frame into pyramid level 0
+//   1 downsample    2x2 box filter from one pyramid level to the next
+//   2 align         per-tile offset search for one pyramid level
+//   3 global        whole-frame translation search at the top pyramid level
+//   4 spectrum      reference tile spectra, which seed the frequency accumulator
+//   5 merge         add one aligned alternate frame to the accumulator per coefficient
+//   6 inverse       transform the accumulated tiles back and overlap-add them
+//   7 finalize      write the spatial accumulator as 16-bit RAW
+//
+// Every stage is submitted in small pieces so the viewfinder keeps rendering
+// between them; the reference spectra are computed once per band, so each
+// alternate frame costs a single transform per tile.
+
+#ifndef MERGE_STAGE
+#define MERGE_STAGE 0
+#endif
+
+const int TILE = 16;
+
+layout(set = 0, binding = 0, std430) readonly buffer RefPacked { uint words[]; } refPacked;
+layout(set = 0, binding = 1, std430) readonly buffer AltPacked { uint words[]; } altPacked;
+layout(set = 0, binding = 2, std430) buffer GrayRef { float values[]; } grayRef;
+layout(set = 0, binding = 3, std430) buffer GrayAlt { float values[]; } grayAlt;
+layout(set = 0, binding = 4, std430) buffer Alignment { vec2 offsets[]; } alignment;
+layout(set = 0, binding = 5, std430) buffer Accumulator { vec2 values[]; } accumulator;  // tile spectra sum
+layout(set = 0, binding = 6, std430) buffer Reference { vec2 values[]; } reference;        // reference tile spectra
+layout(set = 0, binding = 7, std430) buffer Merged { uint words[]; } merged;
+layout(set = 0, binding = 8, std430) buffer Stats { uint values[]; } stats;
+layout(set = 0, binding = 9, std430) buffer Spatial { float values[]; } spatial;
+
+layout(push_constant) uniform Push {
+    ivec4 frame;   // width, height, row bytes, format (0 RAW16, 1 RAW10, 2 RAW12)
+    ivec4 mosaic;  // period, source CFA pattern, phase X, phase Y
+    ivec4 level;   // source offset, destination offset, source width, source height (merge: region origin X, Y, plane width, plane height)
+    ivec4 tiles;   // tiles X, tiles Y, search radius (merge: frame count), coarse alignment offset (-1 none)
+    ivec4 coarse;  // coarse tiles X (or destination width), coarse tiles Y (or destination height), alternate frame, flags
+                   // (merge: parity X, parity Y, region tiles X, region tiles Y)
+    vec4 black;    // black level per CFA level (R, G1, G2, B)
+    vec4 noise;    // white level, noise S, noise O, motion sensitivity
+    vec4 scale;    // exposure scale, tile residual offset, tile residual limit, merge noise factor
+} pc;
+
+uint byteAt(uint word, uint offset)
+{
+    return (word >> ((offset & 3u) * 8u)) & 255u;
+}
+
+#define DEFINE_PACKED_READER(name, source) \
+uint name(int x, int y) \
+{ \
+    uint base = uint(y) * uint(pc.frame.z); \
+    if (pc.frame.w == 0) { \
+        uint o = base + uint(x) * 2u; \
+        return (source.words[o >> 2u] >> ((o & 2u) * 8u)) & 0xFFFFu; \
+    } \
+    if (pc.frame.w == 1) { \
+        uint o = base + uint(x >> 2) * 5u; \
+        uint hi = o + uint(x & 3); \
+        uint lo = o + 4u; \
+        return (byteAt(source.words[hi >> 2u], hi) << 2u) | ((byteAt(source.words[lo >> 2u], lo) >> (uint(x & 3) * 2u)) & 3u); \
+    } \
+    uint o = base + uint(x >> 1) * 3u; \
+    uint hi = o + uint(x & 1); \
+    uint lo = o + 2u; \
+    return (byteAt(source.words[hi >> 2u], hi) << 4u) | ((byteAt(source.words[lo >> 2u], lo) >> (uint(x & 1) * 4u)) & 15u); \
+}
+
+DEFINE_PACKED_READER(refAt, refPacked)
+DEFINE_PACKED_READER(altAt, altPacked)
+
+// CFA level of a sensor pixel, following the host remosaic layout.
+int levelOf(int x, int y)
+{
+    int block = max(pc.mosaic.x / 2, 1);
+    int bx = ((x + pc.mosaic.z) / block) & 1;
+    int by = ((y + pc.mosaic.w) / block) & 1;
+    int site = by * 2 + bx;
+    int value = site == pc.mosaic.y ? 0 : site == (pc.mosaic.y ^ 3) ? 3 : by + 1;
+    if (value == 1 || value == 2) value = ((value - 1) ^ (pc.mosaic.w & 1)) + 1;
+    return value;
+}
+
+float blackOf(int level)
+{
+    return level == 0 ? pc.black.x : level == 1 ? pc.black.y : level == 2 ? pc.black.z : pc.black.w;
+}
+
+float normalizedOf(uint value, int level)
+{
+    float black = blackOf(level);
+    return (float(value) - black) / max(pc.noise.x - black, 1.0);
+}
+
+#if MERGE_STAGE == 0
+layout(local_size_x = 16, local_size_y = 16) in;
+
+void main()
+{
+    ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(g, pc.level.zw))) return;
+    int period = pc.mosaic.x;
+    ivec2 origin = g * period;
+    float sum = 0.0;
+    for (int y = 0; y < period; ++y) {
+        for (int x = 0; x < period; ++x) {
+            ivec2 p = origin + ivec2(x, y);
+            int level = levelOf(p.x, p.y);
+            uint value = pc.coarse.z != 0 ? altAt(p.x, p.y) : refAt(p.x, p.y);
+            sum += normalizedOf(value, level);
+        }
+    }
+    float gray = sum / float(period * period) * pc.scale.x;
+    uint index = uint(pc.level.y) + uint(g.y * pc.level.z + g.x);
+    if (pc.coarse.z != 0) grayAlt.values[index] = gray; else grayRef.values[index] = gray;
+}
+#endif
+
+#if MERGE_STAGE == 1
+layout(local_size_x = 16, local_size_y = 16) in;
+
+float sourceAt(ivec2 p)
+{
+    p = clamp(p, ivec2(0), pc.level.zw - 1);
+    uint index = uint(pc.level.x) + uint(p.y * pc.level.z + p.x);
+    return pc.coarse.z != 0 ? grayAlt.values[index] : grayRef.values[index];
+}
+
+void main()
+{
+    ivec2 d = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(d, pc.coarse.xy))) return;
+    ivec2 s = d * 2;
+    float value = (sourceAt(s) + sourceAt(s + ivec2(1, 0)) + sourceAt(s + ivec2(0, 1)) + sourceAt(s + ivec2(1, 1))) * 0.25;
+    uint index = uint(pc.level.y) + uint(d.y * pc.coarse.x + d.x);
+    if (pc.coarse.z != 0) grayAlt.values[index] = value; else grayRef.values[index] = value;
+}
+#endif
+
+#if MERGE_STAGE == 2
+layout(local_size_x = 64) in;
+
+// Shared window capacity: one centre with the top-level radius 8, or three centres with radius 4.
+const int WINDOW_FLOATS = 3 * (TILE + 2 * 4) * (TILE + 2 * 4);
+
+shared float refTile[TILE * TILE];
+shared float altWindow[WINDOW_FLOATS];
+shared float bestDistance[64];
+shared ivec2 bestOffset[64];
+shared int bestCenter[64];
+
+// Distance between the reference tile and the alternate window of centre c at offset d.
+float tileDistance(int c, ivec2 d, int radius, int win, bool absolute)
+{
+    int base = c * win * win + (radius + d.y) * win + radius + d.x;
+    float total = 0.0;
+    for (int y = 0; y < TILE; ++y) {
+        int row = base + y * win;
+        for (int x = 0; x < TILE; ++x) {
+            float diff = refTile[y * TILE + x] - altWindow[row + x];
+            total += absolute ? abs(diff) : diff * diff;
+        }
+    }
+    return total;
+}
+
+ivec2 coarseCenter(int cx, int cy)
+{
+    cx = clamp(cx, 0, pc.coarse.x - 1);
+    cy = clamp(cy, 0, pc.coarse.y - 1);
+    vec2 value = alignment.offsets[uint(pc.tiles.w) + uint(cy * pc.coarse.x + cx)] * 2.0;
+    return ivec2(round(value));
+}
+
+void main()
+{
+    ivec2 tile = ivec2(gl_WorkGroupID.xy);
+    if (any(greaterThanEqual(tile, pc.tiles.xy))) return;
+    uint lid = gl_LocalInvocationID.x;
+    ivec2 origin = tile * TILE;
+    for (uint i = lid; i < uint(TILE * TILE); i += 64u) {
+        ivec2 p = clamp(origin + ivec2(int(i) % TILE, int(i) / TILE), ivec2(0), pc.level.zw - 1);
+        refTile[i] = grayRef.values[uint(pc.level.x) + uint(p.y * pc.level.z + p.x)];
+    }
+
+    ivec2 centers[3];
+    int centerCount = 1;
+    centers[0] = pc.coarse.xy;  // global translation estimate at the top level
+    if (pc.tiles.w >= 0) {
+        // The coarse tile's own offset and those of its two nearest neighbours, each searched once.
+        int cx = tile.x / 2, cy = tile.y / 2;
+        centers[0] = coarseCenter(cx, cy);
+        ivec2 side = coarseCenter((tile.x & 1) == 0 ? cx - 1 : cx + 1, cy);
+        ivec2 above = coarseCenter(cx, (tile.y & 1) == 0 ? cy - 1 : cy + 1);
+        if (side != centers[0]) centers[centerCount++] = side;
+        if (above != centers[0] && (centerCount < 2 || above != centers[1])) centers[centerCount++] = above;
+    }
+    int radius = pc.tiles.z;
+    int span = radius * 2 + 1;
+    int win = TILE + 2 * radius;
+    // The alternate pixels every candidate of a centre can touch are read once into shared memory.
+    for (int c = 0; c < centerCount; ++c) {
+        ivec2 base = origin + centers[c] - ivec2(radius);
+        for (int i = int(lid); i < win * win; i += 64) {
+            ivec2 p = clamp(base + ivec2(i % win, i / win), ivec2(0), pc.level.zw - 1);
+            altWindow[c * win * win + i] = grayAlt.values[uint(pc.level.x) + uint(p.y * pc.level.z + p.x)];
+        }
+    }
+    barrier();
+
+    int perCenter = span * span;
+    int total = perCenter * centerCount;
+    bool absolute = (pc.coarse.w & 1) != 0;
+    float best = 3.4e38;
+    ivec2 bestAt = ivec2(0);
+    int bestC = 0;
+    for (int i = int(lid); i < total; i += 64) {
+        int center = i / perCenter;
+        int local = i - center * perCenter;
+        ivec2 d = ivec2(local % span - radius, local / span - radius);
+        float distance = tileDistance(center, d, radius, win, absolute);
+        if (distance < best) { best = distance; bestAt = d; bestC = center; }
+    }
+    bestDistance[lid] = best;
+    bestOffset[lid] = bestAt;
+    bestCenter[lid] = bestC;
+    barrier();
+    if (lid != 0u) return;
+    for (uint i = 1u; i < 64u; ++i) {
+        if (bestDistance[i] < best) { best = bestDistance[i]; bestAt = bestOffset[i]; bestC = bestCenter[i]; }
+    }
+    vec2 result = vec2(centers[bestC] + bestAt);
+    if ((pc.coarse.w & 2) != 0) {
+        // Sub-pixel refinement from the neighbouring candidates, where they lie inside the window.
+        if (abs(bestAt.x) < radius) {
+            float left = tileDistance(bestC, bestAt + ivec2(-1, 0), radius, win, absolute);
+            float right = tileDistance(bestC, bestAt + ivec2(1, 0), radius, win, absolute);
+            float dx = left - 2.0 * best + right;
+            if (dx > 1e-6) result.x += clamp(0.5 * (left - right) / dx, -0.5, 0.5);
+        }
+        if (abs(bestAt.y) < radius) {
+            float up = tileDistance(bestC, bestAt + ivec2(0, -1), radius, win, absolute);
+            float down = tileDistance(bestC, bestAt + ivec2(0, 1), radius, win, absolute);
+            float dy = up - 2.0 * best + down;
+            if (dy > 1e-6) result.y += clamp(0.5 * (up - down) / dy, -0.5, 0.5);
+        }
+    }
+    alignment.offsets[uint(pc.level.y) + uint(tile.y * pc.tiles.x + tile.x)] = result;
+    if ((pc.coarse.w & 1) != 0) {
+        // Finest level: store the residual per pixel next to the residual a correct alignment would
+        // leave, from the noise level and the sub-pixel error of integer offsets on this texture.
+        float refMean = 0.0, gradient = 0.0;
+        for (int y = 0; y < TILE; ++y) {
+            for (int x = 0; x < TILE; ++x) {
+                float v = refTile[y * TILE + x];
+                refMean += v;
+                if (x + 1 < TILE) gradient += abs(refTile[y * TILE + x + 1] - v);
+                if (y + 1 < TILE) gradient += abs(refTile[(y + 1) * TILE + x] - v);
+            }
+        }
+        refMean /= float(TILE * TILE);
+        gradient /= float(2 * TILE * (TILE - 1));
+        float samples = float(pc.mosaic.x * pc.mosaic.x);
+        float sigma = sqrt(max((pc.noise.y * max(refMean, 0.0) + pc.noise.z) / samples, 1e-12));
+        float expected = 1.13 * sigma + 0.5 * gradient;
+        alignment.offsets[uint(pc.scale.y) + uint(tile.y * pc.tiles.x + tile.x)] = vec2(best / float(TILE * TILE), expected);
+    }
+}
+#endif
+
+#if MERGE_STAGE == 3
+layout(local_size_x = 256) in;
+
+shared float partial[256];
+
+// One workgroup per candidate translation around the predicted centre: mean absolute
+// difference over the overlapping area. Candidates overlapping less than half the frame in
+// either direction are not usable.
+void main()
+{
+    int radius = pc.tiles.z;
+    int span = radius * 2 + 1;
+    int id = int(gl_WorkGroupID.x);
+    if (id >= span * span) return;
+    uint lid = gl_LocalInvocationID.x;
+    ivec2 offset = pc.coarse.xy + ivec2(id % span - radius, id / span - radius);
+    ivec2 size = pc.level.zw;
+    ivec2 lo = max(ivec2(0), -offset);
+    ivec2 hi = min(size, size - offset);
+    ivec2 extent = max(hi - lo, ivec2(0));
+    bool usable = extent.x * 2 >= size.x && extent.y * 2 >= size.y;
+    int count = usable ? extent.x * extent.y : 0;
+    float sum = 0.0;
+    for (int i = int(lid); i < count; i += 256) {
+        ivec2 p = lo + ivec2(i % extent.x, i / extent.x);
+        ivec2 q = p + offset;
+        sum += abs(grayRef.values[uint(pc.level.x) + uint(p.y * size.x + p.x)] -
+            grayAlt.values[uint(pc.level.x) + uint(q.y * size.x + q.x)]);
+    }
+    partial[lid] = sum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) partial[lid] += partial[lid + stride];
+        barrier();
+    }
+    if (lid == 0u) alignment.offsets[uint(pc.level.y) + uint(id)] = vec2(usable ? partial[0] / float(max(count, 1)) : 1e30, float(count));
+}
+#endif
+
+#if MERGE_STAGE >= 4 && MERGE_STAGE <= 6
+// Four 16x16 tiles per workgroup; 64 threads own each tile.
+const int SLOTS = 4;
+shared vec2 tileData[SLOTS * TILE * TILE];
+shared float sums[256];
+shared uint rejected[SLOTS];
+
+int slotOf() { return int(gl_LocalInvocationID.x) >> 6; }
+int threadOf() { return int(gl_LocalInvocationID.x) & 63; }
+
+// A tile whose alignment residual is far above the residual that noise and sub-pixel
+// error explain did not align.
+bool tileValid(ivec2 t)
+{
+    vec2 r = alignment.offsets[uint(pc.scale.y) + uint(t.y * pc.tiles.x + t.x)];
+    return r.x <= pc.scale.z * r.y;
+}
+
+vec2 tileOffset(ivec2 t)
+{
+    return alignment.offsets[uint(t.y * pc.tiles.x + t.x)];
+}
+
+// Offset for a gray pixel, interpolated between the centres of the surrounding aligned tiles.
+bool offsetAt(ivec2 g, out ivec2 offset)
+{
+    ivec2 own = min(g / TILE, pc.tiles.xy - 1);
+    offset = ivec2(0);
+    if (!tileValid(own)) return false;
+    vec2 tc = (vec2(g) + 0.5) / float(TILE) - 0.5;
+    ivec2 t0 = ivec2(floor(tc));
+    vec2 f = tc - vec2(t0);
+    vec2 sum = vec2(0.0);
+    float total = 0.0;
+    for (int j = 0; j < 2; ++j) {
+        for (int i = 0; i < 2; ++i) {
+            ivec2 t = clamp(t0 + ivec2(i, j), ivec2(0), pc.tiles.xy - 1);
+            float w = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y);
+            if (w > 0.0 && tileValid(t)) {
+                sum += tileOffset(t) * w;
+                total += w;
+            }
+        }
+    }
+    offset = ivec2(round(total > 0.0 ? sum / total : tileOffset(own)));
+    return true;
+}
+
+// Mirror a plane coordinate across the frame border.
+int reflect(int i, int n)
+{
+    if (i < 0) i = -i - 1;
+    if (i >= n) i = 2 * n - i - 1;
+    return clamp(i, 0, n - 1);
+}
+
+// Raised-cosine window; tiles overlap by half and start half a tile outside the merge region so
+// the windows sum to one everywhere inside it.
+float window(int i)
+{
+    return 0.5 - 0.5 * cos(6.283185307 * (float(i) + 0.5) / float(TILE));
+}
+
+// Base-4 digit reversal of a 16-point index.
+int digitReverse(int v)
+{
+    return ((v & 3) << 2) | (v >> 2);
+}
+
+vec2 complexMultiply(vec2 a, vec2 b)
+{
+    return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+// Origin of a merge tile in plane pixels. pc.level.xy is the merge region origin.
+ivec2 tileOrigin(ivec2 t)
+{
+    return pc.level.xy + t * (TILE / 2) - TILE / 2;
+}
+
+// First spectrum entry of a tile: planes, then tile rows, then tiles, 256 coefficients each.
+uint spectrumBase(int plane, ivec2 t)
+{
+    return (uint(plane * pc.coarse.w + t.y) * uint(pc.coarse.z) + uint(t.x)) * uint(TILE * TILE);
+}
+
+void store(int slot, int i, vec2 v)
+{
+    tileData[slot * TILE * TILE + i] = v;
+}
+
+vec2 load(int slot, int i)
+{
+    return tileData[slot * TILE * TILE + i];
+}
+
+// In-place 2D radix-4 FFT of all four tiles; each thread owns one 4-point butterfly of one row or
+// column per pass. The forward transform is decimation in time over digit-reversed input, the
+// inverse is decimation in frequency over natural input and leaves its output digit-reversed.
+void transform(bool inverse)
+{
+    int slot = slotOf();
+    int tl = threadOf();
+    int line = tl >> 2;
+    int b4 = tl & 3;
+    float sign = inverse ? 1.0 : -1.0;
+    vec2 rot = vec2(0.0, sign);  // multiplication by sign * i
+    for (int axis = 0; axis < 2; ++axis) {
+        int stride = axis == 0 ? 1 : TILE;
+        int lineBase = axis == 0 ? line * TILE : line;
+        for (int step = 0; step < 2; ++step) {
+            barrier();
+            int L = inverse ? (step == 0 ? 16 : 4) : (step == 0 ? 4 : 16);
+            int Q = L / 4;
+            int g = b4 / Q;
+            int j = b4 - g * Q;
+            int i0 = lineBase + (g * L + j) * stride;
+            int qs = Q * stride;
+            vec2 x0 = load(slot, i0);
+            vec2 x1 = load(slot, i0 + qs);
+            vec2 x2 = load(slot, i0 + 2 * qs);
+            vec2 x3 = load(slot, i0 + 3 * qs);
+            float angle = sign * 6.283185307 * float(j) / float(L);
+            vec2 w1 = vec2(cos(angle), sin(angle));
+            vec2 w2 = complexMultiply(w1, w1);
+            vec2 w3 = complexMultiply(w2, w1);
+            if (!inverse && Q > 1) {
+                x1 = complexMultiply(x1, w1);
+                x2 = complexMultiply(x2, w2);
+                x3 = complexMultiply(x3, w3);
+            }
+            vec2 s02 = x0 + x2, d02 = x0 - x2;
+            vec2 s13 = x1 + x3, d13 = complexMultiply(x1 - x3, rot);
+            vec2 y0 = s02 + s13;
+            vec2 y1 = d02 + d13;
+            vec2 y2 = s02 - s13;
+            vec2 y3 = d02 - d13;
+            if (inverse && Q > 1) {
+                y1 = complexMultiply(y1, w1);
+                y2 = complexMultiply(y2, w2);
+                y3 = complexMultiply(y3, w3);
+            }
+            store(slot, i0, y0);
+            store(slot, i0 + qs, y1);
+            store(slot, i0 + 2 * qs, y2);
+            store(slot, i0 + 3 * qs, y3);
+        }
+    }
+    barrier();
+}
+
+// Sum of sums[] over this thread's tile.
+float reduceTile()
+{
+    int lid = int(gl_LocalInvocationID.x);
+    for (int stride = 32; stride > 0; stride >>= 1) {
+        barrier();
+        if ((lid & 63) < stride) sums[lid] += sums[lid + stride];
+    }
+    barrier();
+    return sums[lid & ~63];
+}
+#endif
+
+#if MERGE_STAGE == 4
+layout(local_size_x = 256) in;
+
+// Reference spectrum of every tile, which also seeds the frequency accumulator. The tile's mean,
+// which the merge needs for its noise level, travels in the imaginary part of the reference DC
+// coefficient, which is zero for real input.
+void main()
+{
+    int slot = slotOf();
+    int tl = threadOf();
+    int lid = int(gl_LocalInvocationID.x);
+    int period = pc.mosaic.x;
+    int plane = int(gl_WorkGroupID.z);
+    ivec2 phase = ivec2(plane % period, plane / period);
+    ivec2 planeSize = pc.level.zw;
+    ivec2 t = ivec2(int(gl_WorkGroupID.x) * SLOTS + slot, int(gl_WorkGroupID.y));
+    bool inRange = t.x < pc.coarse.z;
+    ivec2 origin = tileOrigin(t);
+    float refSum = 0.0;
+    for (int n = 0; n < 4; ++n) {
+        int i = tl + n * 64;
+        ivec2 local = ivec2(i & (TILE - 1), i >> 4);
+        ivec2 p = origin + local;
+        ivec2 pr = ivec2(reflect(p.x, planeSize.x), reflect(p.y, planeSize.y));
+        ivec2 sensor = pr * period + phase;
+        float value = float(refAt(sensor.x, sensor.y)) - blackOf(levelOf(sensor.x, sensor.y));
+        refSum += value;
+        store(slot, digitReverse(local.y) * TILE + digitReverse(local.x), vec2(value * window(local.x) * window(local.y), 0.0));
+    }
+    sums[lid] = refSum;
+    float mean = reduceTile() / float(TILE * TILE);
+    transform(false);
+    if (!inRange) return;
+    uint base = spectrumBase(plane, t);
+    for (int n = 0; n < 4; ++n) {
+        int i = tl + n * 64;
+        vec2 v = load(slot, i);
+        reference.values[base + uint(i)] = i == 0 ? vec2(v.x, mean) : v;
+        accumulator.values[base + uint(i)] = v;
+    }
+}
+#endif
+
+#if MERGE_STAGE == 5
+layout(local_size_x = 256) in;
+
+shared ivec2 tileShift[SLOTS];
+shared uint tileState[SLOTS];
+shared uint keptSum[SLOTS];
+
+// Merge one aligned alternate frame into the frequency accumulator, coefficient by coefficient.
+void main()
+{
+    int slot = slotOf();
+    int tl = threadOf();
+    int period = pc.mosaic.x;
+    int plane = int(gl_WorkGroupID.z);
+    ivec2 phase = ivec2(plane % period, plane / period);
+    ivec2 planeSize = pc.level.zw;
+    ivec2 t = ivec2(int(gl_WorkGroupID.x) * SLOTS + slot, int(gl_WorkGroupID.y));
+    bool inRange = t.x < pc.coarse.z;
+    ivec2 origin = tileOrigin(t);
+    if (tl == 0) {
+        // One thread resolves the shift of each tile for its 64 threads. State 0 is a tile this
+        // frame cannot contribute to, 2 a tile whose shifted pixels all lie inside the frame, and
+        // 1 one where the reference stands in for pixels the frame does not have.
+        ivec2 offset = ivec2(0);
+        ivec2 centre = clamp(origin + ivec2(TILE / 2), ivec2(0), planeSize - 1);
+        uint state = inRange && offsetAt(centre, offset) ? 1u : 0u;
+        if (state != 0u && all(greaterThanEqual(min(origin, origin + offset), ivec2(0))) &&
+            all(lessThanEqual(max(origin, origin + offset) + TILE, planeSize))) state = 2u;
+        tileShift[slot] = offset;
+        tileState[slot] = state;
+        rejected[slot] = 0u;
+        keptSum[slot] = 0u;
+    }
+    barrier();
+    uint state = tileState[slot];
+    ivec2 offset = tileShift[slot];
+    bool anyUsable = (tileState[0] | tileState[1] | tileState[2] | tileState[3]) != 0u;
+    uint base = inRange ? spectrumBase(plane, t) : 0u;
+    float threshold = 0.0;
+    if (anyUsable) {
+        if (state != 0u) {
+            float black = 0.0;
+            for (int n = 0; n < 4; ++n) {
+                int i = tl + n * 64;
+                ivec2 local = ivec2(i & (TILE - 1), i >> 4);
+                ivec2 p = origin + local;
+                ivec2 pr = ivec2(reflect(p.x, planeSize.x), reflect(p.y, planeSize.y));
+                ivec2 sensor = pr * period + phase;
+                black = blackOf(levelOf(sensor.x, sensor.y));
+                ivec2 q = pr + offset;
+                float value;
+                if (state == 2u || (all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, planeSize)))) {
+                    ivec2 altSensor = q * period + phase;
+                    uint altRaw = altAt(altSensor.x, altSensor.y);
+                    value = (float(altRaw) - black) * pc.scale.x;
+                    // A brighter alternate frame cannot restore detail that it clipped.
+                    if (float(altRaw) > pc.noise.x * 0.985 && pc.scale.x > 1.001) atomicOr(rejected[slot], 1u);
+                } else {
+                    // Where the shifted frame has no data, the reference stands in for it: the
+                    // difference is then zero, so those pixels keep the reference while the rest
+                    // of the tile merges normally.
+                    value = float(refAt(sensor.x, sensor.y)) - black;
+                }
+                store(slot, digitReverse(local.y) * TILE + digitReverse(local.x), vec2(value * window(local.x) * window(local.y), 0.0));
+            }
+            // The reference tile mean travels in the imaginary part of its DC coefficient.
+            float mean = reference.values[base].y;
+            float range = max(pc.noise.x - black, 1.0);
+            float pixelVariance = (pc.noise.y * max(mean / range, 0.0) + pc.noise.z) * range * range;
+            // Each coefficient of a windowed noise tile has variance sum(window^2) times the pixel variance.
+            threshold = pc.scale.w * max(pixelVariance * 36.0, 1e-6);
+        }
+        transform(false);
+    }
+    bool usable = state != 0u && rejected[slot] == 0u;
+    float kept = 0.0;
+    if (inRange) {
+        for (int n = 0; n < 4; ++n) {
+            int i = tl + n * 64;
+            vec2 t0 = reference.values[base + uint(i)];
+            if (i == 0) t0.y = 0.0;
+            if (usable) {
+                vec2 tz = load(slot, i);
+                vec2 difference = t0 - tz;
+                float energy = dot(difference, difference);
+                float keep = energy / (energy + threshold);
+                accumulator.values[base + uint(i)] += tz + keep * difference;
+                kept += 1.0 - keep;
+            } else {
+                accumulator.values[base + uint(i)] += t0;
+            }
+        }
+    }
+    atomicAdd(keptSum[slot], uint(round(kept * 256.0)));
+    barrier();
+    if (tl == 0 && inRange) atomicAdd(stats.values[1], (keptSum[slot] + 256u) / 512u);
+}
+#endif
+
+#if MERGE_STAGE == 6
+layout(local_size_x = 256) in;
+
+// Inverse transform of the accumulated tiles, overlap-added into the spatial accumulator. Tiles of
+// one parity pass never overlap, so no atomics are needed. pc.scale.x frames contributed nothing
+// and count as copies of the reference.
+void main()
+{
+    int slot = slotOf();
+    int tl = threadOf();
+    int period = pc.mosaic.x;
+    int plane = int(gl_WorkGroupID.z);
+    ivec2 phase = ivec2(plane % period, plane / period);
+    ivec2 planeSize = pc.level.zw;
+    ivec2 t = ivec2((int(gl_WorkGroupID.x) * SLOTS + slot) * 2 + pc.coarse.x, int(gl_WorkGroupID.y) * 2 + pc.coarse.y);
+    bool inRange = t.x < pc.coarse.z && t.y < pc.coarse.w;
+    ivec2 origin = tileOrigin(t);
+    uint base = inRange ? spectrumBase(plane, t) : 0u;
+    for (int n = 0; n < 4; ++n) {
+        int i = tl + n * 64;
+        vec2 v = vec2(0.0);
+        if (inRange) {
+            vec2 r = reference.values[base + uint(i)];
+            if (i == 0) r.y = 0.0;
+            v = accumulator.values[base + uint(i)] + pc.scale.x * r;
+        }
+        store(slot, i, v);
+    }
+    transform(true);
+    if (!inRange) return;
+    float norm = 1.0 / (float(TILE * TILE) * float(pc.tiles.z));
+    ivec2 regionEnd = pc.level.xy + ivec2(pc.coarse.z - 1, pc.coarse.w - 1) * (TILE / 2);
+    for (int n = 0; n < 4; ++n) {
+        int i = tl + n * 64;
+        ivec2 local = ivec2(i & (TILE - 1), i >> 4);
+        ivec2 p = origin + local;
+        if (any(lessThan(p, pc.level.xy)) || any(greaterThanEqual(p, regionEnd)) || any(greaterThanEqual(p, planeSize))) continue;
+        float value = load(slot, digitReverse(local.y) * TILE + digitReverse(local.x)).x * norm;
+        ivec2 sensor = p * period + phase;
+        spatial.values[uint(sensor.y * pc.frame.x + sensor.x)] += value;
+    }
+}
+#endif
+
+#if MERGE_STAGE == 7
+layout(local_size_x = 16, local_size_y = 16) in;
+
+uint finalPixel(ivec2 p)
+{
+    float value = spatial.values[uint(p.y * pc.frame.x + p.x)] + blackOf(levelOf(p.x, p.y));
+    return uint(round(clamp(value, 0.0, pc.noise.x)));
+}
+
+void main()
+{
+    ivec2 w = ivec2(gl_GlobalInvocationID.xy);
+    int halfWidth = pc.frame.x / 2;
+    if (w.x >= halfWidth || w.y >= pc.frame.y) return;
+    ivec2 p = ivec2(w.x * 2, w.y);
+    uint lo = finalPixel(p);
+    uint hi = finalPixel(p + ivec2(1, 0));
+    merged.words[uint(w.y * halfWidth + w.x)] = lo | (hi << 16u);
+}
+#endif

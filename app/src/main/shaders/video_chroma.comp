@@ -1,0 +1,64 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform sampler2D inputImage;
+layout(set = 0, binding = 1, rgba16f) writeonly uniform image2D outputImage;
+
+layout(push_constant) uniform Parameters {
+    float strength;
+    float noiseS;
+    float noiseO;
+    int encodeSdr;
+    vec4 varianceWeights;
+    int spacing;
+} pc;
+
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+const float KERNEL[5] = float[](1.0, 4.0, 6.0, 4.0, 1.0);
+
+vec3 colorComponents(vec3 rgb) {
+    float y = dot(rgb, LUMA);
+    return vec3(y, (rgb.b - y) / 1.8556, (rgb.r - y) / 1.5748);
+}
+
+vec3 rgbComponents(vec3 color) {
+    float r = color.x + 1.5748 * color.z;
+    float b = color.x + 1.8556 * color.y;
+    return vec3(r, (color.x - LUMA.r * r - LUMA.b * b) / LUMA.g, b);
+}
+
+vec3 encodeSrgb(vec3 rgb) {
+    vec3 value = clamp(rgb, 0.0, 1.0);
+    return mix(1.055 * pow(value, vec3(1.0 / 2.4)) - 0.055,
+        value * 12.92, lessThanEqual(value, vec3(0.0031308)));
+}
+
+void main() {
+    ivec2 position = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outputImage);
+    if (any(greaterThanEqual(position, size))) return;
+    vec4 original = texelFetch(inputImage, position, 0);
+    vec3 center = colorComponents(original.rgb);
+    vec2 sum = vec2(0.0);
+    float weights = 0.0;
+    float chromaVariance = 1.0 / float(pc.spacing * pc.spacing);
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
+            vec3 sampleColor = colorComponents(texelFetch(inputImage,
+                clamp(position + ivec2(x, y) * pc.spacing, ivec2(0), size - 1), 0).rgb);
+            float noise = pc.noiseS * (max(center.x, 0.0) + max(sampleColor.x, 0.0)) + 2.0 * pc.noiseO;
+            vec3 variance = max(noise * pc.varianceWeights.xyz * vec3(2.0, chromaVariance, chromaVariance), vec3(1e-8));
+            vec3 difference = sampleColor - center;
+            vec3 distance = difference * difference / variance;
+            float edge = max(distance.x - 1.0, 0.0) + max(distance.y + distance.z - 2.0, 0.0);
+            float spatial = KERNEL[x + 2] * KERNEL[y + 2];
+            float weight = spatial / (1.0 + edge * edge * 0.25);
+            sum += sampleColor.yz * weight;
+            weights += weight;
+        }
+    }
+    center.yz = mix(center.yz, sum / weights, pc.strength);
+    vec3 outputRgb = rgbComponents(center);
+    if (pc.encodeSdr != 0) outputRgb = encodeSrgb(outputRgb);
+    imageStore(outputImage, position, vec4(outputRgb, original.a));
+}

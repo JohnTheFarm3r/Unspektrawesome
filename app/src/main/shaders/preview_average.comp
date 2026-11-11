@@ -1,0 +1,23 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0, rgba16f) uniform image2D currentFrame;
+layout(binding = 1, rgba16f) uniform image2D history;
+layout(push_constant) uniform Average { int index; int encodeSdr; } average;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(currentFrame)))) return;
+    vec4 value = imageLoad(currentFrame, pixel);
+    if (average.index > 0) {
+        vec4 previous = imageLoad(history, pixel);
+        value = previous + (value - previous) / float(average.index + 1);
+        value.a = max(previous.a, imageLoad(currentFrame, pixel).a);
+    }
+    imageStore(history, pixel, value);
+    if (average.encodeSdr != 0) {
+        vec3 positive = max(value.rgb, vec3(0.0));
+        value.rgb = mix(12.92 * positive, 1.055 * pow(positive, vec3(1.0 / 2.4)) - 0.055,
+            step(vec3(0.0031308), positive));
+    }
+    imageStore(currentFrame, pixel, value);
+}

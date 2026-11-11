@@ -1,0 +1,287 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+// Spatial film effects for video. A shared blur pyramid of film exposure approximates
+// camera diffusion and halation, and a second pyramid of print exposure carries print diffusion.
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+layout(constant_id = 20) const uint kOperation = 0u;
+
+const uint kOpBoostCurve = 0u;
+const uint kOpBase = 1u;
+const uint kOpDown = 2u;
+const uint kOpChain = 3u;
+const uint kOpPrintDown = 4u;
+const uint kOpPrintChain = 5u;
+const uint kOpComposeComposed = 6u;
+const uint kOpComposeStages = 7u;
+
+const uint kFlagFilm = 1u;
+const uint kFlagBoost = 2u;
+const uint kFlagPrint = 4u;
+const uint kFlagGlare = 8u;
+const uint kAutoExposure = 1u;
+
+const float kLog10E = 0.4342944819032518;
+const float kLog2Of10 = 3.321928094887362;
+const float kHalfMax = 65504.0;
+
+layout(push_constant) uniform VideoParams {
+  uint width;
+  uint height;
+  float exposureLog;
+  uint flags;
+  uint level;
+  uint composedSize;
+  uint activeOriginX;
+  uint activeOriginY;
+} params;
+
+#define SPEKTRA_FOUR_STAGE_LUT_BINDING 10
+#define SPEKTRA_FOUR_STAGE_LUT_TEXTURE 1
+#include "SpektraFourStageLut.glsl"
+
+layout(binding = SPEKTRA_COMPOSED_LUT_TEXTURE_BINDING) uniform sampler3D composedLutTexture;
+
+layout(std430, binding = 30) readonly buffer AutoExposureResult {
+  float autoExposureEv[];
+};
+
+#include "SpektraPreviewImageOutput.glsl"
+layout(binding = SPEKTRA_PREVIEW_SOURCE_IMAGE_BINDING, rgba16f) uniform readonly image2D previewSource;
+
+layout(std140, binding = 40) uniform VideoInfo {
+  uvec4 config;      // film levels, flags, print levels
+  vec4 sharp;        // unblurred film weight, w = film pyramid scale
+  vec4 sharpPrint;   // unblurred print weight
+  vec4 boost;        // boost EV, range, protect EV, smoothing
+  vec4 glare;        // linear output veil
+  vec4 weights[10];
+  vec4 printWeights[10];
+} info;
+
+layout(std430, binding = 41) buffer VideoState {
+  uint maxBits;
+  uint valid;
+  float logMax;
+  float reserved;
+  vec4 curve;        // smoothed frame maximum, threshold, shape, gain
+} state;
+
+layout(binding = 42) uniform sampler2D previewSourceTexture;
+layout(binding = 43) uniform sampler2D filmPyramid;
+layout(binding = 45) uniform sampler2D printPyramid;
+layout(set = 1, binding = 0, rgba16f) uniform image2D filmLevel;
+layout(set = 1, binding = 1, rgba16f) uniform image2D printLevel;
+
+shared uint groupMax;
+
+float max3(vec3 value) {
+  return max(max(value.r, value.g), value.b);
+}
+
+float exposureLog10() {
+  float exposure = params.exposureLog;
+  if ((params.flags & kAutoExposure) != 0u) exposure += autoExposureEv[0] * 0.3010299956639812;
+  return exposure;
+}
+
+vec3 filmRaw(vec3 linearRgb, float exposure) {
+  const vec3 logRaw = fourStageDecodeLog(sampleFourStageLut(fourStageEncodeInput(linearRgb), 0u), 0u) + exposure;
+  return exp2(logRaw * kLog2Of10);
+}
+
+vec3 applyBoost(vec3 raw) {
+  const vec4 curve = state.curve;
+  if ((info.config.y & kFlagBoost) == 0u || curve.x <= 0.0 || curve.w <= 0.0 || curve.y >= curve.x ||
+      max3(raw) <= curve.y) {
+    return raw;
+  }
+  // Values above the smoothed maximum keep the boost of the maximum.
+  const vec3 dx = clamp((raw - vec3(curve.y)) / curve.x, 0.0, 1.0);
+  return raw + curve.w * curve.x * (exp(curve.z * dx) - curve.z * dx - 1.0);
+}
+
+vec3 negativeDensity(vec3 logRaw) {
+  return applyFourStageCouplers(logRaw,
+    max(fourStageDecodeDensity(sampleFourStageLut(fourStageEncodeLog(logRaw, 0u), 1u)), vec3(0.0)));
+}
+
+vec3 densityFromFilm(vec3 film) {
+  return negativeDensity(log(max(film, vec3(0.0)) + vec3(1.0e-10)) * kLog10E);
+}
+
+vec3 printExposure(vec3 density) {
+  return exp2(fourStageDecodeLog(sampleFourStageLut(fourStageEncodeDensity(density), 2u), 2u) * kLog2Of10);
+}
+
+float printScale() {
+  return exp2(-fourStageLogRange(2u).y * kLog2Of10);
+}
+
+vec4 downsample(sampler2D pyramid, ivec2 position, ivec2 size, int level) {
+  const vec2 uv = (vec2(position) + 0.5) / vec2(size);
+  const vec2 offset = 0.75 / vec2(textureSize(pyramid, level - 1));
+  const float lod = float(level - 1);
+  return 0.25 * (textureLod(pyramid, uv - offset, lod) + textureLod(pyramid, uv + offset, lod) +
+    textureLod(pyramid, uv + vec2(offset.x, -offset.y), lod) + textureLod(pyramid, uv + vec2(-offset.x, offset.y), lod));
+}
+
+vec3 upsample(sampler2D pyramid, vec2 uv, int level) {
+  const vec2 offset = 0.5 / vec2(textureSize(pyramid, level));
+  const float lod = float(level);
+  return 0.25 * (textureLod(pyramid, uv - offset, lod).rgb + textureLod(pyramid, uv + offset, lod).rgb +
+    textureLod(pyramid, uv + vec2(offset.x, -offset.y), lod).rgb +
+    textureLod(pyramid, uv + vec2(-offset.x, offset.y), lod).rgb);
+}
+
+float srgbDecode(float value) {
+  const float magnitude = abs(value);
+  const float linear = magnitude <= 0.04045 ? magnitude / 12.92 : pow((magnitude + 0.055) / 1.055, 2.4);
+  return value < 0.0 ? -linear : linear;
+}
+
+float srgbEncode(float value) {
+  const float magnitude = abs(value);
+  const float encoded = magnitude <= 0.0031308 ? magnitude * 12.92 : 1.055 * pow(magnitude, 1.0 / 2.4) - 0.055;
+  return value < 0.0 ? -encoded : encoded;
+}
+
+void updateBoostCurve() {
+  if (gl_GlobalInvocationID.x != 0u || gl_GlobalInvocationID.y != 0u) return;
+  const float frameMax = uintBitsToFloat(state.maxBits);
+  state.maxBits = 0u;
+  if (frameMax > 0.0 && !isinf(frameMax) && !isnan(frameMax)) {
+    const float logMax = log2(frameMax);
+    state.logMax = state.valid != 0u ? mix(state.logMax, logMax, info.boost.w) : logMax;
+    state.valid = 1u;
+  }
+  const float maximum = state.valid != 0u ? exp2(state.logMax) : 0.0;
+  const float threshold = clamp(0.184 * exp2(info.boost.z), 0.0, maximum);
+  const float shape = pow(28.0, 1.0 - clamp(info.boost.y, 0.0, 1.0));
+  const float start = maximum > 0.0 ? threshold / maximum : 1.0;
+  const float denominator = exp(shape * (1.0 - start)) - shape * (1.0 - start) - 1.0;
+  const float gain = maximum > 0.0 && threshold < maximum && denominator > 1.0e-10
+    ? (exp2(max(info.boost.x, 0.0)) - 1.0) / denominator : 0.0;
+  state.curve = vec4(maximum, threshold, shape, gain);
+}
+
+void buildBase(uvec2 gid) {
+  const ivec2 size = imageSize(filmLevel);
+  const bool accumulate = (info.config.y & kFlagBoost) != 0u;
+  if (accumulate) {
+    if (gl_LocalInvocationIndex == 0u) groupMax = 0u;
+    barrier();
+  }
+  float localMax = 0.0;
+  if (all(lessThan(ivec2(gid), size))) {
+    const float exposure = exposureLog10();
+    vec3 film;
+    if (accumulate) {
+      // Boost is applied per pixel so that small highlights keep their boosted energy.
+      const ivec2 limit = ivec2(params.width, params.height) - 1;
+      vec3 sum = vec3(0.0);
+      for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
+          const ivec2 position = min(ivec2(gid) * 2 + ivec2(x, y), limit);
+          const vec3 raw = filmRaw(imageLoad(previewSource, position).rgb, exposure);
+          localMax = max(localMax, max3(raw));
+          sum += applyBoost(raw);
+        }
+      }
+      film = sum * 0.25;
+    } else {
+      // A bilinear sample at the block center averages its four pixels.
+      const vec2 uv = (vec2(gid) * 2.0 + 1.0) / vec2(params.width, params.height);
+      film = filmRaw(textureLod(previewSourceTexture, uv, 0.0).rgb, exposure);
+    }
+    imageStore(filmLevel, ivec2(gid), vec4(min(film * info.sharp.w, vec3(kHalfMax)), 1.0));
+  }
+  if (accumulate) {
+    atomicMax(groupMax, floatBitsToUint(localMax));
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) atomicMax(state.maxBits, groupMax);
+  }
+}
+
+void chainFilm(ivec2 position) {
+  const ivec2 size = imageSize(filmLevel);
+  if (any(greaterThanEqual(position, size))) return;
+  const int level = int(params.level);
+  const vec3 own = imageLoad(filmLevel, position).rgb;
+  vec3 glow = info.weights[level].rgb * own;
+  if (level + 1 < int(info.config.x)) glow += upsample(filmPyramid, (vec2(position) + 0.5) / vec2(size), level + 1);
+  imageStore(filmLevel, position, vec4(glow, 1.0));
+  if (level == 0 && (info.config.y & kFlagPrint) != 0u) {
+    const vec3 film = (info.sharp.rgb * own + glow) / info.sharp.w;
+    const vec3 print = printExposure(densityFromFilm(film)) * printScale();
+    imageStore(printLevel, position, vec4(min(print, vec3(kHalfMax)), 1.0));
+  }
+}
+
+void chainPrint(ivec2 position) {
+  const ivec2 size = imageSize(printLevel);
+  if (any(greaterThanEqual(position, size))) return;
+  const int level = int(params.level);
+  const vec3 own = imageLoad(printLevel, position).rgb;
+  vec3 glow = info.printWeights[level].rgb * own;
+  if (level + 1 < int(info.config.z)) glow += upsample(printPyramid, (vec2(position) + 0.5) / vec2(size), level + 1);
+  if (level == 0) {
+    // The base level keeps the output change from print diffusion, which varies as slowly as the glow.
+    const float scale = printScale();
+    const vec3 print = max(own / scale, vec3(1.0e-10));
+    const vec3 diffused = max(info.sharpPrint.rgb * print + glow / scale, vec3(1.0e-10));
+    glow = sampleFourStageLut(fourStageEncodeLog(log(diffused) * kLog10E, 2u), 3u) -
+      sampleFourStageLut(fourStageEncodeLog(log(print) * kLog10E, 2u), 3u);
+  }
+  imageStore(printLevel, position, vec4(glow, 1.0));
+}
+
+void compose(uvec2 gid) {
+  if (gid.x >= params.width || gid.y >= params.height) return;
+  const vec4 source = imageLoad(previewSource, ivec2(gid));
+  const vec2 uv = (vec2(gid) + 0.5) / vec2(params.width, params.height);
+  const uint flags = info.config.y;
+  vec3 film = applyBoost(filmRaw(source.rgb, exposureLog10()));
+  if ((flags & kFlagFilm) != 0u) film = info.sharp.rgb * film + upsample(filmPyramid, uv, 0) / info.sharp.w;
+  const vec3 density = densityFromFilm(film);
+  vec3 rgb;
+  if (kOperation == kOpComposeComposed) {
+    const float size = float(params.composedSize);
+    rgb = textureLod(composedLutTexture, (fourStageEncodeDensity(density) * (size - 1.0) + 0.5) / size, 0.0).rgb;
+  } else {
+    rgb = sampleFourStageLut(sampleFourStageLut(fourStageEncodeDensity(density), 2u), 3u);
+  }
+  if ((flags & kFlagPrint) != 0u) rgb += upsample(printPyramid, uv, 0);
+  if ((flags & kFlagGlare) != 0u) {
+    const vec3 linear = vec3(srgbDecode(rgb.r), srgbDecode(rgb.g), srgbDecode(rgb.b)) + info.glare.rgb;
+    rgb = vec3(srgbEncode(linear.r), srgbEncode(linear.g), srgbEncode(linear.b));
+  }
+  storePreviewImage(gid.y * params.width + gid.x, vec4(rgb, source.a));
+}
+
+void main() {
+  const uvec2 gid = gl_GlobalInvocationID.xy;
+  if (kOperation == kOpBoostCurve) {
+    updateBoostCurve();
+  } else if (kOperation == kOpBase) {
+    buildBase(gid);
+  } else if (kOperation == kOpDown) {
+    const ivec2 size = imageSize(filmLevel);
+    if (all(lessThan(ivec2(gid), size))) {
+      imageStore(filmLevel, ivec2(gid), downsample(filmPyramid, ivec2(gid), size, int(params.level)));
+    }
+  } else if (kOperation == kOpChain) {
+    chainFilm(ivec2(gid));
+  } else if (kOperation == kOpPrintDown) {
+    const ivec2 size = imageSize(printLevel);
+    if (all(lessThan(ivec2(gid), size))) {
+      imageStore(printLevel, ivec2(gid), downsample(printPyramid, ivec2(gid), size, int(params.level)));
+    }
+  } else if (kOperation == kOpPrintChain) {
+    chainPrint(ivec2(gid));
+  } else {
+    compose(gid);
+  }
+}

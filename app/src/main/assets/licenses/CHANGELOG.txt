@@ -1,0 +1,11 @@
+Kodak Tri-X Reversal Film 7266
+Original profile by Andrea Volpato, licensed under CC BY-SA 4.0.
+https://github.com/andreavolpato/spektrafilm
+Source revision: 6cd00c8d4f30b5b550f50f4bbd3753c9f2a48507 (dev).
+
+2026-09-29, Unspektrawesome / JohnTheFarm3r:
+The original kodak_trix.json is preserved unchanged. Build-time tables encode
+its single emulsion channel in Vulkan's three-component storage, retaining the
+original spectral sensitivity, density curves, sublayers and base density.
+Grain area is derived from the upstream monochrome RMS-granularity preset.
+Monochrome rendering uses direct film scanning and same-layer inhibition.

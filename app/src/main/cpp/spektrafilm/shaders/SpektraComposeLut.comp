@@ -1,0 +1,19 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#define SPEKTRA_FOUR_STAGE_LUT_BINDING 0
+#include "SpektraFourStageLut.glsl"
+
+layout(local_size_x = 8, local_size_y = 4, local_size_z = 4) in;
+layout(binding = 1, rgba16f) uniform writeonly image3D composedLut;
+layout(push_constant) uniform ComposeParams {
+  uint size;
+} params;
+
+void main() {
+  const uvec3 gid = gl_GlobalInvocationID;
+  if (any(greaterThanEqual(gid, uvec3(params.size)))) return;
+  const vec3 code = vec3(gid) / float(params.size - 1u);
+  const vec3 printCode = sampleFourStageLut(code, 2u);
+  imageStore(composedLut, ivec3(gid), vec4(sampleFourStageLut(printCode, 3u), 1.0));
+}

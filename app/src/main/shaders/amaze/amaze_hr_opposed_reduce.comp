@@ -1,0 +1,80 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Chrominance estimate of darktable's "inpaint opposed" highlight reconstruction:
+// https://github.com/darktable-org/darktable/blob/master/src/iop/hlreconstruct/opposed.c
+// Copyright (C) 2022-2026 darktable developers. GNU General Public License version 3 or later.
+// Modified for Vulkan shaders.
+#include "amaze/amaze_common.glsl"
+#include "highlight_recovery.glsl"
+
+layout(local_size_x_id = 12, local_size_y_id = 13, local_size_z = 1) in;
+layout(set = 0, binding = 7) uniform sampler2D demosaicImage;
+layout(set = 0, binding = 6) uniform sampler2D hrTmpImage;
+layout(set = 0, binding = 12) uniform sampler2D hrMaskImage;
+layout(set = 0, binding = 11) buffer HrReduce {
+    int chromaSum[3];
+    uint chromaCount[3];
+} hrReduce;
+
+shared int workgroupChromaSum[3];
+shared uint workgroupChromaCount[3];
+
+highp float hrMaskChannel(ivec2 p, int c) {
+    if (p.x < 0 || p.y < 0 || p.x >= AMAZE_WIDTH || p.y >= AMAZE_HEIGHT) {
+        return 0.0;
+    }
+    return texelFetch(hrMaskImage, p, 0)[c];
+}
+
+bool hrDilatedMask3x3(ivec2 pos, int c) {
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (hrMaskChannel(pos + ivec2(dx, dy), c) > 0.5) return true;
+        }
+    }
+    return false;
+}
+
+
+void accumulateChrominance(int c, highp float inval, highp float tmp, highp float clipdark, highp float clip) {
+    if (inval > clipdark && inval < clip) {
+        int delta = int(round((inval - tmp) * HR_REDUCE_SCALE));
+        atomicAdd(workgroupChromaSum[c], delta);
+        atomicAdd(workgroupChromaCount[c], 1u);
+    }
+}
+
+void main() {
+    uint localIndex = gl_LocalInvocationIndex;
+    if (localIndex < 3u) {
+        int c = int(localIndex);
+        workgroupChromaSum[c] = 0;
+        workgroupChromaCount[c] = 0u;
+    }
+    barrier();
+
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    bool isActivePixel = pos.x >= HR_BORDER && pos.y >= HR_BORDER &&
+        pos.x < AMAZE_WIDTH - HR_BORDER && pos.y < AMAZE_HEIGHT - HR_BORDER;
+
+    if (isActivePixel) {
+        highp vec3 wb = hrWhiteBalance(rawColor.whiteBalanceExposure.xyz);
+        highp vec3 clips = hrClips(wb);
+        highp vec3 clipdark = hrClipDark(clips);
+        highp vec3 inval = max(texelFetch(demosaicImage, pos, 0).rgb * wb, vec3(0.0));
+        highp vec3 tmp = texelFetch(hrTmpImage, pos, 0).rgb;
+
+        for (int c = 0; c < 3; ++c) {
+            if (hrDilatedMask3x3(pos, c)) {
+                accumulateChrominance(c, inval[c], tmp[c], clipdark[c], clips[c]);
+            }
+        }
+    }
+
+    barrier();
+    if (localIndex < 3u) {
+        int c = int(localIndex);
+        atomicAdd(hrReduce.chromaSum[c], workgroupChromaSum[c]);
+        atomicAdd(hrReduce.chromaCount[c], workgroupChromaCount[c]);
+    }
+}

@@ -1,0 +1,224 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(constant_id = 0) const int BIN_SIZE = 2;
+layout(constant_id = 1) const bool IDENTITY_LEVELS = false;
+layout(constant_id = 3) const bool ALIGNED_RAW16 = false;
+layout(constant_id = 4) const bool PREVIEW_SIZED = false;
+
+#include "raw_source.glsl"
+#include "frame_geometry.glsl"
+
+layout(set = 0, binding = 2, std430) writeonly buffer RemosaicOutput { uint words[]; } remosaiced;
+
+int colorAt(ivec2 site, int pattern) {
+    int index = site.y * 2 + site.x;
+    return index == pattern ? CFA_RED : index == (pattern ^ 3) ? CFA_BLUE : CFA_GREEN;
+}
+
+int levelAt(ivec2 site, int pattern) {
+    int color = colorAt(site, pattern);
+    return color == CFA_RED ? 0 : color == CFA_BLUE ? 3 : site.y + 1;
+}
+
+int bayerColorAt(int x, int y) {
+    return colorAt(ivec2(x, y) & 1, rawParams.layoutInfo.z);
+}
+
+int binColorAt(int x, int y) {
+    return colorAt(((ivec2(x, y) + rawParams.remosaic.zw) / BIN_SIZE) & 1, rawParams.remosaic.y);
+}
+
+int quadColorAt(int x, int y) { return binColorAt(x, y); }
+
+float encodeRawAt(int x, int y, int level) {
+    uint sampleValue;
+#ifndef UNSPEKTRA_RAW_IMAGE_INPUT
+    if (ALIGNED_RAW16) {
+        uint index = uint(y * (rawParams.layoutInfo.x / 2) + x);
+        sampleValue = (rawInput.words[index >> 1u] >> ((index & 1u) * 16u)) & 65535u;
+    } else
+#endif
+    {
+        sampleValue = rawSensorIntegerAt(ivec2(x, y));
+    }
+    float value = float(sampleValue);
+    if (IDENTITY_LEVELS)
+        return clamp(value, rawParams.blackLevel[level], rawParams.whiteLevel[level]);
+    ivec2 site = ((ivec2(x, y) + rawParams.remosaic.zw) / BIN_SIZE) & 1;
+    int sourceLevel = levelAt(site, rawParams.remosaic.y);
+    if (sourceLevel == 1 || sourceLevel == 2)
+        sourceLevel = ((sourceLevel - 1) ^ (rawParams.remosaic.w & 1)) + 1;
+    float black = rawParams.blackLevel[sourceLevel];
+    float white = rawParams.whiteLevel[sourceLevel];
+    float normalized = clamp((value - black) / max(1.0, white - black), 0.0, 1.25);
+    return clamp(round(normalized * (rawParams.whiteLevel[level] - rawParams.blackLevel[level]) +
+        rawParams.blackLevel[level]), rawParams.blackLevel[level], rawParams.whiteLevel[level]);
+}
+
+bool inSourceBounds(int x, int y) {
+    return x >= 0 && y >= 0 && x < rawParams.dimensions.x && y < rawParams.dimensions.y;
+}
+
+// Same-color copy, edge-directed interpolation, then inverse-distance border fallback.
+bool findDirectionalSample(int cx, int cy, int stepX, int stepY,
+                           int target, int level, int side, uint sampleMask,
+                           out float value, out int distance) {
+    value    = -1.0;
+    int R = clamp((2 * BIN_SIZE), 1, 8);
+    distance = findLSB(sampleMask & ((1u << R) - 1u)) + 1;
+    if (distance == 0) return false;
+    int sx = cx + side * stepX * distance;
+    int sy = cy + side * stepY * distance;
+    if (!inSourceBounds(sx, sy)) return false;
+    value = encodeRawAt(sx, sy, level);
+    return true;
+}
+
+uint colorMask(uint xMask, uint yMask, int target) {
+    if (target == 0) return ~(xMask | yMask);
+    if (target == 2) return xMask & yMask;
+    return xMask ^ yMask;
+}
+
+void considerEdgeDirection(int cx, int cy, int stepX, int stepY, int target, int level,
+                           uint negMask, uint posMask,
+                           inout float bestValue, inout float bestScore) {
+    float negVal; int negDist;
+    float posVal; int posDist;
+    bool hasNeg = findDirectionalSample(cx, cy, stepX, stepY, target, level, -1, negMask, negVal, negDist);
+    bool hasPos = findDirectionalSample(cx, cy, stepX, stepY, target, level,  1, posMask, posVal, posDist);
+
+    float value;
+    float score;
+    if (hasNeg && hasPos) {
+        float total = float(negDist + posDist);
+        value = (negVal * float(posDist) + posVal * float(negDist)) / total;
+        score = abs(posVal - negVal) / total + 0.015 * total;
+    } else if (hasNeg || hasPos) {
+        value = hasNeg ? negVal : posVal;
+        float d = float(hasNeg ? negDist : posDist);
+        score = 256.0 + d * 8.0;
+    } else {
+        return;
+    }
+
+    if (score < bestScore) {
+        bestScore = score;
+        bestValue = value;
+    }
+}
+
+
+uint remosaicAt(int x, int y) {
+    int target = bayerColorAt(x, y);
+    int level = levelAt(ivec2(x, y) & 1, rawParams.layoutInfo.z);
+    int cx     = min(x, rawParams.dimensions.x - 1);
+    int cy     = min(y, rawParams.dimensions.y - 1);
+
+    float outVal;
+
+    if (quadColorAt(cx, cy) == target) {
+        outVal = encodeRawAt(cx, cy, level);
+    } else {
+        float bestValue = -1.0;
+        float bestScore =  1e9;
+        int b = BIN_SIZE;
+        int period = 2 * b;
+        int redX = (rawParams.remosaic.y & 1) * b;
+        int redY = (rawParams.remosaic.y >> 1) * b;
+        int px = (cx + rawParams.remosaic.z + redX) % period;
+        int py = (cy + rawParams.remosaic.w + redY) % period;
+        uint wave = ((1u << b) - 1u) << b;
+        wave |= (wave << period) | (wave << (2 * period));
+        uint xp = wave >> (px + 1);
+        uint yp = wave >> (py + 1);
+        uint xn = ~(wave >> (period - px));
+        uint yn = ~(wave >> (period - py));
+        uint xc = px < b ? 0u : 0xFFu;
+        uint yc = py < b ? 0u : 0xFFu;
+        considerEdgeDirection(cx, cy, 1, 0, target, level,
+            colorMask(xn, yc, target), colorMask(xp, yc, target), bestValue, bestScore);
+        considerEdgeDirection(cx, cy, 0, 1, target, level,
+            colorMask(xc, yn, target), colorMask(xc, yp, target), bestValue, bestScore);
+        considerEdgeDirection(cx, cy, 1, 1, target, level,
+            colorMask(xn, yn, target), colorMask(xp, yp, target), bestValue, bestScore);
+        considerEdgeDirection(cx, cy, 1, -1, target, level,
+            colorMask(xn, yp, target), colorMask(xp, yn, target), bestValue, bestScore);
+
+        if (bestValue >= 0.0) {
+            outVal = clamp(round(bestValue), rawParams.blackLevel[level], rawParams.whiteLevel[level]);
+        } else {
+            int fb = max(1, 2 * BIN_SIZE - 1);
+            float wnum = 0.0;
+            float wsum = 0.0;
+            for (int dy = -fb; dy <= fb; ++dy) {
+                int sy = cy + dy;
+                if (sy < 0 || sy >= rawParams.dimensions.y) continue;
+                for (int dx = -fb; dx <= fb; ++dx) {
+                    if (dx == 0 && dy == 0) continue;
+                    int sx = cx + dx;
+                    if (sx < 0 || sx >= rawParams.dimensions.x) continue;
+                    if (binColorAt(sx, sy) != target) continue;
+                    float w = 1.0 / float(dx * dx + dy * dy);
+                    wnum += encodeRawAt(sx, sy, level) * w;
+                    wsum += w;
+                }
+            }
+            if (wsum > 1e-6) {
+                outVal = clamp(round(wnum / wsum), rawParams.blackLevel[level], rawParams.whiteLevel[level]);
+            } else {
+                outVal = clamp(round(rawParams.blackLevel[level]), 0.0, rawParams.whiteLevel[level]);
+            }
+        }
+    }
+
+    return uint(int(outVal));
+}
+
+
+ivec2 clampSampleCoordinate(ivec2 position) {
+    ivec2 parity = position & 1;
+    ivec2 minimum = frameGeometry.rawBounds.xy;
+    minimum += (minimum & 1) ^ parity;
+    ivec2 maximum = frameGeometry.rawBounds.xy + frameGeometry.rawBounds.zw - 1;
+    maximum -= (maximum & 1) ^ parity;
+    return clamp(position, minimum, maximum);
+}
+
+uint outputSample(ivec2 position) {
+    if (PREVIEW_SIZED) {
+        ivec2 cropOrigin = ivec2(round(frameGeometry.sourceCrop.xy * vec2(rawParams.dimensions.xy)));
+        ivec2 cropSize = ivec2(round(frameGeometry.sourceCrop.zw * vec2(rawParams.dimensions.xy)));
+        // Resize within each Bayer site so downsampling cannot mix CFA colors.
+        ivec2 parity = position & 1;
+        ivec2 center = (position * 2 + 1) * cropSize / rawParams.dimensions.zw;
+        position = (cropOrigin * 2 + center + 1 - parity * 2) / 4 * 2 + parity;
+        position = clampSampleCoordinate(position);
+    }
+    return remosaicAt(position.x, position.y);
+}
+
+void main() {
+    int pairX = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    ivec2 dimensions = PREVIEW_SIZED ? rawParams.dimensions.zw : rawParams.dimensions.xy;
+    int pairsPerRow = (dimensions.x + 1) / 2;
+    if (pairX >= pairsPerRow || y >= dimensions.y) return;
+    int index = (y * pairsPerRow + pairX) * 2;
+    int pixelCount = dimensions.x * dimensions.y;
+    if (index >= pixelCount) return;
+    int x = pairX * 2;
+    if ((dimensions.x & 1) != 0) {
+        y = index / dimensions.x;
+        x = index - y * dimensions.x;
+    }
+    uint low = outputSample(ivec2(x, y));
+    uint high = 0u;
+    if (index + 1 < pixelCount) {
+        if (++x == dimensions.x) { x = 0; ++y; }
+        high = outputSample(ivec2(x, y));
+    }
+    remosaiced.words[index / 2] = low | (high << 16);
+}

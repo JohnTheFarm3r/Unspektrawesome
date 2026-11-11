@@ -1,0 +1,49 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "SpektraStorageBuffer.glsl"
+#include "SpektraFourStageLut.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+SPEKTRA_READ_BUFFER(0, vec4, 16u, filmDensity)
+layout(binding = SPEKTRA_COMPOSED_LUT_TEXTURE_BINDING) uniform sampler3D composedLutTexture;
+layout(push_constant) uniform CoreParams {
+  uint width;
+  uint height;
+  float filmExposureEv;
+  float filmGamma;
+  uint exposureCount;
+  int inputColorSpace;
+  int rgbToRawMethod;
+  uint colorSpaceCount;
+  uint transferLutSize;
+  float colorDecodeMin;
+  float colorDecodeMax;
+  uint hanatosWidth;
+  uint hanatosHeight;
+  uint _pad0;
+  uint _pad1;
+  uint _pad2;
+  int filmPushPullMode;
+  float filmPushPullStops;
+  uint fullWidth;
+  uint fullHeight;
+  uint tileOriginX;
+  uint tileOriginY;
+  uint activeOriginX;
+  uint activeOriginY;
+  uint activeWidth;
+  uint activeHeight;
+} params;
+#include "SpektraPreviewImageOutput.glsl"
+
+void main() {
+  const uvec2 activeGid = gl_GlobalInvocationID.xy;
+  if (any(greaterThanEqual(activeGid, uvec2(params.activeWidth, params.activeHeight)))) return;
+  const uvec2 gid = activeGid + uvec2(params.activeOriginX, params.activeOriginY);
+  if (any(greaterThanEqual(gid, uvec2(params.width, params.height)))) return;
+  const uint index = gid.y * params.width + gid.x;
+  const vec4 pixel = read_filmDensity(index);
+  const float size = float(params._pad2);
+  const vec3 coordinate = (fourStageEncodeDensity(pixel.rgb) * (size - 1.0) + 0.5) / size;
+  storePreviewImage(index, vec4(textureLod(composedLutTexture, coordinate, 0.0).rgb, pixel.a));
+}

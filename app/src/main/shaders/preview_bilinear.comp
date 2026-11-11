@@ -1,0 +1,300 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#if !defined(UNSPEKTRA_SENSOR_METER) && !defined(UNSPEKTRA_PREVIEW_REMOSAIC_INPUT)
+#define UNSPEKTRA_LIVE_STABILIZATION 1
+#endif
+#define UNSPEKTRA_PREVIEW_SCALAR_SHADING
+#include "raw_input.glsl"
+#include "raw_color.glsl"
+#include "frame_geometry.glsl"
+
+#ifndef UNSPEKTRA_PREVIEW_SHADING_REUSE
+#define UNSPEKTRA_PREVIEW_SHADING_REUSE 0
+#endif
+const bool reusePreviewShading = UNSPEKTRA_PREVIEW_SHADING_REUSE != 0;
+#if defined(UNSPEKTRA_SENSOR_METER) || defined(UNSPEKTRA_PREVIEW_LIGHTWEIGHT)
+const bool useMhcDemosaic = false;
+#elif defined(UNSPEKTRA_PREVIEW_DEMOSAIC)
+const bool useMhcDemosaic = UNSPEKTRA_PREVIEW_DEMOSAIC == 1;
+#else
+layout(constant_id = 7) const bool useMhcDemosaic = true;
+#endif
+#ifdef UNSPEKTRA_PREVIEW_FRAGMENT
+layout(location = 0) out vec4 previewOutput;
+#else
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+#ifdef UNSPEKTRA_SENSOR_METER
+layout(set = 0, binding = 11, std430) writeonly buffer MeterPixels {
+    vec4 pixels[];
+} meterOutput;
+layout(push_constant) uniform MeterRegion {
+    uvec2 origin;
+    uvec2 extent;
+    uvec2 samples;
+} meterRegion;
+#else
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D previewOutput;
+#endif
+layout(constant_id = 0) const bool useSharedRawTile = false;
+#ifndef UNSPEKTRA_PREVIEW_REMOSAIC_INPUT
+const int previewTileRadius = useMhcDemosaic ? 2 : 1;
+const int previewTileSide = 8 + 2 * previewTileRadius;
+shared float previewRawTile[previewTileSide * previewTileSide];
+ivec2 previewTileOrigin;
+bool previewTileFits = false;
+#endif
+#endif
+vec4 previewShading;
+float previewSensorWarning = 0.0;
+
+float previewRawSample(ivec2 position)
+{
+    if (reusePreviewShading) {
+        position = clampRawCoordinateToParity(position);
+        int levelIndex = cfaLevelIndex(position);
+        float value = float(rawIntegerAt(position));
+        float black = rawParams.blackLevel[levelIndex];
+        float white = rawParams.whiteLevel[levelIndex];
+        return max((value - black) / max(white - black, 1.0), 0.0) *
+               previewShading[levelIndex] * rawColor.whiteBalanceExposure[cfaColor(position)];
+    }
+#if !defined(UNSPEKTRA_PREVIEW_FRAGMENT) && !defined(UNSPEKTRA_PREVIEW_REMOSAIC_INPUT)
+    if (useSharedRawTile && previewTileFits) {
+        ivec2 local = position - previewTileOrigin;
+        return previewRawTile[local.y * previewTileSide + local.x];
+    }
+#endif
+    return rawNormalized(position);
+}
+
+#define UNSPEKTRA_DEMOSAIC_SAMPLE previewRawSample
+#include "raw_demosaic.glsl"
+#include "raw_mhc.glsl"
+#include "raw_preview_mhc.glsl"
+
+#if UNSPEKTRA_PREVIEW_SHADING_REUSE
+vec3 previewMhcDemosaic(ivec2 center)
+{
+    float value = float(rawInteger(center));
+    vec4 axial = vec4(rawInteger(center + ivec2(-1, 0)), rawInteger(center + ivec2(1, 0)),
+                      rawInteger(center + ivec2(0, -1)), rawInteger(center + ivec2(0, 1)));
+    vec4 distant = vec4(rawInteger(center + ivec2(-2, 0)), rawInteger(center + ivec2(2, 0)),
+                        rawInteger(center + ivec2(0, -2)), rawInteger(center + ivec2(0, 2)));
+    vec4 corners = vec4(rawInteger(center + ivec2(-1, -1)), rawInteger(center + ivec2(1, -1)),
+                        rawInteger(center + ivec2(-1, 1)), rawInteger(center + ivec2(1, 1)));
+    return previewMhcInterpolate(value, axial, distant, corners, center, previewShading);
+}
+
+vec3 previewDemosaic(ivec2 center)
+{
+    float value = float(rawInteger(center));
+    vec4 axial = vec4(rawInteger(center + ivec2(-1, 0)),
+                      rawInteger(center + ivec2(1, 0)),
+                      rawInteger(center + ivec2(0, -1)),
+                      rawInteger(center + ivec2(0, 1)));
+    vec4 black = rawParams.blackLevel;
+    vec4 sensorLimit = mix(black, rawParams.whiteLevel, 0.98);
+    vec4 scale = previewShading * rawColor.whiteBalanceExposure.rggb /
+                 max(rawParams.whiteLevel - black, vec4(1.0));
+    int cfa = UNSPEKTRA_INPUT_CFA;
+    ivec2 redPosition = ivec2(cfa == CFA_GRBG || cfa == CFA_BGGR ? 1 : 0,
+                              cfa == CFA_GBRG || cfa == CFA_BGGR ? 1 : 0);
+    ivec2 site = (center & ivec2(1)) ^ redPosition;
+    bool topRow = (center.y & 1) == 0;
+    if (site.x != site.y) {
+        bool horizontalRed = site.y == 0;
+        if (rawColor.reserved1.z > 0.5) {
+            vec4 limits = horizontalRed ? sensorLimit.rraa : sensorLimit.aarr;
+            // This demosaic path does not otherwise read the other green site.
+            float otherGreen = float(rawInteger(center + ivec2(-1, -1)));
+            previewSensorWarning = value >= (topRow ? sensorLimit.g : sensorLimit.b) ||
+                otherGreen >= (topRow ? sensorLimit.b : sensorLimit.g) ||
+                any(greaterThanEqual(axial, limits)) ? 1.0 : 0.0;
+        }
+        vec4 levels = horizontalRed ? black.rraa : black.aarr;
+        vec4 gains = horizontalRed ? scale.rraa : scale.aarr;
+        axial = max(axial - levels, vec4(0.0)) * gains;
+        float green = max(value - (topRow ? black.g : black.b), 0.0) *
+                      (topRow ? scale.g : scale.b);
+        vec2 opposite = 0.5 * vec2(axial.x + axial.y, axial.z + axial.w);
+        return horizontalRed ? vec3(opposite.x, green, opposite.y)
+                             : vec3(opposite.y, green, opposite.x);
+    }
+    vec4 diagonal = vec4(rawInteger(center + ivec2(-1, -1)),
+                         rawInteger(center + ivec2(1, -1)),
+                         rawInteger(center + ivec2(-1, 1)),
+                         rawInteger(center + ivec2(1, 1)));
+    if (rawColor.reserved1.z > 0.5) {
+        vec4 limits = topRow ? sensorLimit.ggbb : sensorLimit.bbgg;
+        float centerLimit = site.x == 0 ? sensorLimit.r : sensorLimit.a;
+        float diagonalLimit = site.x == 0 ? sensorLimit.a : sensorLimit.r;
+        previewSensorWarning = value >= centerLimit || any(greaterThanEqual(axial, limits)) ||
+            any(greaterThanEqual(diagonal, vec4(diagonalLimit))) ? 1.0 : 0.0;
+    }
+    vec4 levels = topRow ? black.ggbb : black.bbgg;
+    vec4 gains = topRow ? scale.ggbb : scale.bbgg;
+    axial = max(axial - levels, vec4(0.0)) * gains;
+    float green = 0.25 * dot(axial, vec4(1.0));
+    if (site.x == 0) {
+        float red = max(value - black.r, 0.0) * scale.r;
+        float blue = 0.25 * dot(max(diagonal - black.a, vec4(0.0)), vec4(scale.a));
+        return vec3(red, green, blue);
+    }
+    float blue = max(value - black.a, 0.0) * scale.a;
+    float red = 0.25 * dot(max(diagonal - black.r, vec4(0.0)), vec4(scale.r));
+    return vec3(red, green, blue);
+}
+#endif
+
+#if !defined(UNSPEKTRA_SENSOR_METER) && !defined(UNSPEKTRA_PREVIEW_LIGHTWEIGHT)
+#include "raw_preview_downsample.glsl"
+#endif
+
+vec3 previewIntegerDemosaic(ivec2 position)
+{
+#ifdef UNSPEKTRA_SENSOR_METER
+    // Share the sample calculations across CFA sites, retaining each pixel's lens shading.
+    const ivec2 offsets[9] = ivec2[9](ivec2(0, 0),
+        ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1),
+        ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
+    int centerColor = cfaColor(position);
+    bool green = centerColor == CFA_GREEN;
+    float center = 0.0;
+    float horizontal = 0.0;
+    float vertical = 0.0;
+    float diagonal = 0.0;
+    for (int index = 0; index < (green ? 5 : 9); ++index) {
+        float value = rawNormalized(position + offsets[index]);
+        if (index == 0) center = value;
+        else if (index < 3) horizontal += value;
+        else if (index < 5) vertical += value;
+        else diagonal += value;
+    }
+    bool redIsHorizontal = cfaColor(position + ivec2(1, 0)) == CFA_RED;
+    vec3 greenPixel = redIsHorizontal ? vec3(0.5 * horizontal, center, 0.5 * vertical)
+                                     : vec3(0.5 * vertical, center, 0.5 * horizontal);
+    float axial = 0.25 * (horizontal + vertical);
+    vec3 otherPixel = centerColor == CFA_RED ? vec3(center, axial, 0.25 * diagonal)
+                                           : vec3(0.25 * diagonal, axial, center);
+    return green ? greenPixel : otherPixel;
+#elif UNSPEKTRA_PREVIEW_SHADING_REUSE
+    return useMhcDemosaic ? previewMhcDemosaic(position) : previewDemosaic(position);
+#else
+    return useMhcDemosaic ? mhcDemosaic(position) : bilinearDemosaic(position);
+#endif
+}
+
+vec3 previewFilteredDemosaic(ivec2 position, vec2 sourceUv)
+{
+#if !defined(UNSPEKTRA_SENSOR_METER) && !defined(UNSPEKTRA_PREVIEW_LIGHTWEIGHT)
+    vec2 outputSize = vec2((frameGeometry.transform.x & 1) != 0 ?
+        frameGeometry.transform.wz : frameGeometry.transform.zw);
+    vec2 footprint = frameGeometry.sourceCrop.zw * vec2(rawParams.dimensions.xy) / outputSize;
+#ifdef UNSPEKTRA_PREVIEW_REMOSAIC
+    if (previewRemosaic) footprint = vec2(1.0);
+#endif
+    if (previewMhcPrefiltered) {
+#ifdef UNSPEKTRA_LIVE_STABILIZATION
+        if (frameGeometry.stabilization.x > 0.5 && all(lessThanEqual(footprint, vec2(1.0001))))
+            return textureLod(previewRawTexture, sourceUv, 0.0).rgb;
+#endif
+        return previewMhcArea(sourceUv * vec2(rawParams.dimensions.xy), max(footprint, vec2(1.0)));
+    }
+    if (any(greaterThan(footprint, vec2(1.0001))))
+        return previewAreaDemosaic(sourceUv * vec2(rawParams.dimensions.xy), max(footprint, vec2(1.0)));
+#endif
+#ifdef UNSPEKTRA_LIVE_STABILIZATION
+    if (frameGeometry.stabilization.x > 0.5) {
+        vec2 pixel = sourceUv * vec2(rawParams.dimensions.xy) - 0.5;
+        ivec2 first = ivec2(floor(pixel));
+        vec2 fraction = fract(pixel);
+        // A single accumulation loop avoids duplicated MHC branches on Adreno.
+        vec3 sum = vec3(0.0);
+        for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) {
+            vec2 weight = mix(vec2(1.0) - fraction, fraction, bvec2(x != 0, y != 0));
+            sum += previewIntegerDemosaic(first + ivec2(x, y)) * (weight.x * weight.y);
+        }
+        return sum;
+    }
+#endif
+    return previewIntegerDemosaic(position);
+}
+
+void main()
+{
+#ifdef UNSPEKTRA_SENSOR_METER
+    uvec2 samplePosition = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(samplePosition, meterRegion.samples))) return;
+    ivec2 outputPosition = ivec2(meterRegion.origin + samplePosition * meterRegion.extent / meterRegion.samples);
+#elif defined(UNSPEKTRA_PREVIEW_FRAGMENT)
+    ivec2 outputPosition = ivec2(gl_FragCoord.xy);
+#else
+    ivec2 outputPosition = ivec2(gl_GlobalInvocationID.xy);
+#ifndef UNSPEKTRA_PREVIEW_REMOSAIC_INPUT
+    if (useSharedRawTile && !reusePreviewShading) {
+        ivec2 blockStart = ivec2(gl_WorkGroupID.xy) * 8;
+        ivec2 blockEnd = min(blockStart + 7, rawParams.dimensions.zw - 1);
+        ivec2 first = geometrySourcePosition(blockStart, rawParams.dimensions.xy);
+        ivec2 last = geometrySourcePosition(blockEnd, rawParams.dimensions.xy);
+        previewTileOrigin = min(first, last) - previewTileRadius;
+        previewTileFits = all(lessThanEqual(abs(last - first), ivec2(7)));
+        if (previewTileFits) {
+            for (uint index = gl_LocalInvocationIndex; index < uint(previewTileSide * previewTileSide); index += 64u) {
+                ivec2 offset = ivec2(int(index % uint(previewTileSide)), int(index / uint(previewTileSide)));
+                previewRawTile[index] = rawNormalized(previewTileOrigin + offset);
+            }
+            // Edge invocations must finish loading the tile before returning.
+            barrier();
+        }
+    }
+#endif
+    if (any(greaterThanEqual(outputPosition, rawParams.dimensions.zw)))
+        return;
+#endif
+
+    vec2 sourceUv = geometrySourceUv(outputPosition);
+    ivec2 rawPosition = clamp(
+        ivec2(floor(sourceUv * vec2(rawParams.dimensions.xy))),
+        ivec2(0), rawParams.dimensions.xy - 1);
+#ifdef UNSPEKTRA_PREVIEW_REMOSAIC
+    if (previewRemosaic) {
+        previewRemosaicSize = (frameGeometry.transform.x & 1) != 0 ?
+            rawParams.dimensions.wz : rawParams.dimensions.zw;
+        rawPosition = geometryUnrotatePosition(outputPosition);
+    }
+#endif
+    vec2 lensShadingUv = geometryLensShadingUv(sourceUv, rawParams.dimensions.xy);
+    vec3 processed;
+#if UNSPEKTRA_PREVIEW_SHADING_REUSE
+    // Lens shading changes slowly across the neighboring Bayer samples.
+    previewShading = rawLensGains(lensShadingUv);
+    vec3 rawRgb = previewFilteredDemosaic(rawPosition, sourceUv);
+    if (useMhcDemosaic) previewSensorWarning = max(previewSensorWarning, previewSensorHighlights(rawPosition));
+#ifndef UNSPEKTRA_SENSOR_METER
+    processed = rawColor.reserved1.w > 0.001 || rawColor.geometryControls.x > 0.5 ? rawRgb :
+#else
+    processed =
+#endif
+        rawColorProcessWithShading(rawRgb, previewShading, true);
+#else
+    vec3 rawRgb = previewFilteredDemosaic(rawPosition, sourceUv);
+#ifndef UNSPEKTRA_SENSOR_METER
+    processed = rawColor.reserved1.w > 0.001 || rawColor.geometryControls.x > 0.5 ? rawRgb :
+#else
+    processed =
+#endif
+        rawColorProcess(rawRgb, lensShadingUv,
+                                float(rawParams.layoutInfo.w));
+    previewSensorWarning = max(previewSensorWarning, previewSensorHighlights(rawPosition));
+#endif
+    // Carry clipping in the unused preview alpha without another image or pass.
+    vec4 outputValue = vec4(processed, 1.0 + previewSensorWarning);
+#ifdef UNSPEKTRA_SENSOR_METER
+    meterOutput.pixels[samplePosition.y * meterRegion.samples.x + samplePosition.x] = vec4(processed, 1.0);
+#elif defined(UNSPEKTRA_PREVIEW_FRAGMENT)
+    previewOutput = outputValue;
+#else
+    imageStore(previewOutput, outputPosition, outputValue);
+#endif
+}

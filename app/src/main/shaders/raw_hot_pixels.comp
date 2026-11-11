@@ -1,0 +1,71 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+#define UNSPEKTRA_PREVIEW_SHADING_REUSE 1
+#include "raw_source.glsl"
+#include "raw_color.glsl"
+#include "frame_geometry.glsl"
+
+layout(set = 0, binding = 2, std430) writeonly buffer CleanRaw { uint words[]; } cleanRaw;
+
+ivec2 sameSite(ivec2 position, ivec2 offset, int period) {
+    ivec2 requested = position + offset * period;
+    if (all(greaterThanEqual(requested, frameGeometry.rawBounds.xy)) &&
+        all(lessThan(requested, frameGeometry.rawBounds.xy + frameGeometry.rawBounds.zw))) return requested;
+    ivec2 phase = position % period;
+    ivec2 minimum = frameGeometry.rawBounds.xy;
+    minimum += (phase - minimum % period + period) % period;
+    ivec2 maximum = frameGeometry.rawBounds.xy + frameGeometry.rawBounds.zw - 1;
+    maximum -= (maximum % period - phase + period) % period;
+    ivec2 samplePosition = minimum + abs(requested - minimum);
+    samplePosition = maximum - abs(maximum - samplePosition);
+    return clamp(samplePosition, minimum, max(minimum, maximum));
+}
+
+uint corrected(ivec2 position) {
+    uint original = rawSensorIntegerAt(position);
+    if (any(lessThan(position, frameGeometry.rawBounds.xy)) ||
+        any(greaterThanEqual(position, frameGeometry.rawBounds.xy + frameGeometry.rawBounds.zw))) return original;
+    int block = max(rawParams.remosaic.x, 1);
+    int period = 2 * block;
+    ivec2 site = ((position + rawParams.remosaic.zw) / block) & 1;
+    int pattern = block > 1 ? rawParams.remosaic.y : rawParams.layoutInfo.z;
+    int index = site.y * 2 + site.x;
+    int level = index == pattern ? 0 : index == (pattern ^ 3) ? 3 : site.y + 1;
+    if (block > 1 && (level == 1 || level == 2)) level = ((level - 1) ^ (rawParams.remosaic.w & 1)) + 1;
+    float black = rawParams.blackLevel[level];
+    float range = max(rawParams.whiteLevel[level] - black, 1.0);
+    float minimumMargin = max(range * 0.002,
+        6.0 * sqrt(max(rawColor.reserved2.z, 0.0)) * range);
+    // One same-color neighbor can prove this pixel is not an isolated defect.
+    float neighbor = float(rawSensorIntegerAt(sameSite(position, ivec2(-1, 0), period)));
+    if (float(original) <= neighbor + minimumMargin ||
+        float(original) - black <= 2.0 * max(neighbor - black, 0.0) + minimumMargin) return original;
+    float maximum = neighbor;
+    float sum = neighbor;
+    float minimum = neighbor;
+    for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x) {
+        if (y == 0 && x <= 0) continue;
+        float sampleValue = float(rawSensorIntegerAt(sameSite(position, ivec2(x, y), period)));
+        maximum = max(maximum, sampleValue);
+        minimum = min(minimum, sampleValue);
+        sum += sampleValue;
+    }
+    float replacement = (sum - maximum - minimum) / 6.0;
+    float signal = max(replacement - black, 0.0) / range;
+    float sigma = sqrt(max(rawColor.reserved2.y * signal + rawColor.reserved2.z, 0.0)) * range;
+    float margin = max(range * 0.002, 6.0 * sigma);
+    bool isolated = float(original) > maximum + margin &&
+        float(original) - black > 2.0 * max(maximum - black, 0.0) + margin;
+    return isolated ? uint(round(clamp(replacement, 0.0, 65535.0))) : original;
+}
+
+void main() {
+    ivec2 position = ivec2(gl_GlobalInvocationID.xy) * ivec2(2, 1);
+    if (any(greaterThanEqual(position, rawParams.dimensions.xy))) return;
+    uint first = corrected(position);
+    uint second = position.x + 1 < rawParams.dimensions.x ? corrected(position + ivec2(1, 0)) : 0u;
+    uint rowWords = uint((rawParams.dimensions.x + 1) / 2);
+    cleanRaw.words[uint(position.y) * rowWords + uint(position.x / 2)] = first | (second << 16u);
+}

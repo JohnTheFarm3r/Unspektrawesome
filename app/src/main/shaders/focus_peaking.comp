@@ -1,0 +1,169 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform sampler2D inputImage;
+layout(set = 0, binding = 1, rgba16f) writeonly uniform image2D outputImage;
+layout(push_constant) uniform FocusParameters {
+    int width;
+    int height;
+    float strength;
+    float noiseS;
+    float noiseO;
+    float lumaVarianceGain;
+    float quantization;
+} pc;
+#if FOCUS_OVERLAY
+shared float confidenceTile[576];
+shared float connectedTile[400];
+#else
+shared float lumaTile[676];
+shared float filteredTile[400];
+
+float focusLuma(ivec2 position)
+{
+    vec3 rgb = texelFetch(inputImage, clamp(position, ivec2(0), ivec2(pc.width, pc.height) - 1), 0).rgb;
+    return dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+}
+
+float focusMedian(float a, float b, float c)
+{
+    return max(min(a, b), min(max(a, b), c));
+}
+
+float noiseResidual(ivec2 position)
+{
+    int p = position.y * 26 + position.x;
+    return abs(lumaTile[p] - lumaTile[p + 1] - lumaTile[p + 26] + lumaTile[p + 27]) * 0.5;
+}
+
+vec2 focusGradient(ivec2 position, int distance)
+{
+    int p = position.y * 20 + position.x;
+    return vec2(filteredTile[p + distance] - filteredTile[p - distance],
+                filteredTile[p + 20 * distance] - filteredTile[p - 20 * distance]);
+}
+
+vec4 focusPreview(ivec2 position)
+{
+    float strength = pc.strength;
+    float level = max(focusLuma(position), 0.0);
+    float gray = level <= 0.0031308 ? 12.92 * level : 1.055 * pow(level, 1.0 / 2.4) - 0.055;
+    if (any(lessThan(position, ivec2(6))) ||
+        any(greaterThanEqual(position, ivec2(pc.width, pc.height) - 6))) return vec4(vec3(gray), 0.0);
+    ivec2 local = ivec2(gl_LocalInvocationID.xy);
+    // Spread the noise samples so a diagonal edge cannot dominate their median.
+    float localNoise = 1.4826 * focusMedian(
+        focusMedian(noiseResidual(local), noiseResidual(local + ivec2(4, 0)), noiseResidual(local + ivec2(8, 0))),
+        focusMedian(noiseResidual(local + ivec2(0, 4)), noiseResidual(local + ivec2(4, 4)), noiseResidual(local + ivec2(8, 4))),
+        focusMedian(noiseResidual(local + ivec2(0, 8)), noiseResidual(local + ivec2(4, 8)), noiseResidual(local + ivec2(8, 8))));
+    float sensorNoise = sqrt(max((pc.noiseS * level + pc.noiseO) * pc.lumaVarianceGain, 0.0));
+    float noise = max(localNoise, sensorNoise);
+
+    vec2 fine = focusGradient(local + 2, 1);
+    vec2 coarse = focusGradient(local + 2, 2);
+    float fineMagnitude = length(fine);
+    // Account for the square prefilter's different step response on diagonal edges.
+    float diagonal = 2.0 * abs(fine.x * fine.y) / max(dot(fine, fine), 0.000000000001);
+    float edgeCutoff = strength < 1.5 ? 0.66 : strength < 2.5 ? 0.63 : 0.60;
+    float sharpness = max(fineMagnitude - (edgeCutoff - diagonal * 0.065) * length(coarse), 0.0);
+
+    // Neighboring gradients must agree: random bright speckles do not confirm focus.
+    vec2 directionSum = vec2(0.0);
+    float gradientEnergy = 0.0;
+    for (int y = 1; y < 4; ++y) {
+        for (int x = 1; x < 4; ++x) {
+            vec2 gradient = focusGradient(local + ivec2(x, y), 1);
+            directionSum += gradient;
+            gradientEnergy += dot(gradient, gradient);
+        }
+    }
+    float coherence = dot(directionSum, directionSum) / max(9.0 * gradientEnergy, 0.000000000001);
+    float sensitivity = strength < 1.5 ? 3.6 : strength < 2.5 ? 2.6 : 2.0;
+    float quantization = pc.quantization;
+    float threshold = max(0.45 * noise * sensitivity, max(quantization, level * 0.0015));
+    float contrastSensitivity = sensitivity + 3.0;
+    float confidence = smoothstep(threshold, threshold * 1.8, sharpness) *
+        smoothstep(0.30, 0.64, coherence) *
+        smoothstep(noise * contrastSensitivity, noise * (contrastSensitivity + 1.5) + quantization, fineMagnitude);
+    // Sensor clipping contains no recoverable focus information.
+    confidence *= 1.0 - smoothstep(0.96, 1.0, level);
+    return vec4(vec3(gray), confidence);
+}
+#endif
+
+#if FOCUS_OVERLAY
+float connectedConfidence(ivec2 local)
+{
+    int p = (local.y + 2) * 24 + local.x + 2;
+    float center = confidenceTile[p];
+    if (center < 0.06) return 0.0;
+    const ivec2 directions[4] = ivec2[](ivec2(1, 0), ivec2(0, 1), ivec2(1, 1), ivec2(1, -1));
+    float support = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        int direction = directions[i].y * 24 + directions[i].x;
+        float forward = max(confidenceTile[p + direction], confidenceTile[p + 2 * direction]);
+        float backward = max(confidenceTile[p - direction], confidenceTile[p - 2 * direction]);
+        support = max(support, min(forward, backward));
+    }
+    // Validate the edge before increasing its opacity or width.
+    float upper = pc.strength < 1.5 ? 0.6 : pc.strength < 2.5 ? 0.45 : 0.3;
+    return smoothstep(0.06, upper, min(center, support));
+}
+
+vec4 connectedOverlay(ivec2 position)
+{
+    vec3 gray = texelFetch(inputImage, position, 0).rgb;
+    ivec2 local = ivec2(gl_LocalInvocationID.xy) + 2;
+    float center = connectedTile[local.y * 20 + local.x];
+    float nearby = 0.0;
+    float surrounding = 0.0;
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
+            float confidence = connectedTile[(local.y + y) * 20 + local.x + x];
+            surrounding = max(surrounding, confidence);
+            if (abs(x) <= 1 && abs(y) <= 1) nearby = max(nearby, confidence);
+        }
+    }
+    float width = pc.strength < 1.5 ? 0.0 : pc.strength < 2.5 ? 0.4 : 1.0;
+    float alpha = max(center, nearby * width);
+    float opacity = pc.strength < 1.5 ? 0.8 : pc.strength < 2.5 ? 0.9 : 1.0;
+    // A narrow dark rim keeps lime edges visible against bright subjects.
+    float rim = pc.strength < 2.5 ? nearby : surrounding;
+    gray *= 1.0 - 0.55 * rim * (1.0 - alpha);
+    return vec4(mix(gray, vec3(0.866667, 0.996078, 0.321569), alpha * opacity), 1.0);
+}
+#endif
+
+void main()
+{
+    ivec2 position = ivec2(gl_GlobalInvocationID.xy);
+#if FOCUS_OVERLAY
+    ivec2 origin = ivec2(gl_WorkGroupID.xy) * 16 - 4;
+    for (uint i = gl_LocalInvocationIndex; i < 576u; i += 256u) {
+        ivec2 samplePosition = clamp(origin + ivec2(int(i % 24u), int(i / 24u)),
+            ivec2(0), ivec2(pc.width, pc.height) - 1);
+        confidenceTile[i] = texelFetch(inputImage, samplePosition, 0).a;
+    }
+    barrier();
+    for (uint i = gl_LocalInvocationIndex; i < 400u; i += 256u)
+        connectedTile[i] = connectedConfidence(ivec2(int(i % 20u), int(i / 20u)));
+    barrier();
+    if (all(lessThan(position, ivec2(pc.width, pc.height))))
+        imageStore(outputImage, position, connectedOverlay(position));
+#else
+    ivec2 origin = ivec2(gl_WorkGroupID.xy) * 16 - 5;
+    for (uint i = gl_LocalInvocationIndex; i < 676u; i += 256u)
+        lumaTile[i] = focusLuma(origin + ivec2(int(i % 26u), int(i / 26u)));
+    barrier();
+    // Share the noise prefilter across neighboring invocations without private-array spills.
+    for (uint i = gl_LocalInvocationIndex; i < 400u; i += 256u) {
+        int p = (int(i / 20u) + 2) * 26 + int(i % 20u) + 2;
+        filteredTile[i] = (lumaTile[p] + 2.0 * lumaTile[p + 1] + lumaTile[p + 2] +
+            2.0 * lumaTile[p + 26] + 4.0 * lumaTile[p + 27] + 2.0 * lumaTile[p + 28] +
+            lumaTile[p + 52] + 2.0 * lumaTile[p + 53] + lumaTile[p + 54]) / 16.0;
+    }
+    barrier();
+    if (any(greaterThanEqual(position, ivec2(pc.width, pc.height)))) return;
+    imageStore(outputImage, position, focusPreview(position));
+#endif
+}

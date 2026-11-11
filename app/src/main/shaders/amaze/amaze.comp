@@ -1,0 +1,273 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// AMaZE demosaic (Aliasing Minimization and Zipper Elimination), adapted from RawTherapee:
+// https://github.com/Beep6581/RawTherapee/blob/dev/rtengine/amaze_demosaic_RT.cc
+// Copyright (c) 2008-2010 Emil Martinec <ejmartin@uchicago.edu>, optimized for speed by Ingo Weyrich,
+// incorporating ideas of Luis Sanz Rodrigues and Paul Lee.
+// Licensed under the GNU General Public License version 3 or later. Modified as tiled Vulkan compute stages.
+layout(push_constant) uniform Tile { ivec4 bounds; } tile;
+#if AMAZE_STAGE >= 0
+#define UNSPEKTRA_AMAZE_TILED_RAW
+#endif
+#include "amaze/amaze_common.glsl"
+
+layout(local_size_x_id = 12, local_size_y_id = 13, local_size_z = 1) in;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D outputImage;
+layout(set = 0, binding = 6) uniform sampler2D source0;
+layout(set = 0, binding = 7) uniform sampler2D source1;
+layout(set = 0, binding = 8) uniform sampler2D source2;
+const ivec2 H = ivec2(1,0);
+const ivec2 V = ivec2(0,1);
+const int HALO = 32;
+
+vec4 fetchTile(sampler2D source, ivec2 p) {
+    ivec2 q = p - tile.bounds.xy;
+    ivec2 parity = q & 1;
+    ivec2 maximum = tile.bounds.zw - 1;
+    maximum -= (maximum & 1) ^ parity;
+    return texelFetch(source, clamp(q, parity, maximum), 0);
+}
+
+#if AMAZE_STAGE == 0 || AMAZE_STAGE == 1
+vec4 axisCandidates(ivec2 p, ivec2 d) {
+    float c = getRaw(p);
+    float gn = amazeGradient(p-d,d), gp = amazeGradient(p+d,d);
+    float weight = gn / (gn+gp), gc = amazeGradient(p,d);
+    vec2 side, additive;
+    for (int i=0; i<2; ++i) {
+        ivec2 step = i==0 ? -d : d;
+        float g = amazeGradient(p+2*step,d);
+        float ratio = getRaw(p+step)*(g+gc) /
+            (g*(AMAZE_EPS+c)+gc*(AMAZE_EPS+getRaw(p+2*step)));
+        additive[i] = getRaw(p+step)+0.5*(c-getRaw(p+2*step));
+        side[i] = abs(1.0-ratio)<0.75 ? c*ratio : additive[i];
+    }
+    float alt = mix(additive.x,additive.y,weight);
+    float estimate = mix(side.x,side.y,weight);
+    if (c>0.8 || alt>0.8) { estimate=alt; side=additive; }
+    float sign = amazeIsGreen(p) ? -1.0 : 1.0;
+    return vec4(sign*(estimate-c),sign*(alt-c),
+        min(amazeSqr(side.x-side.y),amazeSqr(additive.x-additive.y)),weight);
+}
+#endif
+
+#if AMAZE_STAGE == -1
+vec4 process(ivec2 p) { return vec4(getRaw(p),0.0,0.0,0.0); }
+#elif AMAZE_STAGE == 0
+vec4 process(ivec2 p) {
+    return vec4(axisCandidates(p,H).xy,axisCandidates(p,V).xy);
+}
+#elif AMAZE_STAGE == 1
+float variance3(vec3 x) { return max(3.0*dot(x,x)-amazeSqr(x.x+x.y+x.z),0.0); }
+vec2 selectAxis(ivec2 p,ivec2 d,int channel) {
+    vec4 a=fetchTile(source0,p-2*d),b=fetchTile(source0,p),c=fetchTile(source0,p+2*d);
+    float diff = variance3(vec3(a[channel+1],b[channel+1],c[channel+1])) <
+        variance3(vec3(a[channel],b[channel],c[channel])) ? b[channel+1] : b[channel];
+    float sign=amazeIsGreen(p) ? -1.0 : 1.0;
+    float center=getRaw(p);
+    float value=amazeBound(center+sign*diff,center,getRaw(p-d),getRaw(p+d),3.0);
+    return vec2(sign*(value-center),axisCandidates(p,d).z);
+}
+vec4 process(ivec2 p) {
+    vec2 h=selectAxis(p,H,0),v=selectAxis(p,V,2);
+    return vec4(h.x,v.x,h.y,v.y);
+}
+#elif AMAZE_STAGE == 2
+vec2 directionalVariance(ivec2 p,ivec2 d,int channel) {
+    vec2 variance=vec2(AMAZE_EPSSQ);
+    float weight=amazeGradient(p-d,d)/(amazeGradient(p-d,d)+amazeGradient(p+d,d));
+    for(int side=-1;side<=1;side+=2) {
+        vec4 values; float fluctuation=0.0;
+        for(int i=0;i<4;++i) {
+            vec4 valuesAtSite=fetchTile(source0,p+side*i*d);
+            values[i]=valuesAtSite[channel];
+            if(i<3) fluctuation+=valuesAtSite[channel+2];
+        }
+        float mean=dot(values,vec4(0.25));
+        vec4 delta=values-mean;
+        variance+=(side<0 ? 1.0-weight : weight)*vec2(dot(delta,delta),fluctuation);
+    }
+    return variance;
+}
+float gradientEnergy(ivec2 p) {
+    return amazeSqr(getRaw(p+H)-getRaw(p-H))+amazeSqr(getRaw(p+V)-getRaw(p-V));
+}
+float nyquistTest(ivec2 p) {
+    float cd=0.0,gradient=0.0;
+    for(int y=-2;y<=2;++y) for(int x=-2;x<=2;++x) {
+        ivec2 q=p+ivec2(x,y); int ax=abs(x),ay=abs(y);
+        float gw=ax==0 && ay==0 ? 0.073844119 : ax+ay==1 ? 0.062075120 :
+            ax==1 && ay==1 ? 0.052181819 : ax+ay==2 ? 0.036874193 :
+            ax+ay==3 ? 0.030997322 : 0.018413194;
+        gradient+=0.5*gw*gradientEnergy(q);
+        if(((x+y)&1)==0) {
+            float cw=ax==0 && ay==0 ? 0.146597277 : ax==1 ? 0.103592713 :
+                ax==0 || ay==0 ? 0.073203613 : 0.036554355;
+            vec2 diff=fetchTile(source0,q).xy;
+            cd+=cw*amazeSqr(diff.x-diff.y);
+        }
+    }
+    return cd-gradient;
+}
+vec4 process(ivec2 p) {
+    if(amazeIsGreen(p)) return vec4(0.0);
+    vec2 h=directionalVariance(p,H,0),v=directionalVariance(p,V,1),w=h/(h+v);
+    float weight=(w.x-0.5)*(w.y-0.5)>0.0 && abs(w.x-0.5)>abs(w.y-0.5) ? w.x : w.y;
+    return vec4(weight,nyquistTest(p)>0.0 ? 1.0 : 0.0,0.0,0.0);
+}
+#elif AMAZE_STAGE == 3
+bool nyquist(ivec2 p) {
+    float count=0.0;
+    for(int y=-2;y<=2;++y) for(int x=-2;x<=2;++x)
+        if(abs(x)+abs(y)==2) count+=fetchTile(source1,p+ivec2(x,y)).y;
+    return count>4.0 || (count==4.0 && fetchTile(source1,p).y>0.5);
+}
+vec4 process(ivec2 p) {
+    if(amazeIsGreen(p)) return vec4(getRaw(p),0.5,0.0,0.0);
+    float weight=fetchTile(source1,p).x; bool texture=nyquist(p);
+    if(texture) {
+        vec2 sum=vec2(0.0),squares=vec2(0.0); float count=0.0;
+        for(int y=-6;y<=6;y+=2) for(int x=-6;x<=6;x+=2) {
+            ivec2 q=p+ivec2(x,y);
+            if(!nyquist(q)) continue;
+            float c=getRaw(q);
+            vec2 a=vec2(c-getRaw(q-H),c-getRaw(q-V));
+            vec2 b=vec2(c-getRaw(q+H),c-getRaw(q+V));
+            sum+=0.5*(a+b); squares+=0.5*(a*a+b*b); count+=1.0;
+        }
+        vec2 variance=max(count*squares-sum*sum,vec2(0.0))+AMAZE_EPSSQ;
+        weight=variance.x/(variance.x+variance.y);
+    }
+    vec2 diff=fetchTile(source0,p).xy;
+    return vec4(getRaw(p)+mix(diff.x,diff.y,weight),weight,texture ? 1.0 : 0.0,0.0);
+}
+#elif AMAZE_STAGE == 4
+vec4 process(ivec2 p) {
+    vec4 center=fetchTile(source1,p);
+    if(amazeIsGreen(p)) return center;
+    float alternate=0.0;
+    for(int y=-1;y<=1;y+=2) for(int x=-1;x<=1;x+=2)
+        alternate+=0.25*fetchTile(source1,p+ivec2(x,y)).y;
+    float weight=abs(alternate-0.5)>abs(center.y-0.5) ? alternate : center.y;
+    vec2 diff=fetchTile(source0,p).xy;
+    float green=getRaw(p)+mix(diff.x,diff.y,weight);
+    if(center.z>0.5) {
+        vec2 variance=vec2(AMAZE_EPSSQ);
+        for(int y=-2;y<=2;++y) for(int x=-2;x<=2;++x) {
+            if(((x+y)&1)!=0) continue;
+            ivec2 q=p+ivec2(x,y);
+            if(fetchTile(source1,q).z<0.5) continue;
+            int ax=abs(x),ay=abs(y);
+            float w=ax+ay==0 ? 0.169917 : ax==1 ? 0.108947 : ax==0 || ay==0 ? 0.069855 : 0.0287182;
+            float g=fetchTile(source1,q).x;
+            vec2 curve=vec2(g-0.5*(getRaw(q-H)+getRaw(q+H)),g-0.5*(getRaw(q-V)+getRaw(q+V)));
+            variance+=w*curve*curve;
+        }
+        green=getRaw(p)+(diff.x*variance.y+diff.y*variance.x)/(variance.x+variance.y);
+    }
+    return vec4(green,weight,0.0,0.0);
+}
+#elif AMAZE_STAGE == 5
+float diagonalGradient(ivec2 p,ivec2 d) { return abs(getRaw(p+d)-getRaw(p-d)); }
+float diagonalVariance(ivec2 p,ivec2 d) {
+    float sum=AMAZE_EPSSQ;
+    for(int y=-2;y<=2;++y) for(int x=-2;x<=2;++x) {
+        int distance=abs(x)+abs(y);
+        if(distance!=1 && distance!=3) continue;
+        ivec2 q=p+ivec2(x,y);
+        sum+=(distance==1 ? 0.137194944 : 0.056402528)*
+            (amazeSqr(getRaw(q)-getRaw(q-d))+amazeSqr(getRaw(q)-getRaw(q+d)));
+    }
+    return sum;
+}
+float diagonalEstimate(ivec2 p,ivec2 d) {
+    float c=getRaw(p),sum=0.0,total=0.0;
+    for(int side=-1;side<=1;side+=2) {
+        ivec2 s=side*d;
+        float neighbor=getRaw(p+s),far=getRaw(p+2*s),ratio=2.0*neighbor/(AMAZE_EPS+c+far);
+        float estimate=abs(1.0-ratio)<0.75 ? c*ratio : neighbor+0.5*(c-far);
+        float weight=1.0/(AMAZE_EPS+diagonalGradient(p,d)+diagonalGradient(p+s,d)+diagonalGradient(p+2*s,d));
+        sum+=weight*estimate; total+=weight;
+    }
+    return amazeBound(sum/total,c,getRaw(p-d),getRaw(p+d),2.0);
+}
+vec4 process(ivec2 p) {
+    if(amazeIsGreen(p)) return vec4(0.0);
+    ivec2 plus=ivec2(1,-1),minus=ivec2(1,1);
+    float vp=diagonalVariance(p,plus),vm=diagonalVariance(p,minus);
+    return vec4(diagonalEstimate(p,minus),diagonalEstimate(p,plus),vm/(vm+vp),0.0);
+}
+#elif AMAZE_STAGE == 6
+vec2 redBlueMean(ivec2 p) {
+    vec3 center=fetchTile(source2,p).xyz; float alternate=0.0;
+    for(int y=-1;y<=1;y+=2) for(int x=-1;x<=1;x+=2)
+        alternate+=0.25*fetchTile(source2,p+ivec2(x,y)).z;
+    float weight=abs(alternate-0.5)>abs(center.z-0.5) ? alternate : center.z;
+    return vec2(0.5*(getRaw(p)+mix(center.x,center.y,weight)),weight);
+}
+float correctedAxis(ivec2 p,ivec2 d,float center) {
+    vec2 estimates,weights;
+    for(int i=0;i<2;++i) {
+        ivec2 s=i==0 ? -d : d;
+        float far=redBlueMean(p+2*s).x,neighbor=getRaw(p+s),ratio=2.0*neighbor/(AMAZE_EPS+center+far);
+        estimates[i]=abs(1.0-ratio)<0.75 ? center*ratio : neighbor+0.5*(center-far);
+        weights[i]=amazeGradient(p+s,d);
+    }
+    float value=(weights.y*estimates.x+weights.x*estimates.y)/(weights.x+weights.y);
+    return amazeBound(value,center,getRaw(p-d),getRaw(p+d),2.0);
+}
+vec4 process(ivec2 p) {
+    if(amazeIsGreen(p)) return vec4(0.0);
+    vec2 green=fetchTile(source0,p).xy,rb=redBlueMean(p);
+    if(abs(rb.y-0.5)>=abs(green.y-0.5))
+        green.x=mix(correctedAxis(p,H,rb.x),correctedAxis(p,V,rb.x),green.y);
+    return vec4(green.x-getRaw(p),green.x,green.y,0.0);
+}
+#elif AMAZE_STAGE == 7
+float nativeDifference(ivec2 p) { return fetchTile(source1,p).x; }
+vec2 differences(ivec2 p) {
+    float sum=0.0,total=0.0;
+    for(int y=-1;y<=1;y+=2) for(int x=-1;x<=1;x+=2) {
+        ivec2 d=ivec2(x,y);
+        float near=nativeDifference(p+d),far=nativeDifference(p+3*d),opposite=nativeDifference(p-d);
+        float weight=1.0/(AMAZE_EPS+abs(near-opposite)+abs(near-far)+abs(opposite-far));
+        float estimate=1.325*near-0.175*far-0.075*(nativeDifference(p+d+2*x*H)+nativeDifference(p+d+2*y*V));
+        sum+=weight*estimate; total+=weight;
+    }
+    float native=nativeDifference(p),other=sum/total;
+    return amazeFc(p)==CFA_RED ? vec2(native,other) : vec2(other,native);
+}
+vec4 process(ivec2 p) {
+    float green; vec2 diff;
+    if(amazeIsGreen(p)) {
+        green=getRaw(p); diff=vec2(0.0); float total=0.0;
+        for(int axis=0;axis<2;++axis) for(int side=-1;side<=1;side+=2) {
+            ivec2 q=p+side*(axis==0 ? H : V);
+            float vertical=fetchTile(source1,q).z;
+            float weight=max(axis==0 ? 1.0-vertical : vertical,AMAZE_EPS);
+            diff+=weight*differences(q); total+=weight;
+        }
+        diff/=total;
+    } else { green=fetchTile(source1,p).y; diff=differences(p); }
+    vec3 rgb=max(vec3(green-diff.x,green,green-diff.y),vec3(0.0));
+    if(rawColor.reserved0.w>0.5) rgb=min(rgb,vec3(1.0));
+    if(any(isnan(rgb)) || any(isinf(rgb))) rgb=vec3(max(getRaw(p),0.0));
+    return vec4(rgb,1.0);
+}
+#endif
+
+void main() {
+    ivec2 base=2*ivec2(gl_GlobalInvocationID.xy);
+    for(int y=0;y<2;++y) for(int x=0;x<2;++x) {
+        ivec2 local=base+ivec2(x,y);
+        if(any(greaterThanEqual(local,tile.bounds.zw))) continue;
+        ivec2 p=local+tile.bounds.xy;
+#if AMAZE_STAGE == 7
+        if(any(lessThan(local,ivec2(HALO))) || any(greaterThanEqual(local,tile.bounds.zw-HALO)) ||
+            any(lessThan(p,ivec2(0))) || any(greaterThanEqual(p,ivec2(AMAZE_WIDTH,AMAZE_HEIGHT)))) continue;
+        imageStore(outputImage,p,process(p));
+#else
+        imageStore(outputImage,local,process(p));
+#endif
+    }
+}

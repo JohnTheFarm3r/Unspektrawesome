@@ -1,0 +1,53 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "raw_color.glsl"
+#include "frame_geometry.glsl"
+#include "raw_input.glsl"
+#include "shadows.glsl"
+#if UNSPEKTRA_RAW_DIAGNOSTICS
+#include "raw_demosaic.glsl"
+#endif
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D captureOutput;
+layout(set = 0, binding = 7) uniform sampler2D amazeInput;
+
+void main()
+{
+    ivec2 outputPosition = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(outputPosition, frameGeometry.transform.zw)))
+        return;
+
+    ivec2 rawDimensions = rawParams.dimensions.xy;
+    vec2 sourceUv = geometrySourceUv(outputPosition);
+    ivec2 rawPosition = geometrySourcePosition(outputPosition, rawDimensions);
+    ivec2 amazePosition = rawPosition - frameGeometry.rawBounds.xy;
+#if UNSPEKTRA_RAW_DIAGNOSTICS
+    int diagnostic = int(rawColor.reserved0.y);
+    if (diagnostic == 1) {
+        uint value = rawIntegerClamped(rawPosition);
+        imageStore(captureOutput, outputPosition, vec4(float(value & 255u), float(value >> 8u), 0.0, 1.0));
+        return;
+    }
+    if (diagnostic == 2) {
+        imageStore(captureOutput, outputPosition, vec4(vec3(rawNormalizedClamped(rawPosition)), 1.0));
+        return;
+    }
+    if (diagnostic == 4) {
+        imageStore(captureOutput, outputPosition, texelFetch(amazeInput, amazePosition, 0));
+        return;
+    }
+    if (diagnostic == 3) {
+        imageStore(captureOutput, outputPosition, vec4(rawColorProcess(bilinearDemosaic(rawPosition), sourceUv, 0.0), 1.0));
+        return;
+    }
+#endif
+    vec3 rawRgb = texelFetch(amazeInput, amazePosition, 0).rgb;
+    vec2 amazeUv = (vec2(amazePosition) + 0.5) / vec2(frameGeometry.rawBounds.zw);
+    vec3 adjustedRgb = applyShadows(rawRgb, amazeUv, rawColor.reserved1.w);
+    vec3 processed = rawColorProcess(
+        rawRgb, geometryLensShadingUv(sourceUv, rawDimensions), 0.0,
+        true, adjustedRgb, rawColor.reserved0.w > 0.5);
+    imageStore(captureOutput, outputPosition, vec4(processed, 1.0));
+}

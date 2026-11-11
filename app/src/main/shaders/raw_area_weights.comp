@@ -1,0 +1,29 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "raw_source.glsl"
+#include "frame_geometry.glsl"
+
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 13, std430) writeonly buffer AreaWeights { vec4 values[]; } areaWeights;
+
+void main()
+{
+    int column = int(gl_GlobalInvocationID.x);
+    int columns = (frameGeometry.transform.x & 1) != 0 ? rawParams.dimensions.w : rawParams.dimensions.z;
+    if (column >= columns) return;
+    float footprint = frameGeometry.sourceCrop.z * float(rawParams.dimensions.x) / float(columns);
+    float lower = frameGeometry.sourceCrop.x * float(rawParams.dimensions.x) + float(column) * footprint;
+    float upper = lower + footprint;
+    int first = (int(floor(lower)) - 2) & ~3;
+    int blocks = (int(ceil(footprint)) + 11) / 4;
+    for (int block = 0; block < blocks; ++block) {
+        vec4 pixels = float(first + block * 4) + vec4(0.0, 1.0, 2.0, 3.0);
+        int index = (column * blocks + block) * 3;
+        areaWeights.values[index] = max(min(pixels + 1.0, upper) - max(pixels, lower), vec4(0.0));
+        areaWeights.values[index + 1] = max(min(pixels, upper) - max(pixels - 1.0, lower), vec4(0.0)) +
+            max(min(pixels + 2.0, upper) - max(pixels + 1.0, lower), vec4(0.0));
+        areaWeights.values[index + 2] = max(min(pixels - 1.0, upper) - max(pixels - 2.0, lower), vec4(0.0)) +
+            max(min(pixels + 3.0, upper) - max(pixels + 2.0, lower), vec4(0.0));
+    }
+}

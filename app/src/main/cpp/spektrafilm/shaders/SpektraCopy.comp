@@ -1,0 +1,23 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "SpektraStorageBuffer.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#include "SpektraLinearDispatch.h"
+
+SPEKTRA_READ_BUFFER(0, uint, 4u, srcWords)
+
+SPEKTRA_WRITE_BUFFER(1, uint, 4u, dstWords)
+
+layout(push_constant) uniform CopyParams {
+  uint wordCount;
+  uint byteCount;
+} copyParams;
+
+void main() {
+  const uint wordIndex = spektraLinearIndex();
+  if (wordIndex >= copyParams.wordCount) {
+    return;
+  }
+  write_dstWords(wordIndex, read_srcWords(wordIndex));
+}

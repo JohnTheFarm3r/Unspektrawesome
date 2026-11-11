@@ -1,0 +1,341 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 64) in;
+layout(binding = 0) uniform sampler2D sourceImage;
+layout(std430, binding = 1) buffer Parameters { vec4 p[]; };
+layout(std430, binding = 2) buffer Queries { vec4 queries[]; };
+layout(std430, binding = 3) buffer Tile { uint pixels[]; };
+layout(std430, binding = 4) buffer Results { vec4 result[]; };
+layout(push_constant) uniform Dispatch { ivec4 job; ivec4 tile; };
+
+vec2 cylindrical(vec2 position) {
+    float angle = (position.x - p[0].x * .5) / p[0].z;
+    if (abs(angle) >= 1.5) return vec2(-1);
+    return vec2(p[0].z * tan(angle) + p[0].x * .5, (position.y - p[0].y * .5) / cos(angle) + p[0].y * .5);
+}
+bool valid(vec2 point) { return all(greaterThanEqual(point, vec2(1))) && all(lessThan(point, p[0].xy - 2)); }
+vec2 sourcePoint(vec2 point) {
+    if (p[0].w > .5) {
+        if (p[0].w > 1.5) {
+            vec3 ray = vec3(point, 1);
+            vec3 q = vec3(dot(p[3].xyz, ray), dot(p[4].xyz, ray), dot(p[5].xyz, ray));
+            return q.z > 1e-8 ? q.xy / q.z : vec2(-1);
+        }
+        vec2 uv = (point - p[0].xy * .5) / (2 * p[0].z);
+        float z = 1 - dot(uv, uv);
+        vec3 ray = vec3(p[0].xy * .5 * z + 2 * p[0].z * uv, z);
+        vec3 q = vec3(dot(p[3].xyz, ray), dot(p[4].xyz, ray), dot(p[5].xyz, ray));
+        return q.z > 1e-8 ? q.xy / q.z : vec2(-1);
+    }
+    vec2 q = point - p[2].zw;
+    return cylindrical(vec2(p[2].x * q.x + p[2].y * q.y, -p[2].y * q.x + p[2].x * q.y) / dot(p[2].xy, p[2].xy));
+}
+vec3 rgb(vec2 point) { return textureLod(sourceImage, (point + .5) / p[0].xy, 0).rgb * 255; }
+vec4 field(vec2 point, vec4 geometry, int offset) {
+    if (geometry.x < 2 || geometry.y < 2) return vec4(0);
+    vec2 uv = clamp(point / geometry.zw, vec2(0), geometry.xy - 1);
+    ivec2 cell = min(ivec2(uv), ivec2(geometry.xy) - 2);
+    vec2 fraction = uv - vec2(cell);
+    int index = offset + cell.y * int(geometry.x) + cell.x;
+    return mix(mix(p[index], p[index + 1], fraction.x), mix(p[index + int(geometry.x)], p[index + int(geometry.x) + 1], fraction.x), fraction.y);
+}
+vec2 correctedPoint(vec2 point) {
+    vec2 local = (point - p[6].xy) / p[6].z - .5;
+    vec2 shift = field(local, p[7], int(p[17].x)).xy * p[6].z;
+    int count = int(p[13].x);
+    if (count >= 2) {
+        bool horizontal = p[12].w > .5;
+        float u = clamp(((horizontal ? point.y : point.x) - p[12].x) / p[12].y, 0, count - 1.0);
+        int i = min(int(u), count - 2);
+        vec4 join = mix(p[int(p[17].z) + i], p[int(p[17].z) + i + 1], u - i);
+        float distance = (horizontal ? point.x : point.y) - join.z;
+        shift += join.xy * exp(-distance * distance / (2 * p[12].z * p[12].z));
+    }
+    return sourcePoint(point + shift + p[1].zw);
+}
+vec3 color(vec3 value, vec2 point, vec2 source) {
+    vec2 uv = source / p[0].xy - .5;
+    vec3 local = field((point - p[6].xy) / p[6].z - .5, p[8], int(p[17].y)).rgb;
+    vec3 protection = clamp(value / 8, 0, 1) * clamp((255 - value) / 8, 0, 1);
+    return clamp(value + (value * (p[9].rgb + p[11].rgb * dot(uv, uv) - 1) + p[10].rgb + local) * protection, 0, 255);
+}
+float cubic(float t) {
+    t = abs(t);
+    return t < 1 ? (1.5 * t - 2.5) * t * t + 1 : t < 2 ? ((-.5 * t + 2.5) * t - 4) * t + 2 : 0;
+}
+vec3 detail(vec2 point) {
+    if (any(lessThan(point, vec2(2))) || any(greaterThanEqual(point, p[0].xy - 3))) return round(rgb(point));
+    ivec2 base = ivec2(point);
+    vec3 value = vec3(0);
+    for (int y = -1; y <= 2; ++y) for (int x = -1; x <= 2; ++x)
+        value += texelFetch(sourceImage, base + ivec2(x, y), 0).rgb * (255 * cubic(point.x - base.x - x) * cubic(point.y - base.y - y));
+    return round(clamp(value, 0, 255));
+}
+float cutAt(float along) {
+    int fineCount = int(p[16].x);
+    if (fineCount > 0) {
+        float u = clamp(along - p[14].y, 0, fineCount - 1.0);
+        int i = int(u), j = min(i + 1, fineCount - 1);
+        return mix(p[int(p[18].y) + i].x, p[int(p[18].y) + j].x, u - i);
+    }
+    float u = clamp((along - p[14].y) / p[13].y, 0, p[13].w - 1);
+    int i = int(u), j = min(i + 1, int(p[13].w) - 1);
+    float a = p[int(p[17].w) + i].x, b = p[int(p[17].w) + j].x;
+    return a >= 0 ? mix(a, b, u - i) : (p[14].z > .5 ? p[15].x + p[15].z : p[15].y + p[15].w) * .5;
+}
+float sourceSelection(vec2 point) {
+    if (p[14].w == 0) return 1;
+    bool horizontal = p[14].z > .5;
+    float across = horizontal ? point.x - .5 : point.y - .5;
+    float along = horizontal ? point.y - .5 : point.x - .5;
+    if (p[18].x >= 0) {
+        vec2 uv = clamp((vec2(across, along) - p[14].xy) / p[13].y, vec2(0), p[13].zw - 1);
+        return field(uv, vec4(p[13].zw, 1, 1), int(p[18].x)).x >= .5 ? 0 : 1;
+    }
+    bool keep = p[14].w > 0 ? across < cutAt(along) : across > cutAt(along);
+    return keep ? 0 : 1;
+}
+vec3 blendCorrection(vec2 point, int image) {
+    int descriptor = int(p[18].z);
+    vec4 geometry = p[descriptor + 1];
+    vec2 uv = clamp((point - p[descriptor].xy) / p[descriptor].z - .5, vec2(0), geometry.xy - 1);
+    ivec2 cell = ivec2(uv), next = min(cell + 1, ivec2(geometry.xy) - 1);
+    vec2 fraction = fract(uv);
+    int cols = int(geometry.x);
+    return mix(mix(result[(cell.y * cols + cell.x) * 2 + image].rgb,
+                   result[(cell.y * cols + next.x) * 2 + image].rgb, fraction.x),
+               mix(result[(next.y * cols + cell.x) * 2 + image].rgb,
+                   result[(next.y * cols + next.x) * 2 + image].rgb, fraction.x), fraction.y);
+}
+float grayAt(ivec2 point) { int i = point.y * job.z + point.x; return queries[i / 4][i % 4]; }
+bool featureJob(uint index) {
+    if (job.x == 10) {
+        ivec2 point = ivec2(12 + int(index) % tile.x * 2, 12 + int(index) / tile.x * 2);
+        float score = 0;
+        if (min(min(grayAt(point - 11), grayAt(point + ivec2(11, -11))), min(grayAt(point + ivec2(-11, 11)), grayAt(point + 11))) >= 0) {
+            float xx = 0, yy = 0, xy = 0;
+            for (int y = -2; y <= 2; ++y) for (int x = -2; x <= 2; ++x) {
+                ivec2 q = point + ivec2(x, y);
+                float dx = (grayAt(q + ivec2(1, 0)) - grayAt(q - ivec2(1, 0))) * .5;
+                float dy = (grayAt(q + ivec2(0, 1)) - grayAt(q - ivec2(0, 1))) * .5;
+                xx += dx * dx; yy += dy * dy; xy += dx * dy;
+            }
+            score = .5 * (xx + yy - length(vec2(xx - yy, 2 * xy)));
+        }
+        result[index] = vec4(score, point, 0); return true;
+    }
+    if (job.x == 11) {
+        ivec2 point = ivec2(p[1 + index].xy);
+        float descriptor[128];
+        for (int i = 0; i < 128; ++i) descriptor[i] = 0;
+        for (int y = -8; y < 8; ++y) for (int x = -8; x < 8; ++x) {
+            ivec2 q = point + ivec2(x, y);
+            vec2 gradient = vec2(grayAt(q + ivec2(1, 0)) - grayAt(q - ivec2(1, 0)), grayAt(q + ivec2(0, 1)) - grayAt(q - ivec2(0, 1)));
+            float angle = (atan(gradient.y, gradient.x) + 3.141592653589793) * (8 / 6.283185307179586);
+            int bin = clamp(int(angle), 0, 7);
+            descriptor[((y + 8) / 4 * 4 + (x + 8) / 4) * 8 + bin] += length(gradient) * exp(-(x * x + y * y) / 100.0);
+        }
+        float norm = 1e-9;
+        for (int i = 0; i < 128; ++i) norm += descriptor[i] * descriptor[i];
+        norm = sqrt(norm);
+        float next = 1e-9;
+        for (int i = 0; i < 128; ++i) { descriptor[i] = min(.2, descriptor[i] / norm); next += descriptor[i] * descriptor[i]; }
+        next = sqrt(next);
+        for (int i = 0; i < 32; ++i) result[index * 32 + i] = vec4(descriptor[i * 4], descriptor[i * 4 + 1], descriptor[i * 4 + 2], descriptor[i * 4 + 3]) / next;
+        return true;
+    }
+    if (job.x == 12) {
+        uint before = index % uint(job.z), after = index / uint(job.z);
+        float distance = 0;
+        for (uint i = 0; i < 32; ++i) {
+            vec4 delta = queries[before * 32 + i] - queries[(uint(job.z) + after) * 32 + i];
+            distance += dot(delta, delta);
+        }
+        result[index] = vec4(distance); return true;
+    }
+    if (job.x == 13) {
+        float best = 1e20, second = 1e20; int winner = -1;
+        bool current = index < uint(job.w); int count = current ? job.z : job.w;
+        for (int i = 0; i < count; ++i) {
+            uint offset = current ? index * uint(job.z) + i : uint(i * job.z) + index - uint(job.w);
+            float distance = result[offset].x;
+            if (distance < best) { second = best; best = distance; winner = i; } else second = min(second, distance);
+        }
+        pixels[index * 4] = floatBitsToUint(float(winner)); pixels[index * 4 + 1] = floatBitsToUint(best);
+        pixels[index * 4 + 2] = floatBitsToUint(second); pixels[index * 4 + 3] = 0;
+        return true;
+    }
+    return false;
+}
+vec4 referenceAt(vec2 position) {
+    vec2 point = position - .5;
+    if (any(lessThan(point, vec2(0))) || any(greaterThanEqual(point, vec2(job.z - 1, tile.x - 1)))) return vec4(-1);
+    ivec2 base = ivec2(point);
+    if (base.y < job.w || base.y + 1 >= job.w + tile.y) return vec4(-1);
+    vec2 fraction = fract(point);
+    uint offset = uint((base.y - job.w) * job.z + base.x);
+    vec4 a = unpackUnorm4x8(pixels[offset]), b = unpackUnorm4x8(pixels[offset + 1]);
+    vec4 c = unpackUnorm4x8(pixels[offset + job.z]), d = unpackUnorm4x8(pixels[offset + job.z + 1]);
+    if (min(min(a.a, b.a), min(c.a, d.a)) <= 0) return vec4(-1);
+    return vec4(mix(mix(a.rgb, b.rgb, fraction.x), mix(c.rgb, d.rgb, fraction.x), fraction.y) * 255, 1);
+}
+vec4 referencePixel(ivec2 point) {
+    if (any(lessThan(point, ivec2(0))) || any(greaterThanEqual(point, ivec2(job.z, tile.x))) || point.y < job.w || point.y >= job.w + tile.y) return vec4(0);
+    vec4 value = unpackUnorm4x8(pixels[(point.y - job.w) * job.z + point.x]);
+    return vec4(value.rgb * 255, value.a);
+}
+float matchGray(ivec2 point, bool reference) {
+    if (any(lessThan(point, ivec2(0))) || any(greaterThanEqual(point, ivec2(p[19].zw)))) return -1;
+    int i = int(reference ? p[19].y : p[19].x) + point.y * int(p[19].z) + point.x;
+    return queries[i / 4][i % 4];
+}
+float matchSample(vec2 point, bool reference) {
+    if (any(lessThan(point, vec2(0))) || any(greaterThanEqual(point, p[19].zw - 1))) return -1;
+    ivec2 q = ivec2(point); vec2 fraction = fract(point);
+    float a = matchGray(q, reference), b = matchGray(q + ivec2(1, 0), reference);
+    float c = matchGray(q + ivec2(0, 1), reference), d = matchGray(q + 1, reference);
+    return min(min(a, b), min(c, d)) < 0 ? -1 : mix(mix(a, b, fraction.x), mix(c, d, fraction.x), fraction.y);
+}
+float matchCorrelation(vec2 from, vec2 to) {
+    float a = 0, b = 0, aa = 0, bb = 0, ab = 0;
+    for (int y = -5; y <= 5; ++y) for (int x = -5; x <= 5; ++x) {
+        float s = matchSample(from + vec2(x, y), false), t = matchSample(to + vec2(x, y), true);
+        if (s < 0 || t < 0) return -1;
+        s -= 128; t -= 128;
+        a += s; b += t; aa += s * s; bb += t * t; ab += s * t;
+    }
+    float va = aa - a * a / 121, vb = bb - b * b / 121;
+    return min(va, vb) < 1089 ? -1 : (ab - a * b / 121) / sqrt(va * vb);
+}
+float matchCorner(ivec2 point) {
+    float xx = 0, yy = 0, xy = 0;
+    for (int y = -2; y <= 2; ++y) for (int x = -2; x <= 2; ++x) {
+        ivec2 q = point + ivec2(x, y);
+        float left = matchGray(q - ivec2(1, 0), false), right = matchGray(q + ivec2(1, 0), false);
+        float top = matchGray(q - ivec2(0, 1), false), bottom = matchGray(q + ivec2(0, 1), false);
+        if (min(min(left, right), min(top, bottom)) < 0) return 0;
+        vec2 gradient = vec2(right - left, bottom - top) * .5;
+        xx += gradient.x * gradient.x; yy += gradient.y * gradient.y; xy += gradient.x * gradient.y;
+    }
+    return .5 * (xx + yy - length(vec2(xx - yy, 2 * xy)));
+}
+#if PANORAMA_FAMILY == 1
+#include "panorama_flow.glsl"
+#elif PANORAMA_FAMILY == 2
+#include "panorama_seam.glsl"
+#elif PANORAMA_FAMILY == 3
+#include "panorama_crop.glsl"
+#elif PANORAMA_FAMILY == 4
+#include "panorama_exposure.glsl"
+#elif PANORAMA_FAMILY == 5
+#include "panorama_sweep.glsl"
+#elif PANORAMA_FAMILY == 6
+#include "panorama_blend.glsl"
+#endif
+
+void main() {
+    uint index = (gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 64 + gl_LocalInvocationID.x;
+#if PANORAMA_FAMILY == 1
+    if (job.x == 21) index += uint(job.w);
+#endif
+    if (index >= uint(job.y)) return;
+#if PANORAMA_FAMILY == 1
+    flowJob(index); return;
+#elif PANORAMA_FAMILY == 2
+    seamJob(index); return;
+#elif PANORAMA_FAMILY == 3
+    cropJob(index); return;
+#elif PANORAMA_FAMILY == 4
+    exposureJob(index); return;
+#elif PANORAMA_FAMILY == 5
+    sweepJob(); return;
+#elif PANORAMA_FAMILY == 6
+    blendJob(index); return;
+#else
+    if (job.x >= 10 && featureJob(index)) return;
+    if (job.x == 9) {
+        vec2 point = (vec2(index % uint(job.z), index / uint(job.z)) + .5) / vec2(job.z, job.w);
+        if (tile.x == 1) point = vec2(point.y, 1 - point.x);
+        else if (tile.x == 2) point = 1 - point;
+        else if (tile.x == 3) point = vec2(1 - point.y, point.x);
+        pixels[index] = packUnorm4x8(textureLod(sourceImage, point, 0)); return;
+    }
+    if (job.x == 7) {
+        result[index * 3 + 2] = vec4(0, 0, -2, 0);
+        vec2 point = queries[tile.z + index].xy;
+        vec2 shift = field(point, p[7], int(p[17].x)).xy;
+        float confidence = matchCorrelation(point + shift, point);
+        if (confidence >= 0 && confidence < .94) return;
+        vec2 world = p[6].xy + (point + .5) * p[6].z;
+        vec2 source = correctedPoint(world);
+        if (!valid(source)) return;
+        vec3 value = rgb(source); vec4 reference = referenceAt(world);
+        if (reference.a <= 0 || any(lessThan(min(value, reference.rgb), vec3(8))) || any(greaterThan(max(value, reference.rgb), vec3(247)))) return;
+        vec2 uv = source / p[0].xy - .5;
+        bool aligned = confidence >= .97 && matchCorner(ivec2(point + shift)) > 2;
+        result[index * 3] = vec4(value, uv.x); result[index * 3 + 1] = vec4(reference.rgb, uv.y);
+        result[index * 3 + 2] = vec4(point, confidence, aligned ? 1 : 0); return;
+    }
+    if (job.x == 6) {
+        vec4 query = queries[index]; vec2 point = query.xy;
+        ivec2 pixel = ivec2(floor(point)); vec4 old = referencePixel(pixel);
+        vec2 source = correctedPoint(point); bool covered = valid(source);
+        int coverage = (old.a > 0 ? 1 : 0) | (covered ? 2 : 0); float cost = 100000;
+        if (coverage == 3) {
+            vec3 value = color(rgb(source), point, source);
+            cost = 1 + dot(abs(value - old.rgb), vec3(1));
+            for (int direction = 0; direction < 2; ++direction) {
+                ivec2 offset = direction == 0 ? ivec2(int(query.z), 0) : ivec2(0, int(query.z));
+                ivec2 q = clamp(pixel + offset, ivec2(0), ivec2(job.z - 1, tile.x - 1));
+                vec4 reference = referencePixel(q); vec2 nextSource = correctedPoint(vec2(q) + .5);
+                if (reference.a <= 0 || !valid(nextSource)) continue;
+                vec3 gradient = color(rgb(nextSource), vec2(q) + .5, nextSource) - value, oldGradient = reference.rgb - old.rgb;
+                cost += dot((tile.z != 0 ? 1 : .5) * abs(gradient - oldGradient) + (tile.z != 0 ? 0 : .08) * max(abs(gradient), abs(oldGradient)), vec3(1));
+            }
+        }
+        result[index] = vec4(cost, coverage, query.w, 0); return;
+    }
+    if (job.x == 4 || job.x == 5) {
+        vec4 query = queries[index]; int taps = int(query.w);
+        vec3 sum = vec3(0); bool covered = true;
+        for (int y = 0; y < taps; ++y) for (int x = 0; x < taps; ++x) {
+            vec2 point = query.xy + ((vec2(x, y) + .5) / taps - .5) * query.z;
+            if (job.x == 4) {
+                vec2 source = sourcePoint(point);
+                if (valid(source)) sum += rgb(source); else covered = false;
+            } else {
+                vec4 value = referenceAt(point);
+                if (value.a > 0) sum += value.rgb; else covered = false;
+            }
+        }
+        result[index] = vec4(covered ? dot(sum / (taps * taps), vec3(.2126, .7152, .0722)) : -1);
+        return;
+    }
+    if (job.x == 1) {
+        vec2 point = vec2(index % uint(job.z), index / uint(job.z));
+        if (p[0].w < .5) point = cylindrical(point);
+        result[index] = vec4(valid(point) ? dot(rgb(point), vec3(.2126, .7152, .0722)) : -1);
+        return;
+    }
+    if (job.x != 2) {
+        vec2 point = queries[index].xy;
+        vec2 source = job.x == 3 ? correctedPoint(point) : sourcePoint(point);
+        result[index] = valid(source) ? vec4(job.x == 3 ? color(rgb(source), point, source) : rgb(source), 1) : vec4(-1);
+        return;
+    }
+    vec2 point = vec2(int(index) % job.z + tile.x, int(index) / job.z + job.w) + .5;
+    vec2 source = correctedPoint(point);
+    bool covered = valid(source);
+    vec4 old = unpackUnorm4x8(pixels[index]);
+    if (!covered && old.a <= 0) return;
+    int selected = covered && (old.a <= 0 || sourceSelection(point) > .5) ? 1 : 0;
+    if (p[18].w > .5) {
+        vec3 value = selected == 1 ? color(detail(source), point, source) : old.rgb * 255;
+        value += blendCorrection(point, selected);
+        pixels[index] = packUnorm4x8(vec4(round(clamp(value, 0, 255)) / 255, 1));
+        return;
+    }
+    if (!covered || selected == 0) return;
+    pixels[index] = packUnorm4x8(vec4(round(color(detail(source), point, source)) / 255, 1));
+#endif
+}
