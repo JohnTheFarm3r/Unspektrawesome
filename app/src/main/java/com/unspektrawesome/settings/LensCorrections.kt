@@ -22,6 +22,17 @@ interface LensToneStorage {
     fun save(key: String, tone: LensTone)
 }
 
+/**
+ * Gives copied lens profiles the shadows and highlight compression of their originals.
+ * [copies] maps original to copy ids. The lens in use holds its values in the film parameters, passed as [current].
+ */
+fun LensToneStorage.copyProfiles(copies: Map<String, String>, current: LensTone) {
+    copies.forEach { (original, copy) ->
+        val tone = if ("lens:$original" == activeKey) current else load("lens:$original")
+        tone?.let { save("lens:$copy", it) }
+    }
+}
+
 class SharedPreferencesLensToneStorage(private val preferences: SharedPreferences) : LensToneStorage {
     constructor(context: Context) : this(
         context.applicationContext.getSharedPreferences("lens_tone", Context.MODE_PRIVATE),

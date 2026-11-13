@@ -26,19 +26,25 @@ object AutoLensProfiles {
         val selected = select(verified)
         if (verified.isEmpty() && preferences.lensProfiles.none { it.verification != null }) return preferences
         val previous = preferences.lensProfiles
-        val managed = previous.filter { it.managedByDiscovery }.groupBy { it.sensorId }
         val resultsByConfiguration = report.results.associateBy { it.configuration.key }
-        val generated = selected.map { configuration ->
-            val existing = managed[configuration.sensorId].orEmpty().minWithOrNull(compareBy(
-                { if (it.verification?.configuration?.key == configuration.key) 0 else 1 },
-                { if (it.id == preferences.activeLensProfileId) 0 else 1 },
-                { if (it.id == preferences.defaultLensProfileId) 0 else 1 }, { it.id }))
-            val camera = cameras.first(configuration::matches)
-            (existing ?: LensProfile(UUID.randomUUID().toString(), configuration.sensorId, configuration.profileName,
-                configuration.routeId, configuration.raw,
-                color = LensColorSettings(matrixEnabled = camera.sensorMetadata.colorCalibration.hasUsableColorTransform())))
-                .copy(name = configuration.profileName, sensorId = configuration.sensorId, routeId = configuration.routeId,
-                    rawStream = configuration.raw, verification = LensVerification(report.environment, configuration), autoManaged = true)
+        // Photo and video each get their own set of discovered profiles.
+        val managed = LensProfileMode.entries.associateWith { mode ->
+            previous.filter { it.managedByDiscovery && it.mode == mode }.groupBy { it.sensorId }
+        }
+        val generated = LensProfileMode.entries.associateWith { mode ->
+            selected.map { configuration ->
+                val existing = managed.getValue(mode)[configuration.sensorId].orEmpty().minWithOrNull(compareBy(
+                    { if (it.verification?.configuration?.key == configuration.key) 0 else 1 },
+                    { if (it.id == preferences.activeLensProfileId) 0 else 1 },
+                    { if (it.id == preferences.defaultLensProfileId(mode)) 0 else 1 }, { it.id }))
+                val camera = cameras.first(configuration::matches)
+                (existing ?: LensProfile(UUID.randomUUID().toString(), configuration.sensorId, configuration.profileName,
+                    configuration.routeId, configuration.raw,
+                    color = LensColorSettings(matrixEnabled = camera.sensorMetadata.colorCalibration.hasUsableColorTransform()),
+                    mode = mode))
+                    .copy(name = configuration.profileName, sensorId = configuration.sensorId, routeId = configuration.routeId,
+                        rawStream = configuration.raw, verification = LensVerification(report.environment, configuration), autoManaged = true)
+            }
         }
         val retained = previous.filterNot { it.managedByDiscovery }.map { old ->
             val proof = old.verification
@@ -50,22 +56,27 @@ object AutoLensProfiles {
                     old.copy(verification = proof.copy(verified = false))
                 else -> old
             }
-            if (generated.isNotEmpty() && !preferences.autoLensDiscoveryConfigured) updated.copy(enabled = false) else updated
+            if (selected.isNotEmpty() && !preferences.autoLensDiscoveryConfigured) updated.copy(enabled = false) else updated
         }
-        val selectedSensors = generated.mapTo(hashSetOf()) { it.sensorId }
-        val pending = if (report.complete) emptyList() else managed.filterKeys { it !in selectedSensors }.values.mapNotNull { profiles ->
-            profiles.filter { resultsByConfiguration[it.verification?.configuration?.key]?.tested != true }
-                .minWithOrNull(compareBy({ if (it.id == preferences.activeLensProfileId) 0 else 1 }, { it.id }))
+        val selectedSensors = selected.mapTo(hashSetOf()) { it.sensorId }
+        val pending = if (report.complete) emptyList() else LensProfileMode.entries.flatMap { mode ->
+            managed.getValue(mode).filterKeys { it !in selectedSensors }.values.mapNotNull { profiles ->
+                profiles.filter { resultsByConfiguration[it.verification?.configuration?.key]?.tested != true }
+                    .minWithOrNull(compareBy({ if (it.id == preferences.activeLensProfileId) 0 else 1 }, { it.id }))
+            }
         }
-        val profiles = generated + retained + pending
+        val profiles = generated.values.flatten() + retained + pending
         val active = profiles.firstOrNull { it.enabled && it.id == preferences.activeLensProfileId &&
             LensProfiles.available(it, cameras) }
-            ?: generated.firstOrNull { it.enabled }
-        val startup = profiles.firstOrNull { preferences.autoLensDiscoveryConfigured && it.id == preferences.defaultLensProfileId &&
-            it.enabled && LensProfiles.available(it, cameras) }
-            ?: generated.firstOrNull { it.enabled }
+            ?: generated.getValue(preferences.lensProfileMode).firstOrNull { it.enabled }
+        fun startup(mode: LensProfileMode) = profiles.firstOrNull {
+            preferences.autoLensDiscoveryConfigured && it.id == preferences.defaultLensProfileId(mode) &&
+                it.enabled && LensProfiles.available(it, cameras)
+        } ?: generated.getValue(mode).firstOrNull { it.enabled }
+        val photo = startup(LensProfileMode.PHOTO)
         return LensProfiles.normalize(preferences.copy(lensProfiles = profiles,
             autoLensDiscoveryConfigured = preferences.autoLensDiscoveryConfigured || verified.isNotEmpty(),
-            activeLensProfileId = active?.id, defaultLensProfileId = startup?.id, defaultLensId = startup?.routeId), cameras)
+            activeLensProfileId = active?.id, defaultLensProfileId = photo?.id, defaultLensId = photo?.routeId,
+            defaultVideoLensProfileId = startup(LensProfileMode.VIDEO)?.id), cameras)
     }
 }

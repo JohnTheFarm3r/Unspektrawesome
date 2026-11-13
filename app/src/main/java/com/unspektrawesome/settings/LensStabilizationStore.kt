@@ -3,57 +3,43 @@ package com.unspektrawesome.settings
 import android.content.Context
 import android.content.SharedPreferences
 import com.unspektrawesome.video.LiveStabilizationSettings
-import com.unspektrawesome.video.VideoRecordingState
 
+/** Stabilization that earlier versions saved beside the lens profiles. It now belongs to each profile. */
 class LensStabilizationStore(context: Context) {
     private val preferences = context.applicationContext.getSharedPreferences("lens_stabilization", Context.MODE_PRIVATE)
+    private val legacy = context.applicationContext.getSharedPreferences("video_recording", Context.MODE_PRIVATE)
 
-    init {
-        if (!preferences.contains("defaults.ois")) {
-            val legacy = context.applicationContext.getSharedPreferences("video_recording", Context.MODE_PRIVATE)
-            write("defaults", read(legacy, "", VideoRecordingState()))
-        }
+    /** Gives every lens profile the stabilization saved for it. Returns [saved] unchanged once [markMoved] was called. */
+    fun moveToProfiles(saved: CameraPreferences): CameraPreferences {
+        if (preferences.getBoolean(MOVED, false)) return saved
+        val defaults = if (preferences.contains("defaults.ois")) read(preferences, "defaults.", VideoStabilization())
+            else read(legacy, "", VideoStabilization())
+        return saved.copy(lensProfiles = saved.lensProfiles.map {
+            it.copy(videoStabilization = read(preferences, "profile:${it.id}.", defaults))
+        })
     }
 
-    fun load(key: String?, state: VideoRecordingState): VideoRecordingState =
-        read(preferences, "${key ?: "defaults"}.", read(preferences, "defaults.", state))
-
-    fun save(key: String, state: VideoRecordingState) = write(key, state)
-
-    private fun write(key: String, state: VideoRecordingState) {
-        val prefix = key + "."
-        preferences.edit()
-            .putBoolean(prefix + "ois", state.oisEnabled)
-            .putBoolean(prefix + "capture_gyro", state.captureGyro)
-            .putBoolean(prefix + "live_stabilization", state.liveStabilization)
-            .putFloat(prefix + "stabilization_crop", state.stabilizationSettings.cropRatio)
-            .putFloat(prefix + "stabilization_smoothing", state.stabilizationSettings.smoothingSeconds)
-            .putFloat(prefix + "stabilization_strength", state.stabilizationSettings.strength)
-            .apply()
+    /** Call after the result of [moveToProfiles] is saved. */
+    fun markMoved() {
+        if (!preferences.getBoolean(MOVED, false)) preferences.edit().putBoolean(MOVED, true).apply()
     }
 
-    private fun read(source: SharedPreferences, prefix: String, state: VideoRecordingState): VideoRecordingState {
+    private fun read(source: SharedPreferences, prefix: String, fallback: VideoStabilization): VideoStabilization {
         fun amount(name: String, default: Float, range: ClosedFloatingPointRange<Float>): Float =
             source.getFloat(prefix + name, default).takeIf { it.isFinite() }?.coerceIn(range) ?: default
-        val settings = state.stabilizationSettings
-        return state.copy(
-            oisEnabled = source.getBoolean(prefix + "ois", state.oisEnabled),
-            captureGyro = source.getBoolean(prefix + "capture_gyro", state.captureGyro),
-            liveStabilization = source.getBoolean(prefix + "live_stabilization", state.liveStabilization),
-            stabilizationSettings = LiveStabilizationSettings(
+        val settings = fallback.settings
+        return VideoStabilization(
+            ois = source.getBoolean(prefix + "ois", fallback.ois),
+            captureGyro = source.getBoolean(prefix + "capture_gyro", fallback.captureGyro),
+            liveStabilization = source.getBoolean(prefix + "live_stabilization", fallback.liveStabilization),
+            settings = LiveStabilizationSettings(
                 amount("stabilization_crop", settings.cropRatio, 1f..1.5f),
                 amount("stabilization_smoothing", settings.smoothingSeconds, .05f..1f),
                 amount("stabilization_strength", settings.strength, 0f..1f)),
         )
     }
 
-    companion object {
-        fun key(preferences: CameraPreferences, routeId: String?): String? {
-            if (routeId == null) return null
-            val profile = preferences.lensProfiles.firstOrNull {
-                it.id == preferences.activeLensProfileId && it.enabled && it.routeId == routeId
-            }
-            return profile?.let { "profile:${it.id}" } ?: "route:$routeId"
-        }
+    private companion object {
+        const val MOVED = "moved_to_profiles"
     }
 }

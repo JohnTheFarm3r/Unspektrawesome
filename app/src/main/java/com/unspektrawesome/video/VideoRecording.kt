@@ -43,8 +43,8 @@ data class VideoRecordingState(
     val defaultBitrate: Int = 45_000_000,
     val bitrateRange: VideoBitrateRange? = null,
     val phase: VideoPhase = VideoPhase.IDLE,
-    /** Exposure, focus and white balance are held for the current recording. */
-    val controlsLocked: Boolean = false,
+    /** What is held fixed for the current recording. */
+    val lockedControls: RecordingLock = RecordingLock.NONE,
     val startedAtMs: Long = 0,
     val droppedFrames: Long = 0,
     val lastUri: Uri? = null,
@@ -72,6 +72,7 @@ data class VideoRecordingState(
     val stabilizationLimited: Boolean = false,
 ) {
     val busy: Boolean get() = phase in setOf(VideoPhase.STARTING, VideoPhase.RECORDING, VideoPhase.SAVING)
+    val controlsLocked: Boolean get() = lockedControls.any
     val oisBlockedByGyro: Boolean get() = liveStabilization || captureGyro || (busy && clipCaptureGyro == true)
     val requestedOis: Boolean get() = if (enabled) oisEnabled && !oisBlockedByGyro else photoOisEnabled
     val outputSupported: Boolean get() = downscale in available && outputIssue == null && outputSize != null

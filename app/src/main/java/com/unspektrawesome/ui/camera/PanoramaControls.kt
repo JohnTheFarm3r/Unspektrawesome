@@ -149,7 +149,7 @@ internal fun PanoramaMenuControls(state: PanoramaState, onExportLater: (Boolean)
 
 @Composable
 internal fun BoxScope.PanoramaOverlay(state: PanoramaState, rotation: Float, supported: Boolean,
-    onGridAimRadiusChanged: (Double) -> Unit = {}) {
+    onGridAimRadiusChanged: (Double) -> Unit = {}, deviceRotation: Float = rotation) {
     var showFailure by remember(state.enabled, state.guide) { mutableStateOf(state.enabled && state.guide in setOf(PanoramaGuide.FAILED, PanoramaGuide.SHORT)) }
     LaunchedEffect(state.enabled, state.guide) { if (showFailure) { delay(2_500); showFailure = false } }
     val warning = when {
@@ -176,7 +176,9 @@ internal fun BoxScope.PanoramaOverlay(state: PanoramaState, rotation: Float, sup
     val displayedWarning = if (visible) warning else retainedWarning
     AnimatedVisibility(visible, Modifier.fillMaxSize(), enter = fadeIn(tween(180, delayMillis = 140)), exit = fadeOut(tween(260))) {
         val guideRotation = displayedState.grid?.takeIf { displayedState.recording }?.orientationDegrees
-            ?.let { if (it == 270) -90f else it.toFloat() } ?: rotation
+            ?.let { if (it == 270) -90f else it.toFloat() }
+            // Guides are drawn relative to the captured frame, so they follow how the phone is held.
+            ?: if (displayedState.recording || displayedState.grid != null) deviceRotation else rotation
         RotatingCameraPanel(guideRotation, Modifier.fillMaxSize(), maxWidth = Dp.Infinity) {
             Box(Modifier.fillMaxSize().testTag("Panorama guidance").languageSemantics { language ->
                 contentDescription = language.text(if (!supported) "Manual exposure is unavailable on this lens" else if (displayedState.grid != null) "Aim at the highlighted circle and hold steady" else displayedState.guide.text)

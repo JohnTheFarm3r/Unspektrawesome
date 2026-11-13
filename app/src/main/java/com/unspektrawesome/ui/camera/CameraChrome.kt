@@ -373,6 +373,7 @@ internal fun CaptureActions(viewfinderSpektraEnabled: Boolean, busy: Boolean, la
     recording: Boolean = false,
     panoramaAuto: (@Composable (Modifier) -> Unit)? = null,
     onShutterLongPress: (() -> Unit)? = null,
+    recordingLock: com.unspektrawesome.video.RecordingLock = com.unspektrawesome.video.RecordingLock(),
     onGuideTarget: (String, androidx.compose.ui.geometry.Rect) -> Unit = { _, _ -> }) {
     val videoMode = mode == CaptureMode.VIDEO
     val burstMode = mode == CaptureMode.BURST
@@ -474,7 +475,7 @@ internal fun CaptureActions(viewfinderSpektraEnabled: Boolean, busy: Boolean, la
                     haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                     start()
                 } },
-                onLongClickLabel = lockedRecording?.let { AppLanguage.text("Record with exposure, focus and white balance locked") },
+                onLongClickLabel = lockedRecording?.let { AppLanguage.text(recordingLock.holdDescription) },
                 interactionSource = holdSource,
                 modifier = Modifier.size(shutterSize).languageSemantics { language ->
                     contentDescription = language.text(if (gridMode) { if (recording) "Stop 3×3 capture" else "Start 3×3 capture" } else if (panoramaMode) { if (recording) "Stop panorama" else "Start panorama" } else if (recording) "Stop recording" else if (videoMode) "Start recording" else if (burstMode) "Capture BURST" else "Take photo")

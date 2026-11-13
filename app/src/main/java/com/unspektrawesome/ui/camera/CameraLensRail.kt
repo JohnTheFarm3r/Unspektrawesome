@@ -15,7 +15,6 @@ import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import com.unspektrawesome.language.LanguageText as Text
@@ -39,6 +38,7 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.platform.ViewConfiguration
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.*
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
@@ -64,6 +64,7 @@ internal fun CameraLensRail(
     preferences: CameraPreferences = CameraPreferences(),
     visible: Boolean = true,
     enabled: Boolean = true,
+    onDefaultProfile: (String) -> Unit = {},
 ) {
     val opacity by animateFloatAsState(if (visible) 1f else 0f, tween(180), label = "Lens controls visibility")
     val interactive = visible && enabled
@@ -75,10 +76,14 @@ internal fun CameraLensRail(
         { (_, choices) -> byRoute.getValue(choices.first().routeId).facing.ordinal },
         { (_, choices) -> choices.minOf { it.focalLength.equivalent(byRoute.getValue(it.routeId)) ?: Float.MAX_VALUE } },
         { (_, choices) -> choices.minOf { routeOrder.getValue(it.routeId) } }))
+    // Photo and video remember the profile last used on each lens separately.
+    val mode = preferences.lensProfileMode
+    fun memory(group: String) = "${mode.name}:$group"
     var lastUsed by rememberSaveable { mutableStateOf(mapOf<String, String>()) }
     val activeProfile = profiles.firstOrNull { it.id == preferences.activeLensProfileId }
+    val defaultProfile = preferences.defaultLensProfileId(mode)
     LaunchedEffect(activeProfile?.id) {
-        activeProfile?.let { lastUsed = lastUsed + (it.focalGroup to it.id) }
+        activeProfile?.let { lastUsed = lastUsed + (memory(it.focalGroup) to it.id) }
     }
     val configuration = LocalViewConfiguration.current
     val holdConfiguration = remember(configuration) {
@@ -96,8 +101,8 @@ internal fun CameraLensRail(
             if (groups.isEmpty()) {
                 orderedCameras.forEach { camera ->
                     key(camera.route.routeId) {
-                        LensButton(camera, camera.route.routeId == selected, emptyList(), null,
-                            enabled = interactive,
+                        LensButton(camera, camera.route.routeId == selected, emptyList(), null, null,
+                            enabled = interactive, onDefaultProfile = {},
                             onSelect = { onSelect(camera.route.routeId) })
                     }
                 }
@@ -105,11 +110,12 @@ internal fun CameraLensRail(
                 groups.forEach { (sensorId, choices) ->
                     key(sensorId) {
                         val profile = activeProfile?.takeIf { it.focalGroup == sensorId }
-                            ?: choices.firstOrNull { it.id == lastUsed[sensorId] } ?: choices.first()
+                            ?: choices.firstOrNull { it.id == lastUsed[memory(sensorId)] } ?: choices.first()
                         LensButton(byRoute.getValue(profile.routeId), activeProfile?.focalGroup == sensorId,
-                            choices, profile.id, enabled = interactive, onSelect = { id ->
+                            choices, profile.id, defaultProfile, enabled = interactive, onDefaultProfile = onDefaultProfile,
+                            onSelect = { id ->
                                 val chosen = id ?: profile.id
-                                lastUsed = lastUsed + (sensorId to chosen)
+                                lastUsed = lastUsed + (memory(sensorId) to chosen)
                                 onSelect(chosen)
                             })
                     }
@@ -121,7 +127,8 @@ internal fun CameraLensRail(
 
 @Composable
 private fun LensButton(camera: CameraDescriptor, active: Boolean, profiles: List<LensProfile>,
-    selectedProfile: String?, enabled: Boolean, onSelect: (String?) -> Unit) {
+    selectedProfile: String?, defaultProfile: String?, enabled: Boolean, onDefaultProfile: (String) -> Unit,
+    onSelect: (String?) -> Unit) {
     val haptics = LocalHapticFeedback.current
     val rotation = LocalCameraRotation.current
     val zoom = profiles.firstOrNull { it.id == selectedProfile }?.focalLength?.label(camera) ?: LensButtonMapping.zoomLabel(camera)
@@ -164,7 +171,7 @@ private fun LensButton(camera: CameraDescriptor, active: Boolean, profiles: List
         }
     }
     if (expanded && enabled) {
-        LensProfilePicker(profiles, selectedProfile, bounds, rotation, { expanded = false }) {
+        LensProfilePicker(profiles, selectedProfile, defaultProfile, bounds, rotation, { expanded = false }, onDefaultProfile) {
             expanded = false
             if (enabled) onSelect(it)
         }
@@ -172,8 +179,9 @@ private fun LensButton(camera: CameraDescriptor, active: Boolean, profiles: List
 }
 
 @Composable
-private fun LensProfilePicker(profiles: List<LensProfile>, selected: String?, anchor: IntRect,
-    rotation: Float, onDismiss: () -> Unit, onSelect: (String) -> Unit) {
+private fun LensProfilePicker(profiles: List<LensProfile>, selectedId: String?, defaultId: String?, anchor: IntRect,
+    rotation: Float, onDismiss: () -> Unit, onDefaultProfile: (String) -> Unit, onSelect: (String) -> Unit) {
+    val haptics = LocalHapticFeedback.current
     val scroll = rememberLazyListState()
     val scrollable = scroll.canScrollBackward || scroll.canScrollForward
     val margin = with(LocalDensity.current) { 12.dp.roundToPx() }
@@ -198,19 +206,32 @@ private fun LensProfilePicker(profiles: List<LensProfile>, selected: String?, an
                     LazyColumn(state = scroll, modifier = Modifier.padding(end = if (scrollable) 16.dp else 0.dp),
                         contentPadding = PaddingValues(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp), overscrollEffect = null) {
                         items(profiles, key = { it.id }) { profile ->
+                            val current = profile.id == selectedId
+                            // A tap switches to the profile. Holding it makes it the profile this capture mode starts with.
                             Row(Modifier.fillMaxWidth().heightIn(min = 44.dp).clip(RoundedCornerShape(12.dp))
-                                .border(1.dp, if (profile.id == selected) CameraColors.Accent else CameraColors.MenuBorder, RoundedCornerShape(12.dp))
-                                .selectable(profile.id == selected, role = Role.RadioButton) { onSelect(profile.id) }
+                                .border(1.dp, if (current) CameraColors.Accent else CameraColors.MenuBorder, RoundedCornerShape(12.dp))
+                                .combinedClickable(role = Role.RadioButton,
+                                    onLongClickLabel = AppLanguage.text("Set as default"),
+                                    onLongClick = {
+                                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        onDefaultProfile(profile.id)
+                                    }, onClick = { onSelect(profile.id) })
+                                .semantics { selected = current }
                                 .padding(horizontal = 12.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                                 Column(Modifier.weight(1f)) {
-                                    Text(profile.displayName, translate = false,
-                                        color = if (profile.id == selected) CameraColors.Accent else Color.White,
-                                        fontSize = 12.sp, lineHeight = 16.sp,
-                                        fontWeight = if (profile.id == selected) FontWeight.Medium else FontWeight.Normal)
+                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        Text(profile.displayName, Modifier.weight(1f, fill = false), translate = false,
+                                            color = if (current) CameraColors.Accent else Color.White,
+                                            fontSize = 12.sp, lineHeight = 16.sp,
+                                            fontWeight = if (current) FontWeight.Medium else FontWeight.Normal)
+                                        if (profile.id == defaultId) Text("Default", Modifier.testTag("Default lens profile")
+                                            .border(1.dp, CameraColors.MenuBorder, RoundedCornerShape(4.dp)).padding(horizontal = 4.dp),
+                                            color = CameraColors.Text, fontSize = 9.sp, lineHeight = 13.sp, maxLines = 1, softWrap = false)
+                                    }
                                     Text(profile.rawStream.let { "${it.format} · ${it.width} × ${it.height}" }, translate = false,
                                         color = CameraColors.Muted, fontSize = 11.sp, lineHeight = 15.sp, fontFamily = CameraTypography.Readout)
                                 }
-                                if (profile.id == selected) CameraIcon(com.unspektrawesome.R.drawable.ic_sleek_check, Modifier.padding(start = 6.dp).size(16.dp), CameraColors.Accent)
+                                if (current) CameraIcon(com.unspektrawesome.R.drawable.ic_sleek_check, Modifier.padding(start = 6.dp).size(16.dp), CameraColors.Accent)
                             }
                         }
                     }

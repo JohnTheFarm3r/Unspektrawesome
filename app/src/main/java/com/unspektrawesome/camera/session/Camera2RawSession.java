@@ -863,18 +863,28 @@ public final class Camera2RawSession implements AutoCloseable {
         });
     }
 
-    /** Holds the current exposure, focus and white balance fixed, as used by panorama and locked video recording. */
+    /** Holds the current exposure, focus and white balance fixed, as used by panorama. */
     public synchronized boolean freezeCaptureControls(int sensitivity, long durationNs) {
+        return freezeCaptureControls(sensitivity, durationNs, true, true, true);
+    }
+
+    /** Holds the chosen controls at their current values, as used by locked video recording. The others keep running. */
+    public synchronized boolean freezeCaptureControls(int sensitivity, long durationNs,
+                                                      boolean exposure, boolean focus, boolean whiteBalance) {
         Handler handler = cameraHandler;
         return handler != null && handler.post(() -> {
-            iso = clamp(sensitivity, isoMin, isoMax);
-            exposureTimeNs = clamp(durationNs, exposureTimeMinNs, exposureTimeMaxNs);
-            autoExposure = false;
-            externalExposureAutomatic = false;
-            longShutter.clear();
-            if (manualFocusSupported) autoFocus = false;
-            resetMetering();
-            if (autoWhiteBalance) {
+            if (exposure) {
+                iso = clamp(sensitivity, isoMin, isoMax);
+                exposureTimeNs = clamp(durationNs, exposureTimeMinNs, exposureTimeMaxNs);
+                autoExposure = false;
+                externalExposureAutomatic = false;
+                longShutter.clear();
+            }
+            if (focus) {
+                if (manualFocusSupported) autoFocus = false;
+                resetMetering();
+            }
+            if (whiteBalance && autoWhiteBalance) {
                 if (manualWhiteBalanceSupported && lastAutoWhiteBalanceNeutral != null) {
                     lockedWhiteBalanceNeutral = lastAutoWhiteBalanceNeutral.clone();
                     autoWhiteBalance = false;

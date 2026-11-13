@@ -206,6 +206,8 @@ fun CameraScreen(
     viewfinderAspectRatio: Float,
     controlRotationDegrees: Float,
     lensSwitching: Boolean,
+    // How the phone is physically held. Level and panorama guides follow it rather than the controls.
+    deviceRotationDegrees: Float = controlRotationDegrees,
     startupLoading: Boolean,
     captureBusy: Boolean,
     captureInProgress: Boolean = captureBusy,
@@ -249,6 +251,8 @@ fun CameraScreen(
     onCancelLensSessionRetries: () -> Unit = {},
     onRetryLensSession: () -> Unit = {},
     onHardwareShutterChanged: ((() -> Unit)?) -> Unit = {},
+    /** Receives the handler that runs camera actions from buttons, or null while the camera controls are hidden. */
+    onHardwareControlsChanged: (((com.unspektrawesome.controls.ControlAction, Int) -> Unit)?) -> Unit = {},
     locationStatus: String = "Off",
     onLocationEnabledChanged: (Boolean) -> Unit = { onPreferencesChanged(preferences.copy(saveLocation = it)) },
     onCameraVisibilityChanged: (Boolean) -> Unit = {},
@@ -529,6 +533,172 @@ fun CameraScreen(
         }) else null)
         onDispose { onHardwareShutterChanged(null) }
     }
+    // Values just requested by a button, so quick repeated steps continue from them before the camera reports back.
+    val requestedControlValues = remember { mutableMapOf<com.unspektrawesome.controls.ControlAction, Pair<Long, Float>>() }
+    fun controlBase(action: com.unspektrawesome.controls.ControlAction, current: Float): Float =
+        requestedControlValues[action]?.takeIf { android.os.SystemClock.uptimeMillis() - it.first < 700 }?.second ?: current
+    fun requestedControl(action: com.unspektrawesome.controls.ControlAction, value: Float) {
+        requestedControlValues[action] = android.os.SystemClock.uptimeMillis() to value
+    }
+    // A photo or recording requested from another capture mode starts once that mode is ready.
+    var pendingControlCapture by remember { mutableStateOf<com.unspektrawesome.controls.ControlAction?>(null) }
+    // The mode to return to after a recording started with a record button, and whether that recording began.
+    var modeAfterControlRecording by remember { mutableStateOf<CaptureMode?>(null) }
+    var controlRecordingStarted by remember { mutableStateOf(false) }
+    LaunchedEffect(pendingControlCapture) {
+        if (pendingControlCapture != null) {
+            delay(8_000)
+            pendingControlCapture = null
+            if (!controlRecordingStarted) modeAfterControlRecording = null
+        }
+    }
+    LaunchedEffect(pendingControlCapture, captureMode, hardwareShutterReady, hardwareShutterActive, videoState.busy) {
+        val target = pendingControlCapture ?: return@LaunchedEffect
+        val modeReady = if (target == com.unspektrawesome.controls.ControlAction.RECORD_VIDEO) captureMode == CaptureMode.VIDEO
+            else captureMode == CaptureMode.PHOTO
+        if (modeReady && hardwareShutterActive && hardwareShutterReady && !videoState.busy) {
+            pendingControlCapture = null
+            currentShutter()
+        }
+    }
+    LaunchedEffect(recordingInProgress) {
+        if (recordingInProgress && modeAfterControlRecording != null) controlRecordingStarted = true
+    }
+    LaunchedEffect(controlRecordingStarted, videoState.busy, modeSwipeEnabled) {
+        val mode = modeAfterControlRecording ?: return@LaunchedEffect
+        if (controlRecordingStarted && !videoState.busy && modeSwipeEnabled) {
+            modeAfterControlRecording = null
+            controlRecordingStarted = false
+            changeCaptureMode(mode)
+        }
+    }
+    // True while a half press is held, which keeps the focus loupe open.
+    var halfPressHeld by remember { mutableStateOf(false) }
+    LaunchedEffect(hardwareShutterActive) { if (!hardwareShutterActive) halfPressHeld = false }
+    var spektraAeControlFeedback by remember { androidx.compose.runtime.mutableIntStateOf(0) }
+    LaunchedEffect(spektraAeControlFeedback) {
+        if (spektraAeControlFeedback == 0) return@LaunchedEffect
+        showSpektraAeFeedback = true
+        delay(accessibilityManager?.calculateRecommendedTimeoutMillis(2_000L, containsText = true) ?: 2_000L)
+        showSpektraAeFeedback = false
+    }
+    val controlHandler: (com.unspektrawesome.controls.ControlAction, Int) -> Unit = handler@{ action, step ->
+        when (action) {
+            com.unspektrawesome.controls.ControlAction.SHUTTER -> {
+                halfPressHeld = false
+                if (hardwareShutterReady) currentShutter()
+            }
+            com.unspektrawesome.controls.ControlAction.TAKE_PHOTO -> {
+                halfPressHeld = false
+                when {
+                    videoState.busy || panoramaState.busy || burstState.busy -> Unit
+                    captureMode == CaptureMode.PHOTO || captureMode == CaptureMode.BURST -> if (hardwareShutterReady) currentShutter()
+                    else -> {
+                        changeCaptureMode(CaptureMode.PHOTO)
+                        pendingControlCapture = action
+                    }
+                }
+            }
+            com.unspektrawesome.controls.ControlAction.RECORD_VIDEO -> when {
+                captureMode == CaptureMode.VIDEO -> if (hardwareShutterReady) currentShutter()
+                panoramaState.busy || burstState.busy || captureInProgress -> Unit
+                else -> {
+                    modeAfterControlRecording = captureMode
+                    controlRecordingStarted = false
+                    changeCaptureMode(CaptureMode.VIDEO)
+                    pendingControlCapture = action
+                }
+            }
+            com.unspektrawesome.controls.ControlAction.HALF_PRESS -> {
+                halfPressHeld = step != 0
+                if (step != 0 && cameraControls.autoFocus) {
+                    // Refocus on the chosen focus point, or the center when none is shown.
+                    val point = tapMeteringStatus.takeIf {
+                        it.generation != 0L && it.phase != com.unspektrawesome.preview.TapMeteringPhase.IDLE && !it.hidden
+                    }
+                    onFocusPointChanged(point?.normalizedX ?: .5f, point?.normalizedY ?: .5f)
+                }
+            }
+            com.unspektrawesome.controls.ControlAction.LENS -> {
+                if (lensChangeBusy) return@handler
+                val front = enabledCameras.firstOrNull { it.route.routeId == selectedLensId }?.facing == LensFacing.FRONT
+                val lenses = enabledCameras.filter { (it.facing == LensFacing.FRONT) == front }
+                lensStepTarget(lenses, preferences, selectedLensId, step)?.let { (id, _) -> pendingLensSelection = id }
+            }
+            com.unspektrawesome.controls.ControlAction.CAPTURE_MODE ->
+                if (modeSwipeEnabled) changeCaptureMode(captureMode.step(step.coerceIn(-1, 1)))
+            com.unspektrawesome.controls.ControlAction.EV -> {
+                val minimum = cameraControls.exposureCompensationMin
+                val maximum = cameraControls.exposureCompensationMax
+                if (!cameraControls.autoExposure || minimum >= maximum) return@handler
+                val value = (controlBase(action, cameraControls.exposureCompensation.toFloat()).roundToInt() + step)
+                    .coerceIn(minimum, maximum)
+                if (onExposureCompensationChanged(value)) requestedControl(action, value.toFloat())
+            }
+            com.unspektrawesome.controls.ControlAction.ISO -> {
+                if (!cameraControls.manualExposureSupported) return@handler
+                val values = isoStops(cameraControls.isoMin, cameraControls.isoMax)
+                val current = closestIndex(values, controlBase(action, cameraControls.iso.toFloat()).roundToInt())
+                val value = values[(current + step).coerceIn(0, values.lastIndex)]
+                if (onIsoChanged(value)) requestedControl(action, value.toFloat())
+            }
+            com.unspektrawesome.controls.ControlAction.SHUTTER_SPEED -> {
+                if (!cameraControls.manualExposureSupported) return@handler
+                val values = shutterStops(cameraControls.exposureTimeMinNs, cameraControls.exposureTimeMaxNs)
+                val base = controlBase(action, cameraControls.selectedExposureTimeNs.toFloat()).toLong()
+                val current = closestIndex(values.map(ShutterStop::nanoseconds), base)
+                // Positive steps make the shutter faster, like a camera's command dial.
+                val value = values[(current - step).coerceIn(0, values.lastIndex)]
+                if (onExposureTimeChanged(value.nanoseconds)) requestedControl(action, value.nanoseconds.toFloat())
+            }
+            com.unspektrawesome.controls.ControlAction.AE_BALANCE -> {
+                if (!cameraControls.customAe || cameraControls.exposureMode != AeMode.AUTO) return@handler
+                val value = com.unspektrawesome.camera.exposure.AeBalance.normalize(
+                    ((controlBase(action, preferences.aeBalance()) * 10).roundToInt() + step) / 10f)
+                onPreferencesChanged(preferences.withAeBalance(value))
+                requestedControl(action, value)
+            }
+            com.unspektrawesome.controls.ControlAction.SHADOWS -> spektraRepository.updateParams {
+                it.copy(inputShadows = (((it.inputShadows * 20).roundToInt() + step) / 20f).coerceIn(0f, 1f))
+            }
+            com.unspektrawesome.controls.ControlAction.HIGHLIGHTS -> spektraRepository.updateParams {
+                it.copy(inputHighlights = (((it.inputHighlights * 20).roundToInt() + step) / 20f).coerceIn(-1f, 1f))
+            }
+            com.unspektrawesome.controls.ControlAction.FOCUS -> {
+                if (!cameraControls.manualFocusSupported) return@handler
+                val nearest = cameraControls.minimumFocusDistance
+                val position = (controlBase(action, FocusScale.position(cameraControls.focusDistance, nearest)) + step * .01f)
+                    .coerceIn(0f, 1f)
+                if (onFocusDistanceChanged(FocusScale.distance(position, nearest))) requestedControl(action, position)
+            }
+            com.unspektrawesome.controls.ControlAction.WHITE_BALANCE -> {
+                if (!cameraControls.manualWhiteBalanceSupported) return@handler
+                val base = controlBase(action, (cameraControls.whiteBalanceTemperatureKelvin ?: 5000).toFloat()).roundToInt()
+                val value = ((base / 100 + step) * 100).coerceIn(WHITE_BALANCE_STOPS.first(), WHITE_BALANCE_STOPS.last())
+                if (onWhiteBalanceTemperatureChanged(value)) requestedControl(action, value.toFloat())
+            }
+            com.unspektrawesome.controls.ControlAction.AUTO_EXPOSURE -> {
+                requestedControlValues.clear()
+                onAutoExposure()
+            }
+            com.unspektrawesome.controls.ControlAction.AUTO_FOCUS -> {
+                requestedControlValues.remove(com.unspektrawesome.controls.ControlAction.FOCUS)
+                onAutoFocus()
+            }
+            com.unspektrawesome.controls.ControlAction.SPEKTRA_AE -> {
+                // Digital auto exposure has no effect while Unspektra AE runs the camera exposure.
+                if (cameraControls.customAe || panoramaState.enabled) return@handler
+                spektraRepository.updateParams { com.unspektrawesome.camera.VolumeExposure.cycle(it, step.coerceIn(-1, 1)) }
+                spektraAeControlFeedback++
+            }
+            com.unspektrawesome.controls.ControlAction.GALLERY -> onOpenGallery()
+        }
+    }
+    val currentControlHandler by rememberUpdatedState(controlHandler)
+    DisposableEffect(hardwareShutterActive, onHardwareControlsChanged) {
+        onHardwareControlsChanged(if (hardwareShutterActive) ({ action, step -> currentControlHandler(action, step) }) else null)
+        onDispose { onHardwareControlsChanged(null) }
+    }
     val restartFocus by rememberUpdatedState(onRestartPassiveFocus)
     val focusRefreshActive = hardwareShutterActive && hardwareShutterReady && cameraControls.autoFocus && timedShutter.remaining == 0
     LaunchedEffect(focusRefreshActive, preferences.passiveFocusIntervalSeconds) {
@@ -803,7 +973,7 @@ fun CameraScreen(
                     .size(viewport.width.dp, viewport.height.dp).testTag("Camera viewport")
                     .cameraModeGestures(captureMode, controlRotationDegrees, modeSwipeEnabled, preferences.modeSwipeEnabled, changeCaptureMode)) {
                     CompositionGuides(preferences.compositionGrid, preferences.horizonEnabled && !actionsVisible,
-                        controlRotationDegrees, visible = !panoramaCapture && panoramaState.grid == null)
+                        deviceRotationDegrees, visible = !panoramaCapture && panoramaState.grid == null)
                     val horizontal = minOf(1f, animatedAspectRatio / viewfinderSurfaceAspectRatio)
                     val vertical = minOf(1f, viewfinderSurfaceAspectRatio / animatedAspectRatio)
                     ViewfinderMeteringOverlay(
@@ -831,7 +1001,8 @@ fun CameraScreen(
                     if (loupeSelected && hasCameraPermission && !startupLoading && !lensSwitching && !panoramaCapture) {
                         FocusLoupeLayer(
                             manualActive = loupeManual,
-                            tapEnabled = loupeOnTap,
+                            tapEnabled = loupeOnTap || halfPressHeld && cameraControls.autoFocus && loupeControlsFree,
+                            held = halfPressHeld,
                             tapStatus = tapMeteringStatus,
                             status = focusLoupeStatus,
                             zoom = preferences.loupeZoom,
@@ -857,7 +1028,8 @@ fun CameraScreen(
                     Box(Modifier.fillMaxSize().graphicsLayer { alpha = shutterFlash.value * .5f }.background(Color.Black))
                     CameraModeOverlay(captureMode, controlRotationDegrees, enabled = !panoramaCapture)
                     CameraModeHint(modeHintVisible && !panoramaCapture, captureMode, controlRotationDegrees, onModeSwipeHintFinished)
-                    PanoramaOverlay(panoramaState, controlRotationDegrees, cameraControls.manualExposureSupported, onGridAimRadiusChanged)
+                    PanoramaOverlay(panoramaState, controlRotationDegrees, cameraControls.manualExposureSupported, onGridAimRadiusChanged,
+                        deviceRotation = deviceRotationDegrees)
                     if (timedShutter.remaining > 0) FlowRow(Modifier.align(Alignment.Center).offset(y = (-56).dp)
                         .clip(RoundedCornerShape(50)).background(CameraColors.Glass)
                         .border(1.dp, CameraColors.MenuBorder, RoundedCornerShape(50))
@@ -979,6 +1151,9 @@ fun CameraScreen(
                         Modifier.onSizeChanged { modeRailHeight = with(density) { it.height.toDp() } })
                     Spacer(Modifier.height(actionsHeight))
                 }
+                    // What a held shutter locks on the camera in use.
+                    val recordingLock = preferences.recordingLock.resolve(cameraControls.manualExposureSupported,
+                        cameraControls.customAe)
                     CaptureActions(viewfinderSpektraEnabled, !hardwareShutterReady, lastPhotoUri, {
                         if (processingGuideActive && processingGuideStep == 3) openGalleryGuide()
                         else onOpenGallery()
@@ -1010,12 +1185,15 @@ fun CameraScreen(
                             PanoramaAutoButton(cameraControls.autoExposure && cameraControls.autoFocus && cameraControls.autoWhiteBalance,
                                 cameraControls.manualExposureSupported, controlRotationDegrees, onPanoramaAuto, modifier)
                         }) else null,
-                        onShutterLongPress = if (videoState.enabled && !videoState.busy && hardwareShutterReady) ({
+                        // With nothing to lock on this camera, holding the shutter is an ordinary press.
+                        onShutterLongPress = if (videoState.enabled && !videoState.busy && hardwareShutterReady &&
+                            recordingLock.any) ({
                             spektraVisible = false
                             advancedSpektraVisible = false
                             activeCameraParameter = null
                             onLockedRecording()
                         }) else null,
+                        recordingLock = recordingLock,
                         onGuideTarget = { name, bounds -> guideTargets[name] = bounds })
                 val bannerTop = minOf(64.dp, (freeHeight - feedbackHeight - 8.dp).coerceAtLeast(0.dp))
                 Box(Modifier.align(Alignment.TopCenter).offset(y = bannerTop)
@@ -1042,6 +1220,7 @@ fun CameraScreen(
                     videoControls = recordingInProgress,
                     expandedSliders = expandedSliders,
                     idleGrid = panoramaState.grid?.takeUnless { panoramaState.busy },
+                    gridRotation = deviceRotationDegrees,
                     video = {
                         if (burstState.enabled) BurstCaptureIndicator(burstState)
                         else Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -1073,7 +1252,8 @@ fun CameraScreen(
                                 timedShutter.remaining == 0 && activeCameraParameter == null &&
                                 cameraControls.pendingExposureTimeNs == null && !showLongShutterNotice) {
                             CameraLensRail(if (selectedFront) enabledCameras.filter { it.facing == LensFacing.FRONT } else rearCameras,
-                                selectedLensId, { pendingLensSelection = it }, preferences = preferences)
+                                selectedLensId, { pendingLensSelection = it }, preferences = preferences,
+                                onDefaultProfile = { onPreferencesChanged(com.unspektrawesome.settings.LensProfiles.setDefault(preferences, it)) })
                             }
                         }
                     },

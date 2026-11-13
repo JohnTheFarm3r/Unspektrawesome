@@ -14,12 +14,15 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+/** Exports and imports the lens profiles of one capture [mode]. */
 @Composable
-internal fun rememberLensProfileTransfer(preferences: CameraPreferences, onChange: (CameraPreferences) -> Unit): ProfileTransferActions {
+internal fun rememberLensProfileTransfer(preferences: CameraPreferences, mode: LensProfileMode,
+    onChange: (CameraPreferences) -> Unit): ProfileTransferActions {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val dcps = remember(context) { DcpRepository(context) }
     val currentPreferences by rememberUpdatedState(preferences)
+    val currentMode by rememberUpdatedState(mode)
     val change by rememberUpdatedState(onChange)
     val exporter = rememberProfileDocumentExport("application/zip")
     var loading by remember { mutableStateOf(false) }
@@ -64,14 +67,16 @@ internal fun rememberLensProfileTransfer(preferences: CameraPreferences, onChang
         }
     }
     exporting?.let { saved ->
+        val profiles = saved.lensProfiles.filter { it.mode == mode }
+        val startupId = saved.defaultLensProfileId(mode)
         ProfileSelectionDialog("Export lens profiles",
             "Every setting and DCP file is included. Backups can only be imported on the same device model.", "Export",
-            saved.lensProfiles.map { TransferProfileChoice(it.id, it.displayName, lensProfileTransferDetail(it, it.id == saved.defaultLensProfileId)) },
+            profiles.map { TransferProfileChoice(it.id, it.displayName, lensProfileTransferDetail(it, it.id == startupId)) },
             onDismiss = { exporting = null }) { ids ->
-            val selected = saved.lensProfiles.filter { it.id in ids }
+            val selected = profiles.filter { it.id in ids }
             exporting = null
             exporter.write("Lens profiles.unspektrawesome.zip", "Exported ${selected.size} lens profiles with their DCP files.") { output ->
-                LensProfileArchive.write(output, selected, saved.defaultLensProfileId, readDcp = dcps::readOriginal)
+                LensProfileArchive.write(output, selected, startupId, readDcp = dcps::readOriginal)
             }
         }
     }
@@ -80,10 +85,11 @@ internal fun rememberLensProfileTransfer(preferences: CameraPreferences, onChang
             "Choose profiles to import with their DCP files. The included startup selection is restored.", "Import",
             backup.profiles.mapIndexed { index, entry -> TransferProfileChoice(index.toString(), entry.profile.displayName,
                 lensProfileTransferDetail(entry.profile, entry.startup)) }, options = {
-                LensProfileImportChoices(importMode) { importMode = it }
+                LensProfileImportChoices(importMode, mode) { importMode = it }
             }, onDismiss = { importing = null }) { ids ->
             val selected = backup.profiles.filterIndexed { index, _ -> index.toString() in ids }
             val selectedMode = importMode
+            val target = mode
             importing = null
             scope.launch(Dispatchers.Main.immediate) {
                 loading = true
@@ -94,7 +100,7 @@ internal fun rememberLensProfileTransfer(preferences: CameraPreferences, onChang
                             dcps.import(backup.dcps.getValue(id), name)
                         }
                     }
-                    change(LensProfiles.importProfiles(currentPreferences, selected, selectedMode))
+                    change(LensProfiles.importProfiles(currentPreferences, selected, selectedMode, target))
                     message("Imported ${selected.size} lens profiles with their DCP files.")
                 } catch (e: CancellationException) {
                     throw e
@@ -109,18 +115,20 @@ internal fun rememberLensProfileTransfer(preferences: CameraPreferences, onChang
         importProfile = {
             try { importer.launch(arrayOf("*/*")) }
             catch (_: Exception) { message("Could not open the file picker.") }
-        }, exportProfiles = { if (currentPreferences.lensProfiles.isNotEmpty()) exporting = currentPreferences })
+        }, exportProfiles = { if (currentPreferences.lensProfiles.any { it.mode == currentMode }) exporting = currentPreferences })
 }
 
 @Composable
-internal fun LensProfileImportChoices(mode: LensProfileImportMode, onChange: (LensProfileImportMode) -> Unit) {
+internal fun LensProfileImportChoices(mode: LensProfileImportMode, target: LensProfileMode,
+    onChange: (LensProfileImportMode) -> Unit) {
     SettingsCard {
         SettingsChoices(listOf("Keep existing", "Replace all"), mode.ordinal) {
             onChange(LensProfileImportMode.entries[it])
         }
-        SettingsHint(when (mode) {
-            LensProfileImportMode.KEEP_EXISTING -> "Existing profiles are kept. Matching names become copies."
-            LensProfileImportMode.REPLACE_ALL -> "All existing lens profiles are removed and replaced by the selected imports."
+        SettingsHint(when {
+            mode == LensProfileImportMode.KEEP_EXISTING -> "Existing profiles are kept. Matching names become copies."
+            target == LensProfileMode.VIDEO -> "All existing video lens profiles are removed and replaced by the selected imports."
+            else -> "All existing photo lens profiles are removed and replaced by the selected imports."
         })
     }
 }

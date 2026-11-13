@@ -2,6 +2,8 @@ package com.unspektrawesome.ui.camera
 
 import com.unspektrawesome.language.languageSemantics
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
@@ -107,12 +109,7 @@ internal fun ViewfinderMeteringOverlay(
                 val point = dragPoint ?: Offset(current.normalizedX, current.normalizedY)
                 val onMove by rememberUpdatedState(if (isExposure) onExposure else onFocus ?: onTap)
                 val onReset by rememberUpdatedState(if (isExposure) onResetExposure else onResetFocus)
-                val label = if (isExposure) "AE" else when (current.phase) {
-                    TapMeteringPhase.SUCCESS -> "AF ✓"
-                    TapMeteringPhase.FAILED -> "AF ×"
-                    TapMeteringPhase.TIMED_OUT, TapMeteringPhase.UNSUPPORTED -> "AF ?"
-                    else -> "AF"
-                }
+                val label = if (isExposure) "AE" else "AF"
                 val description = when (current.phase) {
                     TapMeteringPhase.SUCCESS -> if (isExposure) "Exposure settled" else "Focus confirmed"
                     TapMeteringPhase.FAILED -> "Focus failed"
@@ -122,15 +119,39 @@ internal fun ViewfinderMeteringOverlay(
                 }
                 val color by animateColorAsState(when {
                     dragPoint != null -> CameraColors.Text
-                    current.phase == TapMeteringPhase.SUCCESS -> CameraColors.Accent
+                    current.phase == TapMeteringPhase.SUCCESS -> if (isExposure) CameraColors.Accent else CameraColors.FocusLocked
                     current.phase in listOf(TapMeteringPhase.FAILED, TapMeteringPhase.TIMED_OUT) -> CameraColors.FocusFailed
                     current.phase == TapMeteringPhase.UNSUPPORTED -> CameraColors.Muted
                     else -> CameraColors.Text
-                }, label = "Metering target color")
-                val targetSize = minOf(if (isExposure) 88.dp else 66.dp, maxWidth, maxHeight)
+                }, tween(160), label = "Metering target color")
+                // A new target settles in from slightly larger; a lock pulses once and a failure shakes.
+                val scale = remember { Animatable(1f) }
+                val shake = remember { Animatable(0f) }
+                LaunchedEffect(current.generation) {
+                    scale.snapTo(1.35f)
+                    scale.animateTo(1f, tween(220, easing = FastOutSlowInEasing))
+                }
+                LaunchedEffect(current.generation, current.phase) {
+                    when (current.phase) {
+                        TapMeteringPhase.SUCCESS -> if (!isExposure) {
+                            scale.animateTo(.86f, tween(90, easing = FastOutSlowInEasing))
+                            scale.animateTo(1f, tween(140, easing = FastOutSlowInEasing))
+                        }
+                        TapMeteringPhase.FAILED, TapMeteringPhase.TIMED_OUT -> if (!isExposure) {
+                            for (offset in listOf(4f, -4f, 3f, -2f, 0f)) shake.animateTo(offset, tween(45))
+                        }
+                        else -> Unit
+                    }
+                }
+                val targetSize = minOf(if (isExposure) 64.dp else 52.dp, maxWidth, maxHeight)
                 val targetX = (maxWidth * point.x - targetSize / 2).coerceIn(0.dp, maxWidth - targetSize)
                 val targetY = (maxHeight * point.y - targetSize / 2).coerceIn(0.dp, maxHeight - targetSize)
-                Box(Modifier.offset(targetX, targetY).size(targetSize).graphicsLayer { alpha = opacity }
+                Box(Modifier.offset(targetX, targetY).size(targetSize).graphicsLayer {
+                    alpha = opacity
+                    scaleX = scale.value
+                    scaleY = scale.value
+                    translationX = shake.value.dp.toPx()
+                }
                     .testTag(if (isExposure) "Exposure metering reticle" else "Tap metering reticle")
                     .languageSemantics { language ->
                         this[MeteringTargetOpacity] = opacity
@@ -159,43 +180,43 @@ internal fun ViewfinderMeteringOverlay(
                             onDoubleTap = { interaction++; onReset() })
                     })) {
                     Canvas(Modifier.fillMaxSize().padding(4.dp)) {
-                        val radius = size.minDimension / 2
-                        val corner = Path().apply {
-                            val leg = size.minDimension * .25f
-                            val rounding = size.minDimension * .10f
-                            moveTo(0f, leg)
-                            lineTo(0f, rounding)
-                            quadraticTo(0f, 0f, rounding, 0f)
-                            lineTo(leg, 0f)
-                        }
-                        for ((outline, width) in listOf(Color.Black.copy(alpha = .8f) to 4.dp.toPx(), color to 1.6.dp.toPx())) {
+                        val stroke = 1.5.dp.toPx()
+                        val tick = 4.dp.toPx()
+                        // A soft dark edge keeps the target visible on bright subjects.
+                        for ((ink, width) in listOf(Color.Black.copy(alpha = .35f) to stroke + 2.dp.toPx(), color to stroke)) {
                             if (isExposure) {
-                                drawCircle(outline, radius, style = Stroke(width))
+                                val radius = size.minDimension / 2 - stroke
+                                drawCircle(ink, radius, style = Stroke(width))
                                 repeat(4) { rotate(it * 90f) {
-                                    drawLine(outline, Offset(center.x, 0f), Offset(center.x, 4.dp.toPx()), width, StrokeCap.Round)
+                                    drawLine(ink, Offset(center.x, center.y - radius), Offset(center.x, center.y - radius + tick),
+                                        width, StrokeCap.Round)
                                 } }
                             } else {
-                                repeat(4) { rotate(it * 90f) { drawPath(corner, outline, style = Stroke(width, cap = StrokeCap.Round)) } }
-                                val cross = 3.dp.toPx()
-                                drawLine(outline, center - Offset(cross, 0f), center + Offset(cross, 0f), width, StrokeCap.Round)
-                                drawLine(outline, center - Offset(0f, cross), center + Offset(0f, cross), width, StrokeCap.Round)
+                                val inset = stroke
+                                val corner = 7.dp.toPx()
+                                drawRoundRect(ink, Offset(inset, inset), androidx.compose.ui.geometry.Size(size.width - inset * 2,
+                                    size.height - inset * 2), androidx.compose.ui.geometry.CornerRadius(corner), style = Stroke(width))
+                                repeat(4) { rotate(it * 90f) {
+                                    drawLine(ink, Offset(center.x, inset), Offset(center.x, inset + tick), width, StrokeCap.Round)
+                                } }
+                                drawCircle(ink, 1.4.dp.toPx() + (width - stroke) / 2, center)
                             }
                         }
                     }
                 }
-                if (maxWidth >= 66.dp && maxHeight >= 88.dp) {
+                if (maxWidth >= 52.dp && maxHeight >= 64.dp) {
                     val rotation = LocalCameraRotation.current
                     val grouped = !isExposure && !exposureStatus.hidden && exposureStatus.generation != 0L && exposureStatus.phase != TapMeteringPhase.IDLE &&
                         kotlin.math.abs(point.x - exposureStatus.normalizedX) < .001f &&
                         kotlin.math.abs(point.y - exposureStatus.normalizedY) < .001f
-                    val labelTop = if (grouped) (maxHeight * point.y - 44.dp).coerceIn(0.dp, maxHeight - 88.dp) else targetY
+                    val labelTop = if (grouped) (maxHeight * point.y - 32.dp).coerceIn(0.dp, maxHeight - 64.dp) else targetY
                     Layout(content = { RotatingCameraPanel(rotation) {
                         Text(label, Modifier.testTag(if (isExposure) "Exposure target label" else "Focus target label")
                             .semantics { if (hidden) hideFromAccessibility() }
-                            .background(CameraColors.MenuBackground, RoundedCornerShape(5.dp))
-                            .border(.5.dp, color.copy(alpha = .5f), RoundedCornerShape(5.dp))
-                            .padding(horizontal = 6.dp, vertical = 2.dp),
-                            color = color, fontSize = 10.sp, lineHeight = 14.sp, fontWeight = FontWeight.Medium, maxLines = 1)
+                            .background(Color.Black.copy(alpha = .45f), RoundedCornerShape(4.dp))
+                            .padding(horizontal = 4.dp, vertical = 1.dp),
+                            color = color, fontSize = 9.sp, lineHeight = 12.sp, fontWeight = FontWeight.SemiBold,
+                            letterSpacing = .6.sp, maxLines = 1, translate = false)
                     } }, modifier = Modifier.fillMaxSize().graphicsLayer { alpha = opacity }) { measurables, constraints ->
                         val label = measurables.single().measure(Constraints(maxWidth = constraints.maxWidth, maxHeight = constraints.maxHeight))
                         val left = (targetX.roundToPx() + (targetSize.roundToPx() - label.width) / 2)

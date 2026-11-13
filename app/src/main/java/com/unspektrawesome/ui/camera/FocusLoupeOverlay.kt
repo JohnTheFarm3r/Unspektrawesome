@@ -107,6 +107,8 @@ internal fun FocusLoupeLayer(
     manualActive: Boolean,
     tapEnabled: Boolean,
     tapStatus: TapMeteringStatus,
+    /** True while a camera button is half pressed; the tap loupe then stays open until it is released. */
+    held: Boolean = false,
     status: FocusLoupeStatus,
     zoom: LoupeZoom,
     peaking: Float,
@@ -139,6 +141,12 @@ internal fun FocusLoupeLayer(
         }
     }
     LaunchedEffect(tapEnabled) { if (!tapEnabled) { tapVisible = false; pinned = false } }
+    var wasHeld by remember { mutableStateOf(false) }
+    LaunchedEffect(held) {
+        // Releasing the half press, or pressing fully to take the photo, closes the loupe it opened.
+        if (!held && wasHeld && !pinned) tapVisible = false
+        wasHeld = held
+    }
     // A point chosen on the viewfinder while focusing manually; it also reopens a closed loupe.
     LaunchedEffect(targetRequest?.generation) {
         val request = targetRequest ?: return@LaunchedEffect
@@ -157,10 +165,10 @@ internal fun FocusLoupeLayer(
     }
     // Hide two seconds after focusing finishes, or after a focus attempt that never reports a result.
     val focusFinished = tapStatus.phase != TapMeteringPhase.METERING && tapStatus.phase != TapMeteringPhase.IDLE
-    LaunchedEffect(tapVisible, pinned, focusFinished, tapStatus.generation) {
+    LaunchedEffect(tapVisible, pinned, focusFinished, tapStatus.generation, held) {
         hiding = false
         hideProgress.snapTo(1f)
-        if (!tapVisible || pinned) return@LaunchedEffect
+        if (!tapVisible || pinned || held) return@LaunchedEffect
         if (!focusFinished) kotlinx.coroutines.delay(LOUPE_FOCUS_TIMEOUT_MS)
         hiding = true
         hideProgress.animateTo(0f, tween(LOUPE_HIDE_MS, easing = LinearEasing))

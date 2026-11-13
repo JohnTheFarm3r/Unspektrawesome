@@ -14,7 +14,7 @@ import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.platform.ViewConfiguration
 import androidx.compose.ui.semantics.Role
 
-/** How long the shutter must be held to start a recording with exposure, focus and white balance locked. */
+/** How long the shutter must be held to start a recording with the chosen controls locked. */
 internal const val SHUTTER_LOCK_HOLD_MS = 1_000L
 
 @Composable

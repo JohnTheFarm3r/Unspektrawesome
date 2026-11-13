@@ -65,6 +65,14 @@ enum class ViewfinderSource(val label: String) {
     ISP("Camera ISP"),
 }
 
+/** How on-screen text and buttons turn. Photos and videos always follow how the phone is held. */
+enum class UiOrientation(val label: String, val detail: String) {
+    AUTOMATIC("Automatic", "Text and buttons turn with the phone, even when the system rotation lock is on."),
+    FOLLOW_SYSTEM("Follow system", "Text and buttons turn with the phone only while system auto-rotate is on."),
+    PORTRAIT("Portrait", "Text and buttons always stay in portrait."),
+    LANDSCAPE("Landscape", "Text and buttons always stay in landscape."),
+}
+
 const val DEFAULT_CONTROL_OPACITY = .8f
 
 private fun normalizeControlOpacity(value: Float): Float =
@@ -87,6 +95,7 @@ data class CameraPreferences(
     val shutterTimerSeconds: Int = 0,
     val passiveFocusIntervalSeconds: Int = 0,
     val modeSwipeEnabled: Boolean = true,
+    val uiOrientation: UiOrientation = UiOrientation.AUTOMATIC,
     val maxBrightness: Boolean = false,
     val extendTallCropPreview: Boolean = true,
     val controlOpacity: Float = DEFAULT_CONTROL_OPACITY,
@@ -97,6 +106,8 @@ data class CameraPreferences(
     val performanceOverlay: Boolean = false,
     val recordingBufferMb: Int = 512,
     val videoAudioFormat: VideoAudioFormat = VideoAudioFormat.AAC,
+    /** What holding the shutter in video mode locks for the recording it starts. */
+    val recordingLock: com.unspektrawesome.video.RecordingLock = com.unspektrawesome.video.RecordingLock(),
     val burstPreShutterSeconds: Int = 1,
     val histogramEnabled: Boolean = false,
     val histogramSize: HistogramSize = HistogramSize.SMALL,
@@ -128,7 +139,19 @@ data class CameraPreferences(
     val activeLensProfileId: String? = null,
     val defaultLensProfileId: String? = null,
     val autoLensDiscoveryConfigured: Boolean = false,
+    /** Capture mode whose lens profiles the viewfinder offers. */
+    val lensProfileMode: LensProfileMode = LensProfileMode.PHOTO,
+    val defaultVideoLensProfileId: String? = null,
+    /** Profile last used in the capture mode that is not in use. */
+    val idleLensProfileId: String? = null,
 ) {
+    /** Profile that [mode] starts with. */
+    fun defaultLensProfileId(mode: LensProfileMode): String? =
+        if (mode == LensProfileMode.VIDEO) defaultVideoLensProfileId else defaultLensProfileId
+
+    /** Lens profiles of [mode] in their saved order. */
+    fun lensProfiles(mode: LensProfileMode): List<LensProfile> = lensProfiles.filter { it.mode == mode }
+
     /** Viewfinder peaking; the loupe replaces it when selected. */
     fun peakingStrengthFor(autoFocus: Boolean): FocusPeakingStrength? = when {
         focusAssist == FocusAssist.LOUPE -> null
@@ -217,6 +240,9 @@ class CameraPreferencesStore(context: Context) {
             shutterTimerSeconds = preferences.getInt("shutter_timer_seconds", 0).coerceIn(0, 30),
             passiveFocusIntervalSeconds = preferences.getInt("passive_focus_interval_seconds", 0).coerceIn(0, 60),
             modeSwipeEnabled = preferences.getBoolean("mode_swipe_enabled", true),
+            uiOrientation = UiOrientation.entries.firstOrNull {
+                it.name == preferences.getString("ui_orientation", null)
+            } ?: UiOrientation.AUTOMATIC,
             maxBrightness = preferences.getBoolean("max_brightness", false),
             extendTallCropPreview = preferences.getBoolean("extend_tall_crop_preview", true),
             controlOpacity = normalizeControlOpacity(preferences.getFloat("control_opacity", DEFAULT_CONTROL_OPACITY)),
@@ -234,6 +260,11 @@ class CameraPreferencesStore(context: Context) {
             videoAudioFormat = VideoAudioFormat.entries.firstOrNull {
                 it.name == preferences.getString("video_audio_format", null)
             } ?: VideoAudioFormat.AAC,
+            recordingLock = com.unspektrawesome.video.RecordingLock(
+                shutter = preferences.getBoolean("recording_lock_shutter", true),
+                iso = preferences.getBoolean("recording_lock_iso", true),
+                focus = preferences.getBoolean("recording_lock_focus", true),
+                whiteBalance = preferences.getBoolean("recording_lock_white_balance", true)),
             burstPreShutterSeconds = preferences.getInt("burst_pre_shutter_seconds", 1).coerceIn(1, 5),
             histogramEnabled = preferences.getBoolean("histogram_enabled", false),
             exposureZebraEnabled = preferences.getBoolean("exposure_zebra_enabled", false),
@@ -263,6 +294,11 @@ class CameraPreferencesStore(context: Context) {
             lensProfiles = LensProfiles.decode(preferences.getString("lens_profiles", null), defaultAeEngine = legacyAeEngine),
             activeLensProfileId = preferences.getString("active_lens_profile", null),
             defaultLensProfileId = preferences.getString("default_lens_profile", null),
+            lensProfileMode = LensProfileMode.entries.firstOrNull {
+                it.name == preferences.getString("lens_profile_mode", null)
+            } ?: LensProfileMode.PHOTO,
+            defaultVideoLensProfileId = preferences.getString("default_video_lens_profile", null),
+            idleLensProfileId = preferences.getString("idle_lens_profile", null),
             enabledLensIds = preferences.getStringSet(KEY_ENABLED_LENSES, emptySet()).orEmpty().toSet(),
             lensSelectionConfigured = preferences.getBoolean(KEY_LENS_SELECTION_CONFIGURED, false),
             defaultLensId = preferences.getString(KEY_DEFAULT_LENS, null),
@@ -311,6 +347,7 @@ class CameraPreferencesStore(context: Context) {
             .putInt("shutter_timer_seconds", value.shutterTimerSeconds.coerceIn(0, 30))
             .putInt("passive_focus_interval_seconds", value.passiveFocusIntervalSeconds.coerceIn(0, 60))
             .putBoolean("mode_swipe_enabled", value.modeSwipeEnabled)
+            .putString("ui_orientation", value.uiOrientation.name)
             .putBoolean("max_brightness", value.maxBrightness)
             .putBoolean("extend_tall_crop_preview", value.extendTallCropPreview)
             .putFloat("control_opacity", normalizeControlOpacity(value.controlOpacity))
@@ -321,6 +358,10 @@ class CameraPreferencesStore(context: Context) {
             .putBoolean("performance_overlay", value.performanceOverlay)
             .putInt("recording_buffer_mb", value.recordingBufferMb.coerceIn(512, 4096))
             .putString("video_audio_format", value.videoAudioFormat.name)
+            .putBoolean("recording_lock_shutter", value.recordingLock.shutter)
+            .putBoolean("recording_lock_iso", value.recordingLock.iso)
+            .putBoolean("recording_lock_focus", value.recordingLock.focus)
+            .putBoolean("recording_lock_white_balance", value.recordingLock.whiteBalance)
             .putInt("burst_pre_shutter_seconds", value.burstPreShutterSeconds.coerceIn(1, 5))
             .putBoolean("histogram_enabled", value.histogramEnabled)
             .putBoolean("exposure_zebra_enabled", value.exposureZebraEnabled)
@@ -348,6 +389,9 @@ class CameraPreferencesStore(context: Context) {
             .putString("lens_profiles", LensProfiles.encode(value.lensProfiles))
             .putString("active_lens_profile", value.activeLensProfileId)
             .putString("default_lens_profile", value.defaultLensProfileId)
+            .putString("lens_profile_mode", value.lensProfileMode.name)
+            .putString("default_video_lens_profile", value.defaultVideoLensProfileId)
+            .putString("idle_lens_profile", value.idleLensProfileId)
             .putStringSet(KEY_ENABLED_LENSES, value.enabledLensIds)
             .putBoolean(KEY_LENS_SELECTION_CONFIGURED, value.lensSelectionConfigured)
             .putString(KEY_DEFAULT_LENS, value.defaultLensId)

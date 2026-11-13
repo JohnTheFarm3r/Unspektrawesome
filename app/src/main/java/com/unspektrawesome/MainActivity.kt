@@ -39,8 +39,9 @@ import androidx.lifecycle.Lifecycle
 import com.unspektrawesome.camera.CameraDiscovery
 import com.unspektrawesome.camera.CameraDescriptor
 import com.unspektrawesome.camera.CameraOrientation
-import com.unspektrawesome.camera.CameraHardwareKeyHandler
-import com.unspektrawesome.settings.VolumeButtonAction
+import com.unspektrawesome.controls.ControlAction
+import com.unspektrawesome.controls.ControlBindings
+import com.unspektrawesome.controls.ControlInputRouter
 import com.unspektrawesome.capture.CaptureGeometry
 import com.unspektrawesome.capture.FrameGeometrySnapshot
 import com.unspektrawesome.gallery.GalleryActivity
@@ -48,6 +49,8 @@ import com.unspektrawesome.gallery.GALLERY_GUIDE_REVISION
 import com.unspektrawesome.gallery.PhotoViewerActivity
 import com.unspektrawesome.settings.CameraPreferences
 import com.unspektrawesome.settings.LensProfiles
+import com.unspektrawesome.settings.LensProfileMode
+import com.unspektrawesome.settings.copyProfiles
 import com.unspektrawesome.settings.lensToneKey
 import com.unspektrawesome.settings.rawEdgeCrop
 import com.unspektrawesome.settings.rawLayoutOverride
@@ -113,9 +116,10 @@ open class MainActivity : ComponentActivity() {
             lensCorrections = lensCorrections,
         )
     }
+    private val lensTones by lazy { com.unspektrawesome.settings.SharedPreferencesLensToneStorage(this) }
     private val lensCorrections: com.unspektrawesome.settings.LensCorrectionCoordinator by lazy {
         com.unspektrawesome.settings.LensCorrectionCoordinator(
-            tones = com.unspektrawesome.settings.SharedPreferencesLensToneStorage(this),
+            tones = lensTones,
             exposure = com.unspektrawesome.settings.LensExposureStore(this),
             preferences = { cameraPreferences },
             selectedRouteId = { selectedLensId },
@@ -125,9 +129,18 @@ open class MainActivity : ComponentActivity() {
         )
     }
     private val cameraPreferencesStore by lazy { CameraPreferencesStore(this) }
-    private val hardwareKeys = CameraHardwareKeyHandler()
     private var spektraAeFeedbackId by mutableIntStateOf(0)
-    private var hardwareShutter: (() -> Unit)? = null
+    private var hardwareControls: ((ControlAction, Int) -> Unit)? = null
+    private val controlInputs = ControlInputRouter(bindings = { ControlBindings.state.value }, handler = {
+        hardwareControls?.takeIf { lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) && hasWindowFocus() }
+    }, feedback = { step ->
+        // No vibration while recording, where the microphone and the image would pick it up.
+        if (!previewController.videoState.value.busy) window.decorView.performHapticFeedback(
+            if (step) android.view.HapticFeedbackConstants.CLOCK_TICK else android.view.HapticFeedbackConstants.VIRTUAL_KEY)
+    })
+    private val usbControls by lazy {
+        com.unspektrawesome.controls.UsbControlReader(this, controlInputs::onDirectButton, controlInputs::onDirectWheel)
+    }
     private val onboardingPreferences by lazy { getSharedPreferences("onboarding", MODE_PRIVATE) }
     private var onboardingCompleted by mutableStateOf(false)
     private var storageAccessReviewed by mutableStateOf(false)
@@ -169,17 +182,34 @@ open class MainActivity : ComponentActivity() {
                 val resolved = CameraOrientation.resolve(orientation, deviceOrientationDegrees)
                 if (resolved == deviceOrientationDegrees) return
                 deviceOrientationDegrees = resolved
+                landscapeSideDegrees = CameraOrientation.landscapeSide(resolved, landscapeSideDegrees)
                 previewController.updateDeviceOrientation(resolved)
             }
         }
     }
+    private var landscapeSideDegrees by mutableIntStateOf(CameraOrientation.DEFAULT_LANDSCAPE_DEGREES)
+    // Orientation held by the system rotation lock, or null while system auto-rotate is on.
+    private var systemLockedOrientationDegrees by mutableStateOf<Int?>(null)
+    private val systemRotationObserver =
+        object : android.database.ContentObserver(android.os.Handler(android.os.Looper.getMainLooper())) {
+            override fun onChange(selfChange: Boolean) = readSystemRotation()
+        }
+    // Text and buttons follow the chosen setting. Capture always follows deviceOrientationDegrees.
+    private val uiOrientationDegrees: Int
+        get() = CameraOrientation.uiOrientation(cameraPreferences.uiOrientation, deviceOrientationDegrees,
+            landscapeSideDegrees, systemLockedOrientationDegrees)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         enableEdgeToEdge()
         hideStatusBar()
-        cameraPreferences = cameraPreferencesStore.load()
+        cameraPreferences = loadCameraPreferences()
+        ControlBindings.initialize(this, cameraPreferences)
+        com.unspektrawesome.controls.DirectUsbControls.initialize(this)
+        discoveryScope.launch {
+            com.unspektrawesome.controls.DirectUsbControls.enabled.collect { usbControls.refresh() }
+        }
         selectedLensId = cameraPreferences.defaultLensId
         onboardingCompleted = guideProgress.load("introduction", ONBOARDING_REVISION, ONBOARDING_PAGES) == ONBOARDING_PAGES
         storageAccessReviewed = !com.unspektrawesome.ui.onboarding.StorageAccessSetup.needed(this)
@@ -206,7 +236,7 @@ open class MainActivity : ComponentActivity() {
         setContent {
             val language by AppLanguage.state.collectAsState()
             if (!language.choiceMade) {
-                UnspektrawesomeTheme(CameraOrientation.controlRotation(deviceOrientationDegrees)) {
+                UnspektrawesomeTheme(CameraOrientation.controlRotation(uiOrientationDegrees)) {
                     LanguagePicker(firstLaunch = true) {
                         if (onboardingCompleted && cameraPermissionGranted) startCamera()
                     }
@@ -214,7 +244,7 @@ open class MainActivity : ComponentActivity() {
                 return@setContent
             }
             if (!storageAccessReviewed) {
-                UnspektrawesomeTheme(CameraOrientation.controlRotation(deviceOrientationDegrees)) {
+                UnspektrawesomeTheme(CameraOrientation.controlRotation(uiOrientationDegrees)) {
                     com.unspektrawesome.ui.onboarding.StorageAccessOnboarding {
                         storageAccessReviewed = true
                         if (onboardingCompleted && cameraPermissionGranted) startCamera()
@@ -223,7 +253,7 @@ open class MainActivity : ComponentActivity() {
                 return@setContent
             }
             if (discoveryVisible) {
-                UnspektrawesomeTheme(CameraOrientation.controlRotation(deviceOrientationDegrees)) {
+                UnspektrawesomeTheme(CameraOrientation.controlRotation(uiOrientationDegrees)) {
                     AutoLensDiscoveryDialog(discoveryProgress, discoveryReport, discoveryMessage,
                         onStart = ::startAutoLensDiscovery,
                         onResume = ::resumeAutoLensDiscovery,
@@ -237,7 +267,7 @@ open class MainActivity : ComponentActivity() {
                 }
             }
             if (!onboardingCompleted || !cameraPermissionGranted) {
-                UnspektrawesomeTheme(CameraOrientation.controlRotation(deviceOrientationDegrees)) {
+                UnspektrawesomeTheme(CameraOrientation.controlRotation(uiOrientationDegrees)) {
                     OnboardingFlow(
                         activity = this@MainActivity,
                         showIntroduction = !onboardingCompleted,
@@ -252,7 +282,7 @@ open class MainActivity : ComponentActivity() {
                 if (!shaderPreparation.blocksCamera && lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) startCamera()
             }
             if (shaderPreparation.blocksCamera) {
-                UnspektrawesomeTheme(CameraOrientation.controlRotation(deviceOrientationDegrees)) {
+                UnspektrawesomeTheme(CameraOrientation.controlRotation(uiOrientationDegrees)) {
                     Box(Modifier.fillMaxSize().background(CameraColors.Background))
                     if (shaderPreparation.showDialog) ShaderPreparationDialog(shaderPreparation, shaderWarmup::hideProgress)
                 }
@@ -262,6 +292,7 @@ open class MainActivity : ComponentActivity() {
             val lensSessionRecovery by previewController.lensSessionRecovery.collectAsState()
             val captureStatus by previewController.captureStatus.collectAsState()
             val videoState by previewController.videoState.collectAsState()
+            LaunchedEffect(videoState.enabled) { showLensProfiles(videoState.enabled) }
             val burstState by previewController.burstStatus.collectAsState()
             val panoramaState by previewController.panoramaState.collectAsState()
             val panoramaExport by previewController.panoramaExportRequest.collectAsState()
@@ -357,7 +388,7 @@ open class MainActivity : ComponentActivity() {
                 cameraLocation.configure(cameraPreferences.saveLocation,
                     cameraToolsVisible && lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
             }
-            UnspektrawesomeTheme(CameraOrientation.controlRotation(deviceOrientationDegrees)) {
+            UnspektrawesomeTheme(CameraOrientation.controlRotation(uiOrientationDegrees)) {
                 val updates = rememberUpdateController()
                 // Pause the camera while an update is offered, but never interrupt a capture or recording.
                 val pauseForUpdate = updates.visible && updates.state.release != null && !captureStatus.acquiringFrame &&
@@ -501,7 +532,7 @@ open class MainActivity : ComponentActivity() {
                         } else previewController.captureStill()
                     },
                     onLockedRecording = { if (videoState.enabled && !videoState.busy) startVideo(lockControls = true) },
-                    onHardwareShutterChanged = { hardwareShutter = it },
+                    onHardwareControlsChanged = { hardwareControls = it },
                     onOpenGallery = { if (!burstState.busy && !panoramaState.busy) whenUnlocked {
                         if (panoramaState.enabled && panoramaState.frames >= 2) startActivity(GalleryActivity.intent(this@MainActivity, processing = true))
                         else openGallery(captureStatus.lastUri)
@@ -520,9 +551,8 @@ open class MainActivity : ComponentActivity() {
                     onCropTransitionFinished = previewController::completeCropTransition,
                     readPreviewPerformance = previewController::samplePreviewPerformance,
                     readHistogram = { _, cropAspect -> previewController.sampleHistogram(cropAspect) },
-                    controlRotationDegrees = CameraOrientation.controlRotation(
-                        deviceOrientationDegrees,
-                    ),
+                    controlRotationDegrees = CameraOrientation.controlRotation(uiOrientationDegrees),
+                    deviceRotationDegrees = CameraOrientation.controlRotation(deviceOrientationDegrees),
                     lensSwitching = previewStatus.lensSwitching || (hasCameraPermission() && previewStatus.phase in setOf(
                         RawPreviewPhase.IDLE, RawPreviewPhase.PAUSED, RawPreviewPhase.WAITING_FOR_SURFACE, RawPreviewPhase.OPENING)),
                     startupLoading = hasCameraPermission() && !previewStatus.viewfinderReady &&
@@ -583,10 +613,14 @@ open class MainActivity : ComponentActivity() {
         super.onResume()
         com.unspektrawesome.gallery.GalleryProcessing.cameraVisible = true
         if (com.unspektrawesome.gallery.GalleryProcessing.state.value.running) com.unspektrawesome.gallery.GalleryProcessing.pause()
-        cameraPreferences = cameraPreferencesStore.load()
+        cameraPreferences = loadCameraPreferences()
         hideStatusBar()
+        readSystemRotation()
+        for (setting in listOf(android.provider.Settings.System.ACCELEROMETER_ROTATION, android.provider.Settings.System.USER_ROTATION))
+            contentResolver.registerContentObserver(android.provider.Settings.System.getUriFor(setting), false, systemRotationObserver)
         cameraLocation.configure(cameraPreferences.saveLocation, cameraToolsVisible)
         cameraPermissionGranted = hasCameraPermission()
+        usbControls.start()
         if (AppLanguage.state.value.choiceMade && onboardingCompleted && cameraPermissionGranted) {
             startCamera()
             if (cameraStarted) {
@@ -599,54 +633,36 @@ open class MainActivity : ComponentActivity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (!hasFocus) hardwareKeys.reset()
+        if (!hasFocus) controlInputs.reset()
         if (hasFocus) hideStatusBar()
     }
 
     // This public Activity hook inherits the restriction on AndroidX's internal base class.
     @SuppressLint("RestrictedApi")
-    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (event.action == KeyEvent.ACTION_UP &&
-            hardwareKeys.onKeyUp(event.keyCode, event.deviceId, event.downTime)) return true
-        if (event.action != KeyEvent.ACTION_DOWN) return super.dispatchKeyEvent(event)
-        val shutter = hardwareShutter
-        val action = if (shutter != null && lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) && hasWindowFocus()) {
-            hardwareKeys.actionFor(event.keyCode, event.device?.isExternal == true, cameraPreferences)
-        } else VolumeButtonAction.SYSTEM_VOLUME
-        if (hardwareKeys.onKeyDown(event.keyCode, event.repeatCount, action, event.deviceId, event.downTime) { mappedAction ->
-            val direction = mappedAction.direction
-            when (mappedAction) {
-                VolumeButtonAction.SHUTTER -> shutter?.invoke()
-                VolumeButtonAction.DEVICE_EV_UP, VolumeButtonAction.DEVICE_EV_DOWN -> {
-                    val controls = previewController.cameraControls.value
-                    if (!controls.autoExposure || controls.exposureCompensationMin >= controls.exposureCompensationMax) {
-                        android.widget.Toast.makeText(this, AppLanguage.text("Device EV needs Auto exposure on a supported lens"), android.widget.Toast.LENGTH_SHORT).show()
-                    } else previewController.stepExposureCompensation(direction)
-                }
-                VolumeButtonAction.SPEKTRA_AE_NEXT, VolumeButtonAction.SPEKTRA_AE_PREVIOUS -> {
-                    if (previewController.cameraControls.value.customAe || previewController.panoramaState.value.enabled) {
-                        android.widget.Toast.makeText(this, AppLanguage.text("Unspektra AE is active. Digital auto exposure is off."), android.widget.Toast.LENGTH_SHORT).show()
-                    } else {
-                        spektraRepository.updateParams { com.unspektrawesome.camera.VolumeExposure.cycle(it, direction) }
-                        spektraAeFeedbackId++
-                    }
-                }
-                VolumeButtonAction.SYSTEM_VOLUME -> Unit
-            }
-        }) {
-            return true
-        }
-        return super.dispatchKeyEvent(event)
-    }
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean =
+        controlInputs.onKey(event) || super.dispatchKeyEvent(event)
+
+    override fun dispatchGenericMotionEvent(event: android.view.MotionEvent): Boolean =
+        controlInputs.onMotion(event) || super.dispatchGenericMotionEvent(event)
 
     override fun onPause() {
         discoveryJob?.cancel()
         cameraLocation.configure(cameraPreferences.saveLocation, false)
-        hardwareKeys.reset()
+        usbControls.stop()
+        controlInputs.reset()
         com.unspektrawesome.gallery.GalleryProcessing.cameraVisible = false
         spektraAeFeedbackId = 0
         if (cameraStarted) orientationListener.disable()
+        contentResolver.unregisterContentObserver(systemRotationObserver)
         super.onPause()
+    }
+
+    private fun readSystemRotation() {
+        val autoRotate = android.provider.Settings.System.getInt(contentResolver,
+            android.provider.Settings.System.ACCELEROMETER_ROTATION, 0) == 1
+        systemLockedOrientationDegrees = if (autoRotate) null else CameraOrientation.fromDisplayRotation(
+            android.provider.Settings.System.getInt(contentResolver,
+                android.provider.Settings.System.USER_ROTATION, android.view.Surface.ROTATION_0))
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -748,7 +764,8 @@ open class MainActivity : ComponentActivity() {
             runOnUiThread {
                 if (isDestroyed || discoveryProgress.running) return@runOnUiThread
                 result.onSuccess { discovered ->
-                    var currentPreferences = cameraPreferences
+                    // The lens list follows the capture mode the camera is in right now.
+                    var currentPreferences = cameraPreferences.copy(lensProfileMode = captureLensProfileMode())
                     if (cachedReport != null && currentPreferences.lensProfiles.isEmpty()) {
                         currentPreferences = AutoLensProfiles.apply(cachedReport, currentPreferences, discovered)
                     }
@@ -782,6 +799,35 @@ open class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    private fun captureLensProfileMode(): LensProfileMode =
+        if (previewController.videoState.value.enabled) LensProfileMode.VIDEO else LensProfileMode.PHOTO
+
+    /**
+     * Loads the saved settings. Stabilization saved beside the lens profiles by earlier versions moves into the
+     * profiles, and lens profiles saved before photo and video had separate lists are copied to video.
+     */
+    private fun loadCameraPreferences(): CameraPreferences {
+        val saved = cameraPreferencesStore.load()
+        val stabilization = com.unspektrawesome.settings.LensStabilizationStore(this)
+        val (filled, copies) = LensProfiles.fillModes(stabilization.moveToProfiles(saved))
+        if (copies.isNotEmpty())
+            lensTones.copyProfiles(copies, com.unspektrawesome.spektra.LensTone.of(spektraRepository.state.value.params))
+        if (filled != saved) cameraPreferencesStore.save(filled)
+        stabilization.markMoved()
+        return filled
+    }
+
+    /** Offers the video lens profiles in video mode and the photo lens profiles otherwise. */
+    private fun showLensProfiles(video: Boolean) {
+        val mode = if (video) LensProfileMode.VIDEO else LensProfileMode.PHOTO
+        if (cameraPreferences.lensProfileMode == mode) return
+        if (cameras.isEmpty()) {
+            // Lenses are not known yet. Camera discovery selects the profile for this mode.
+            cameraPreferences = cameraPreferences.copy(lensProfileMode = mode)
+            cameraPreferencesStore.save(cameraPreferences)
+        } else saveCameraPreferences(LensProfiles.switchMode(cameraPreferences, mode, cameras))
     }
 
     private fun selectLens(routeId: String) {

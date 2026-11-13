@@ -13,6 +13,8 @@ internal object CameraColors {
     val Accent = Color(0xFFDDFE52)
     val ExposurePriority = Color(0xFF8CCEFF)
     val FocusFailed = Color(0xFFFF756B)
+    /** Focus target once autofocus has locked, as in camera apps. */
+    val FocusLocked = Color(0xFF4ADE80)
     val SlowShutter = FocusFailed
     val Warning = Color(0xFFFFD54F)
     val Background = Color.Black

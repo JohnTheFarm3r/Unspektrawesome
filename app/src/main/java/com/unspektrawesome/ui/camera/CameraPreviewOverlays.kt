@@ -68,6 +68,8 @@ internal fun CameraPreviewOverlays(
     expandedSliders: Set<PreviewSlider> = emptySet(),
     loupe: Rect? = null,
     video: @Composable () -> Unit = {},
+    // The grid guide follows how the phone is held, which can differ from the control rotation.
+    gridRotation: Float = rotation,
 ) {
     val landscape = abs(rotation) == 90f
     val shutterVisibility = remember { MutableTransitionState(false) }
@@ -114,11 +116,12 @@ internal fun CameraPreviewOverlays(
         banner?.let { obstacles += CameraArea(it.left.dp.toPx(), it.top.dp.toPx(), it.width.dp.toPx(), it.height.dp.toPx()) }
         idleGrid?.takeIf { it.available }?.let { grid ->
             val inverse = gridTranspose(grid.rotation)
-            val radians = Math.toRadians(rotation.toDouble())
+            val radians = Math.toRadians(gridRotation.toDouble())
             val cosine = cos(radians).toFloat()
             val sine = sin(radians).toFloat()
-            val guideWidth = (if (landscape) viewport.height else viewport.width).dp.toPx()
-            val guideHeight = (if (landscape) viewport.width else viewport.height).dp.toPx()
+            val gridSideways = abs(gridRotation) == 90f
+            val guideWidth = (if (gridSideways) viewport.height else viewport.width).dp.toPx()
+            val guideHeight = (if (gridSideways) viewport.width else viewport.height).dp.toPx()
             val radius = 22.dp.toPx()
             for (index in 0..8) {
                 val point = gridVector(inverse, gridTarget(index, grid.width, grid.height, grid.focal))

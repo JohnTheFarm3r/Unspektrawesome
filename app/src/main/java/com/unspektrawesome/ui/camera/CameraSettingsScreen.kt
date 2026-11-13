@@ -43,7 +43,6 @@ import com.unspektrawesome.settings.DEFAULT_CONTROL_OPACITY
 import com.unspektrawesome.settings.SensorProfileCatalog
 import com.unspektrawesome.settings.ViewfinderResolutions
 import com.unspektrawesome.settings.rawLayoutOverride
-import com.unspektrawesome.settings.VolumeButtonAction
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
@@ -51,6 +50,7 @@ private enum class CameraSettingsTab(val label: String) {
     GENERAL("General"),
     VIEWFINDER("Viewfinder"),
     VIDEO("Video"),
+    BUTTONS("Buttons"),
     LENS_PROFILES("Lens Profiles"),
     ABOUT("About"),
 }
@@ -81,6 +81,7 @@ internal fun CameraSettingsScreen(
         if (processingGuideStep in 1..2) pager.scrollToPage(CameraSettingsTab.GENERAL.ordinal)
     }
     val scope = rememberCoroutineScope()
+    var assigningAction by remember { mutableStateOf<com.unspektrawesome.controls.ControlAction?>(null) }
     val profiles = remember(cameras, preferences) { SensorProfileCatalog.resolve(cameras, preferences) }
     AmbientScreen(Modifier.fillMaxSize()) {
         Scaffold(
@@ -146,6 +147,7 @@ internal fun CameraSettingsScreen(
                             locationStatus, onLocationEnabledChanged, onShowVideoGuide, burstState)
                         CameraSettingsTab.VIEWFINDER -> ViewfinderCameraSettings(preferences, onChange)
                         CameraSettingsTab.VIDEO -> VideoCameraSettings(preferences, onChange)
+                        CameraSettingsTab.BUTTONS -> ButtonSettings(isActive = pager.currentPage == page) { assigningAction = it }
                         CameraSettingsTab.LENS_PROFILES -> LensProfileSettings(profiles, preferences, rawImportCapabilities,
                             onChange, isActive = pager.currentPage == page, onAutoLensDiscovery = onAutoLensDiscovery, onCheckLensFrameRates = onCheckLensFrameRates)
                         CameraSettingsTab.ABOUT -> AboutScreen(onCheckForUpdates)
@@ -153,6 +155,7 @@ internal fun CameraSettingsScreen(
                 }
             }
         }
+        assigningAction?.let { action -> ButtonAssignOverlay(action) { assigningAction = null } }
         val visibleGuide = processingGuideStep.takeIf { it in 1..2 && pager.currentPage == CameraSettingsTab.GENERAL.ordinal }
         GuideTransition(visibleGuide) { displayedStep ->
             CameraProcessingGuide(displayedStep, guideTargets[if (displayedStep == 1) "later" else "now"],
@@ -233,20 +236,13 @@ private fun GeneralCameraSettings(
                 onChange(preferences.copy(modeSwipeEnabled = it))
             }
         }
-        SettingsCard("Volume buttons", symbol = SettingsSymbol.Volume,
-            trailing = {
-                CameraOverlayToggle(preferences.volumeButtonsEnabled, "Volume button controls") {
-                    onChange(preferences.copy(volumeButtonsEnabled = it))
-                }
-            }) {
-            SettingsDivider()
-            VolumeButtonSettings("Volume up", preferences.volumeUpAction, preferences.volumeButtonsEnabled) {
-                onChange(preferences.copy(volumeUpAction = it))
+        SettingsCard("Control orientation", symbol = SettingsSymbol.Phone) {
+            val orientations = com.unspektrawesome.settings.UiOrientation.entries
+            SettingsChoices(orientations.map { it.label }, orientations.indexOf(preferences.uiOrientation),
+                Modifier.testTag("Control orientation choices")) { index ->
+                onChange(preferences.copy(uiOrientation = orientations[index]))
             }
-            SettingsDivider()
-            VolumeButtonSettings("Volume down", preferences.volumeDownAction, preferences.volumeButtonsEnabled) {
-                onChange(preferences.copy(volumeDownAction = it))
-            }
+            SettingsHint(preferences.uiOrientation.detail)
         }
         SettingsSection("App")
         SettingsCard("Language", symbol = SettingsSymbol.Languages) { LanguageSettingsControls() }
@@ -279,7 +275,28 @@ private fun VideoCameraSettings(preferences: CameraPreferences, onChange: (Camer
         SettingsCard("Video recording", symbol = SettingsSymbol.Video) {
             RecordingBufferSetting(preferences.recordingBufferMb) { onChange(preferences.copy(recordingBufferMb = it)) }
         }
+        SettingsCard("Hold shutter to lock", symbol = SettingsSymbol.Lock) {
+            RecordingLockSetting(preferences.recordingLock) { onChange(preferences.copy(recordingLock = it)) }
+        }
     }
+}
+
+/** Chooses what a recording started by holding the shutter keeps fixed. */
+@Composable
+internal fun RecordingLockSetting(lock: com.unspektrawesome.video.RecordingLock,
+    onChange: (com.unspektrawesome.video.RecordingLock) -> Unit) {
+    SettingsHint(if (lock.any) "In video mode, hold the shutter for 1 second to record with the settings chosen here locked. They are released when recording stops."
+        else "With everything off, holding the shutter records without a lock.")
+    SettingsToggleRow("Lock shutter speed", lock.shutter, null) { onChange(lock.copy(shutter = it)) }
+    SettingsDivider()
+    SettingsToggleRow("Lock ISO", lock.iso, null) { onChange(lock.copy(iso = it)) }
+    // Only one of the two is a choice Android's automatic exposure cannot follow.
+    if (lock.shutter != lock.iso) SettingsHint(
+        "Lens profiles that use Android AE lock both, because Android AE cannot lock shutter speed and ISO separately.")
+    SettingsDivider()
+    SettingsToggleRow("Lock focus", lock.focus, null) { onChange(lock.copy(focus = it)) }
+    SettingsDivider()
+    SettingsToggleRow("Lock white balance", lock.whiteBalance, null) { onChange(lock.copy(whiteBalance = it)) }
 }
 
 @Composable
@@ -444,18 +461,6 @@ private fun SettingsDropdown(
     SettingsDropdownField(label, value, null, expanded, enabled,
         onExpand = { expanded = true }, onDismiss = { expanded = false }) {
         content { expanded = false }
-    }
-}
-
-@Composable
-private fun VolumeButtonSettings(label: String, action: VolumeButtonAction, enabled: Boolean, onChange: (VolumeButtonAction) -> Unit) {
-    SettingsDropdown(label, action.label, enabled) { dismiss ->
-        VolumeButtonAction.entries.forEach { choice ->
-            SettingsMenuChoice(choice.label, choice == action, choice.detail, "$label: ${choice.label}") {
-                onChange(choice)
-                dismiss()
-            }
-        }
     }
 }
 

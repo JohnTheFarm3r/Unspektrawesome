@@ -72,14 +72,17 @@ private fun LensProfileSettingsContent(
 ) {
     var editingId by rememberSaveable { mutableStateOf<String?>(null) }
     var renamingId by rememberSaveable { mutableStateOf<String?>(null) }
+    // Photo and video keep separate profile lists. The list opens on the capture mode in use.
+    var mode by rememberSaveable { mutableStateOf(preferences.lensProfileMode) }
     val sensors = profiles.associateBy { it.profile.id.value }
-    val transfer = rememberLensProfileTransfer(preferences, onChange)
+    val transfer = rememberLensProfileTransfer(preferences, mode, onChange)
     val scroll = rememberLazyListState()
     val haptics = LocalHapticFeedback.current
     var currentPreferences by remember { mutableStateOf(preferences) }
     currentPreferences = preferences
     val change by rememberUpdatedState(onChange)
-    val ids = preferences.lensProfiles.map { it.id }
+    val modeProfiles = preferences.lensProfiles.filter { it.mode == mode }
+    val ids = modeProfiles.map { it.id }
     val reorder = remember(ids.toSet(), scroll) {
         LensProfileReorderState(ids, scroll, { change(LensProfiles.reorder(currentPreferences, it)) },
             { haptics.performHapticFeedback(HapticFeedbackType.SegmentTick) })
@@ -103,7 +106,7 @@ private fun LensProfileSettingsContent(
         LazyColumn(Modifier.fillMaxSize().testTag("Lens profile list").reorderLensProfiles(reorder) {
             haptics.performHapticFeedback(HapticFeedbackType.LongPress)
         }, state = scroll, userScrollEnabled = reorder.draggedKey == null,
-            contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 20.dp, bottom = 32.dp),
+            contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 16.dp, bottom = 32.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)) {
             item(key = "lens-profile-header") {
                 SettingsCard("LENS PROFILES", symbol = SettingsSymbol.Discover) {
@@ -113,26 +116,34 @@ private fun LensProfileSettingsContent(
                     }
                     SettingsFieldPair(
                         first = { modifier -> SettingsButton("Export", modifier,
-                            enabled = !transfer.busy && preferences.lensProfiles.isNotEmpty(), symbol = SettingsSymbol.Export,
+                            enabled = !transfer.busy && modeProfiles.isNotEmpty(), symbol = SettingsSymbol.Export,
                             onClick = transfer.exportProfiles) },
                         second = { modifier -> SettingsButton("Import", modifier, enabled = !transfer.busy,
                             symbol = SettingsSymbol.Import, onClick = transfer.importProfile) },
                     )
                     if (transfer.busy) CircularProgressIndicator(Modifier.padding(12.dp).size(20.dp), color = CameraColors.Accent, strokeWidth = 2.dp)
-                    if (preferences.lensProfiles.isEmpty()) Text("No lens profiles. Run discovery or add a profile manually.", color = CameraColors.Muted)
+                    if (modeProfiles.isEmpty()) Text("No lens profiles. Run discovery or add a profile manually.", color = CameraColors.Muted)
                     var adding by remember { mutableStateOf(false) }
                     SettingsDropdownField("+ Add profile", "Lens", null, adding, enabled = profiles.isNotEmpty(),
                         onExpand = { adding = true }, onDismiss = { adding = false }) {
                         profiles.forEach { configured ->
                             val camera = configured.profile.primary
                             ProfileMenuItem("${camera.equivalentFocalLengthMm?.toInt()?.let { "${it}mm" } ?: camera.lensRole.label} · Lens ID ${camera.route.routeId}") {
-                                val updated = LensProfiles.add(preferences, configured.profile)
+                                val updated = LensProfiles.add(preferences, configured.profile, mode)
                                 onChange(updated)
                                 editingId = updated.lensProfiles.lastOrNull()?.id
                                 adding = false
                             }
                         }
                     }
+                }
+                // Photo and video keep separate profiles. The choice sits directly above the list it switches.
+                Column(Modifier.fillMaxWidth().padding(top = 20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SettingsChoices(listOf("Photo", "Video"), mode.ordinal, Modifier.testTag("Lens profile modes")) {
+                        mode = LensProfileMode.entries[it]
+                    }
+                    SettingsHint(if (mode == LensProfileMode.VIDEO) "These profiles appear in video mode."
+                        else "These profiles appear in photo mode.")
                 }
                 SettingsSection("Hold and drag to reorder")
             }
@@ -143,7 +154,7 @@ private fun LensProfileSettingsContent(
                     val output = sensors[profile.sensorId]?.profile?.paths?.firstOrNull { it.route.routeId == profile.routeId }
                         ?.let { LensProfiles.resolveRawOutput(profile.rawStream, it, profile.rawSession) }
                     val active = preferences.activeLensProfileId == profile.id
-                    val startup = preferences.defaultLensProfileId == profile.id
+                    val startup = preferences.defaultLensProfileId(mode) == profile.id
                     val moving = reorder.draggedKey == profile.id
                     val lifted = moving || reorder.settlingKey == profile.id
                     Surface(color = Color.Transparent,
@@ -185,7 +196,7 @@ private fun LensProfileSettingsContent(
                                     ProfileMenuItem("Rename", symbol = SettingsSymbol.Rename) { close { renamingId = profile.id } }
                                     ProfileMenuItem("Duplicate", symbol = SettingsSymbol.Duplicate) { close { onChange(LensProfiles.duplicate(preferences, profile.id)) } }
                                     ProfileMenuItem("Set as startup", available && profile.enabled, selected = startup, symbol = SettingsSymbol.Startup) { close {
-                                        onChange(preferences.copy(defaultLensProfileId = profile.id, defaultLensId = profile.routeId))
+                                        onChange(LensProfiles.setDefault(preferences, profile.id))
                                     } }
                                     ProfileMenuItem("Delete", LensProfiles.canDelete(preferences, profile.id), symbol = SettingsSymbol.Delete) { close { onChange(LensProfiles.delete(preferences, profile.id)) } }
                                 }
@@ -353,7 +364,11 @@ private fun LensProfileEditor(
         }
         SettingsSection("Capture")
         SettingsCard {
-            PhotoOisControl(profile.photoOisEnabled, photoOisSupported) { enabled -> update { it.copy(photoOisEnabled = enabled) } }
+            if (profile.mode == LensProfileMode.PHOTO) PhotoOisControl(profile.photoOisEnabled, photoOisSupported) { enabled ->
+                update { it.copy(photoOisEnabled = enabled) }
+            } else VideoStabilizationControls(profile.videoStabilization, photoOisSupported) { stabilization ->
+                update { it.copy(videoStabilization = stabilization) }
+            }
         }
         LensCaptureControls(camera, profile, onCheckLensFrameRates, isActive = isActive) { updated -> update { updated } }
         SettingsSection("Preview")
@@ -427,13 +442,67 @@ private fun LensProfileEditor(
 
 @Composable
 internal fun PhotoOisControl(enabled: Boolean, supported: Boolean, onChange: (Boolean) -> Unit) {
+    ProfileToggle("Photo OIS", enabled && supported, supported,
+        "OIS is unavailable for this lens".takeUnless { supported }, onChange)
+}
+
+/**
+ * Stabilization a video profile starts with. It follows the video menu: gyro capture turns OIS off, and live
+ * stabilization replaces both with its own settings.
+ */
+@Composable
+internal fun VideoStabilizationControls(value: VideoStabilization, oisSupported: Boolean, onChange: (VideoStabilization) -> Unit) {
+    Column(Modifier.fillMaxWidth().testTag("Video profile stabilization"), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        SettingsHint("This profile starts with these settings. Changes in the video menu last until you switch profiles or close the app.")
+        if (!value.liveStabilization) {
+            if (!value.captureGyro) ProfileToggle("OIS", value.ois && oisSupported, oisSupported,
+                "OIS is unavailable for this lens".takeUnless { oisSupported }) { onChange(value.copy(ois = it)) }
+            ProfileToggle("Capture gyro data", value.captureGyro, detail = "Save gyro data with video") {
+                onChange(value.copy(captureGyro = it))
+            }
+        }
+        ProfileToggle("Live gyro stabilization", value.liveStabilization) { onChange(value.copy(liveStabilization = it)) }
+        if (value.liveStabilization) {
+            val settings = value.settings
+            val defaults = com.unspektrawesome.video.LiveStabilizationSettings()
+            StabilizationSetting("Crop", "Stabilization crop", "{value1}x",
+                String.format(java.util.Locale.ROOT, "%.2f", settings.cropRatio), settings.cropRatio, 1f..1.5f,
+                defaults.cropRatio) { onChange(value.copy(settings = settings.copy(cropRatio = it))) }
+            StabilizationSetting("Smoothing", "Stabilization smoothing", "{value1} s",
+                String.format(java.util.Locale.ROOT, "%.2f", settings.smoothingSeconds), settings.smoothingSeconds, .05f..1f,
+                defaults.smoothingSeconds) { onChange(value.copy(settings = settings.copy(smoothingSeconds = it))) }
+            StabilizationSetting("Strength", "Stabilization strength", "{value1}%",
+                kotlin.math.round(settings.strength * 100).toInt().toString(), settings.strength, 0f..1f,
+                defaults.strength) { onChange(value.copy(settings = settings.copy(strength = it))) }
+        }
+    }
+}
+
+@Composable
+private fun ProfileToggle(label: String, checked: Boolean, enabled: Boolean = true, detail: String? = null,
+    onChange: (Boolean) -> Unit) {
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
             verticalArrangement = Arrangement.spacedBy(8.dp), itemVerticalAlignment = Alignment.CenterVertically) {
-            Text("Photo OIS", modifier = Modifier.padding(end = 12.dp), color = CameraColors.Text, fontSize = 13.sp)
-            CameraOverlayToggle(enabled && supported, "Photo OIS", supported, onChange)
+            Text(label, modifier = Modifier.padding(end = 12.dp), color = CameraColors.Text, fontSize = 13.sp)
+            CameraOverlayToggle(checked, label, enabled, onChange)
         }
-        if (!supported) Text("OIS is unavailable for this lens", color = CameraColors.Muted, fontSize = 11.sp, lineHeight = 15.sp)
+        if (detail != null) Text(detail, color = CameraColors.Muted, fontSize = 11.sp, lineHeight = 15.sp)
+    }
+}
+
+@Composable
+private fun StabilizationSetting(label: String, description: String, format: String, number: String, value: Float,
+    range: ClosedFloatingPointRange<Float>, default: Float, onChange: (Float) -> Unit) {
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(label, modifier = Modifier.weight(1f), color = CameraColors.Text, fontSize = 13.sp)
+            Text(format, arguments = mapOf("value1" to number), color = CameraColors.Accent, fontSize = 13.sp,
+                fontWeight = FontWeight.Medium)
+        }
+        CameraCompactSlider(value, { onChange(it.coerceIn(range)) }, enabled = true, valueRange = range, valueStep = .01f,
+            thumbSize = 16.dp, requireThumb = false, onReset = { onChange(default) },
+            modifier = Modifier.fillMaxWidth().languageSemantics { language -> contentDescription = language.text(description) })
     }
 }
 

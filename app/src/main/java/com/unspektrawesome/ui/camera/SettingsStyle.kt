@@ -43,11 +43,13 @@ internal enum class SettingsSymbol(@param:DrawableRes val drawable: Int) {
     Save(R.drawable.ic_settings_save),
     Layers(R.drawable.ic_settings_layers),
     Video(R.drawable.ic_settings_video),
+    Lock(R.drawable.ic_settings_lock),
     Focus(R.drawable.ic_settings_focus),
     Volume(R.drawable.ic_settings_volume_2),
     Languages(R.drawable.ic_settings_languages),
     Book(R.drawable.ic_settings_book_open),
     Monitor(R.drawable.ic_settings_monitor),
+    Phone(R.drawable.ic_settings_smartphone),
     Sliders(R.drawable.ic_settings_sliders_horizontal),
     Overlays(R.drawable.ic_settings_scan_line),
     Close(R.drawable.ic_settings_x),
@@ -74,6 +76,8 @@ internal enum class SettingsSymbol(@param:DrawableRes val drawable: Int) {
     ExternalLink(R.drawable.ic_settings_external_link),
     DcpImport(R.drawable.ic_settings_file_plus),
     Erase(R.drawable.ic_settings_eraser),
+    Gamepad(R.drawable.ic_settings_gamepad_2),
+    Add(R.drawable.ic_settings_plus),
 }
 
 @Composable

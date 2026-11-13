@@ -37,7 +37,8 @@ import com.unspektrawesome.settings.CameraPreferences
 import com.unspektrawesome.settings.VendorOverrides
 import com.unspektrawesome.settings.vendorOverrides
 import com.unspektrawesome.settings.LensExposureStore
-import com.unspektrawesome.settings.LensStabilizationStore
+import com.unspektrawesome.settings.LensProfileMode
+import com.unspektrawesome.settings.VideoStabilization
 import com.unspektrawesome.settings.aeLimits
 import com.unspektrawesome.settings.aeBalance
 import com.unspektrawesome.settings.RawLevelCalibration
@@ -78,6 +79,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
+import com.unspektrawesome.video.RecordingLock
 import com.unspektrawesome.video.VideoPhase
 import com.unspektrawesome.video.VideoRecording
 import com.unspektrawesome.video.VideoRecordingState
@@ -231,6 +233,8 @@ class RawVulkanPreviewController(
     private var retainedControls: Camera2RawSession.ControlState? = null
     private var retainedExposureMode = AeMode.AUTO
     private var lensSwitchExposure: SensorExposure? = null
+    // Lens profile that identifies the running session. It stays the same across a capture-mode switch on one lens.
+    private var sessionLensProfileId: String? = null
     private val pipelineCacheDirectory = java.io.File(context.cacheDir, "vulkan-pipelines").apply { mkdirs() }
     private val pipelineCachePath = java.io.File(pipelineCacheDirectory, "rendering").absolutePath
     private val cameraManager = context.applicationContext
@@ -340,16 +344,16 @@ class RawVulkanPreviewController(
     private var cropPreview: PhotoCrop? = null
 
     private val videoPreferences = applicationContext.getSharedPreferences("video_recording", Context.MODE_PRIVATE)
-    private val lensStabilizationStore = LensStabilizationStore(context)
-    private var stabilizationLensKey: String? = null
-    private val mutableVideoState = MutableStateFlow(lensStabilizationStore.load(null, VideoRecordingState(downscale = VideoDownscale.entries.firstOrNull {
+    /** Video lens profile whose stabilization is in use, with the values it had when they were loaded. */
+    private var loadedStabilization: Pair<String, VideoStabilization>? = null
+    private val mutableVideoState = MutableStateFlow(VideoRecordingState(downscale = VideoDownscale.entries.firstOrNull {
         it.name == videoPreferences.getString("downscale", null)
     } ?: VideoDownscale.FULL,
         chromaDenoise = videoPreferences.getBoolean("chroma_denoise", false),
         hotPixelRemoval = videoPreferences.getBoolean("hot_pixel_removal", false),
         chromaDenoiseStrength = videoPreferences.getFloat("chroma_denoise_strength", 1f)
             .takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 1f,
-        bitrate = videoPreferences.getInt("bitrate", 45_000_000))))
+        bitrate = videoPreferences.getInt("bitrate", 45_000_000)))
     val videoState: StateFlow<VideoRecordingState> = mutableVideoState.asStateFlow()
     @Volatile private var videoRecorder: VideoRecording? = null
     private val videoWorker = Executors.newSingleThreadExecutor { Thread(it, "VideoLifecycle") }
@@ -366,10 +370,11 @@ class RawVulkanPreviewController(
     private var recordingGeometry: FrameGeometrySnapshot? = null
     private var recordingCrop: PhotoCrop? = null
 
+    // The stabilization controls of the video menu change the running camera only. Each video lens profile keeps
+    // its own saved stabilization, which returns when the profile is selected again.
     fun setCaptureGyro(enabled: Boolean) { commands.submit { synchronized(lock) {
-        if (stabilizationLensKey == null) return@synchronized
+        if (configuredCamera == null) return@synchronized
         mutableVideoState.value = mutableVideoState.value.copy(captureGyro = enabled)
-        saveLensStabilizationLocked()
         active?.session?.setOpticalStabilization(mutableVideoState.value.requestedOis)
     } } }
 
@@ -399,45 +404,46 @@ class RawVulkanPreviewController(
     }
 
     fun setLiveStabilization(enabled: Boolean) { commands.submit { synchronized(lock) {
-        if (stabilizationLensKey == null || mutableVideoState.value.busy) return@synchronized
+        if (configuredCamera == null || mutableVideoState.value.busy) return@synchronized
         updateVideoOutputLocked(mutableVideoState.value.copy(liveStabilization = enabled, message = null))
-        saveLensStabilizationLocked()
         active?.session?.setOpticalStabilization(mutableVideoState.value.requestedOis)
         cropTransition.reset()
     } } }
 
     fun setStabilizationSettings(settings: com.unspektrawesome.video.LiveStabilizationSettings) {
         commands.submit { synchronized(lock) {
-            if (stabilizationLensKey == null || mutableVideoState.value.busy) return@synchronized
+            if (configuredCamera == null || mutableVideoState.value.busy) return@synchronized
             updateVideoOutputLocked(mutableVideoState.value.copy(stabilizationSettings = settings))
-            saveLensStabilizationLocked()
             cropTransition.reset()
         } }
     }
 
     fun setVideoOis(enabled: Boolean) { commands.submit { synchronized(lock) {
-        if (stabilizationLensKey == null || mutableVideoState.value.oisBlockedByGyro) return@synchronized
+        if (configuredCamera == null || mutableVideoState.value.oisBlockedByGyro) return@synchronized
         val owner = active ?: return@synchronized
         val next = mutableVideoState.value.copy(oisEnabled = enabled)
         if (!owner.session.setOpticalStabilization(next.requestedOis)) return@synchronized
         mutableVideoState.value = next
-        saveLensStabilizationLocked()
     } } }
 
-    private fun saveLensStabilizationLocked() {
-        stabilizationLensKey?.let { lensStabilizationStore.save(it, mutableVideoState.value) }
-    }
-
+    /**
+     * Loads the stabilization of the video lens profile in use. Changes from the video menu are replaced when
+     * another video profile is used or when this profile's saved stabilization is edited. A photo profile keeps the
+     * values of the last video profile, so returning to that profile in video mode continues with them.
+     */
     private fun restoreLensStabilizationLocked(): Boolean {
-        if (mutableVideoState.value.busy) return false
-        val key = LensStabilizationStore.key(configuredPreferences, configuredCamera?.route?.routeId)
-        val photoOisEnabled = configuredPreferences.lensProfiles.firstOrNull {
+        val state = mutableVideoState.value
+        if (state.busy) return false
+        val profile = configuredPreferences.lensProfiles.firstOrNull {
             it.id == configuredPreferences.activeLensProfileId && it.enabled && it.routeId == configuredCamera?.route?.routeId
-        }?.photoOisEnabled ?: true
-        if (key == stabilizationLensKey && photoOisEnabled == mutableVideoState.value.photoOisEnabled) return false
-        stabilizationLensKey = key
-        mutableVideoState.value = lensStabilizationStore.load(key, mutableVideoState.value)
-            .copy(stabilizationLimited = false, photoOisEnabled = photoOisEnabled)
+        }
+        val photoOisEnabled = profile?.photoOisEnabled ?: true
+        val source = profile?.takeIf { it.mode == LensProfileMode.VIDEO }?.let { it.id to it.videoStabilization }
+            ?: loadedStabilization
+        if (source == loadedStabilization && photoOisEnabled == state.photoOisEnabled) return false
+        val next = if (source != null && source != loadedStabilization) source.second.applyTo(state) else state
+        loadedStabilization = source
+        mutableVideoState.value = next.copy(stabilizationLimited = false, photoOisEnabled = photoOisEnabled)
         cropTransition.reset()
         return true
     }
@@ -581,7 +587,7 @@ class RawVulkanPreviewController(
         mutableVideoState.value = videoSettings(state.copy(available = videoEncodings.keys.toList()))
     }
 
-    /** Starts or stops recording. [lockControls] holds exposure, focus and white balance until recording stops. */
+    /** Starts or stops recording. [lockControls] holds the controls chosen in the settings until recording stops. */
     fun toggleVideoRecording(lockControls: Boolean = false) { commands.submit { synchronized(lock) {
         val state = mutableVideoState.value
         if (state.busy) {
@@ -613,7 +619,8 @@ class RawVulkanPreviewController(
         recordingCrop = videoGeometry.crop
         if (lockControls) lockVideoControlsLocked(owner)
         mutableVideoState.value = state.copy(phase = VideoPhase.STARTING, startedAtMs = 0, droppedFrames = 0,
-            stabilizationLimited = false, message = null, controlsLocked = videoLockOwner === owner)
+            stabilizationLimited = false, message = null,
+            lockedControls = if (videoLockOwner === owner) videoLock else RecordingLock.NONE)
         mutableVideoState.value = mutableVideoState.value.copy(clipCaptureGyro = state.captureGyro)
         resetPerformanceLocked()
         val profile = configuredPreferences.lensProfiles.firstOrNull { it.id == configuredPreferences.activeLensProfileId }
@@ -751,25 +758,48 @@ class RawVulkanPreviewController(
 
     private fun lockVideoControlsLocked(owner: ActiveSession) {
         val controls = mutableCameraControls.value
-        if (!controls.manualExposureSupported || owner.session.state() != Camera2RawSession.State.STREAMING) return
+        val lock = configuredPreferences.recordingLock.resolve(controls.manualExposureSupported, controls.customAe)
+        if (!lock.any || owner.session.state() != Camera2RawSession.State.STREAMING) return
         videoLockPreviousControls = controls
         videoLockOwner = owner
-        if (controls.customAe) resetCustomExposureLocked(owner, AeMode.MANUAL)
-        if (!owner.session.freezeCaptureControls(controls.iso, controls.exposureTimeNs)) {
+        videoLock = lock
+        if (controls.customAe) {
+            // Holding one of the two leaves the other automatic. A value the user had already fixed stays fixed.
+            val mode = AeMode.from(controls.exposureMode.isoLocked || lock.iso, controls.exposureMode.shutterLocked || lock.shutter)
+            if (mode != controls.exposureMode) resetCustomExposureLocked(owner, mode)
+        }
+        if (!owner.session.freezeCaptureControls(controls.iso, controls.exposureTimeNs,
+                lock.exposure, lock.focus, lock.whiteBalance)) {
             unlockVideoControlsLocked()
             return
         }
-        mutableCameraControls.value = mutableCameraControls.value.copy(autoExposure = false, exposureMode = AeMode.MANUAL,
-            autoFocus = !controls.manualFocusSupported, autoWhiteBalance = !controls.manualWhiteBalanceSupported)
-        InternalLogRecorder.event("VideoRecording", "controls locked iso=${controls.iso} exposure_ns=${controls.exposureTimeNs}")
+        mutableCameraControls.value = mutableCameraControls.value.let { current -> current.copy(
+            autoExposure = current.autoExposure && !lock.exposure,
+            exposureMode = if (lock.exposure) AeMode.MANUAL else current.exposureMode,
+            autoFocus = current.autoFocus && !(lock.focus && controls.manualFocusSupported),
+            autoWhiteBalance = current.autoWhiteBalance && !(lock.whiteBalance && controls.manualWhiteBalanceSupported)) }
+        InternalLogRecorder.event("VideoRecording", "controls locked ${lock.label} iso=${controls.iso} exposure_ns=${controls.exposureTimeNs}")
     }
 
     private fun unlockVideoControlsLocked() {
         val previous = videoLockPreviousControls ?: return
-        active?.takeIf { it === videoLockOwner }?.let { applyCameraControlsLocked(it, previous) }
+        active?.takeIf { it === videoLockOwner }?.let { owner ->
+            // Only what was held goes back. Shutter speed or ISO that was automatic, or was not held, carries on
+            // from where it is now.
+            val now = mutableCameraControls.value
+            val mode = owner.exposureController.mode
+            applyCameraControlsLocked(owner, previous.copy(
+                exposureMode = if (previous.customAe) AeMode.from(
+                    if (videoLock.iso) previous.exposureMode.isoLocked else mode.isoLocked,
+                    if (videoLock.shutter) previous.exposureMode.shutterLocked else mode.shutterLocked) else previous.exposureMode,
+                iso = if (videoLock.iso && !previous.isoAuto) previous.iso else now.iso,
+                exposureTimeNs = if (videoLock.shutter && !previous.shutterAuto) previous.exposureTimeNs else now.exposureTimeNs),
+                videoLock)
+        }
         videoLockPreviousControls = null
         videoLockOwner = null
-        mutableVideoState.value = mutableVideoState.value.copy(controlsLocked = false)
+        videoLock = RecordingLock.NONE
+        mutableVideoState.value = mutableVideoState.value.copy(lockedControls = RecordingLock.NONE)
     }
 
     private fun stopVideoLocked(failure: String? = null) {
@@ -931,6 +961,7 @@ class RawVulkanPreviewController(
     // Controls in effect before a locked video recording, restored when it stops.
     private var videoLockPreviousControls: CameraControlState? = null
     private var videoLockOwner: ActiveSession? = null
+    private var videoLock = RecordingLock.NONE
     private val mutablePanoramaExportRequest = MutableStateFlow<String?>(null)
     internal val panoramaExportRequest = mutablePanoramaExportRequest.asStateFlow()
     private val panoramaRecorder = com.unspektrawesome.panorama.PanoramaRecorder(applicationContext, preview = { width, height ->
@@ -1029,13 +1060,21 @@ class RawVulkanPreviewController(
             autoFocus = !controls.manualFocusSupported, autoWhiteBalance = !controls.manualWhiteBalanceSupported)
     }
 
-    private fun applyCameraControlsLocked(owner: ActiveSession, controls: CameraControlState) {
-        if (configuredPreferences.aeEngine == AeEngine.SPEKTRA) resetCustomExposureLocked(owner, controls.exposureMode, SensorExposure(controls.iso, controls.exposureTimeNs))
-        else if (controls.autoExposure) owner.session.setAutoExposure()
-        else { owner.session.setIso(controls.iso); owner.session.setExposureTimeNs(controls.exposureTimeNs) }
-        if (controls.autoFocus) owner.session.setAutoFocus() else owner.session.setFocusDistance(controls.focusDistance)
-        if (controls.autoWhiteBalance) owner.session.setAutoWhiteBalance()
-        else controls.whiteBalanceTemperatureKelvin?.let { owner.session.setWhiteBalanceTemperatureKelvin(it) }
+    /** Returns the camera to [controls]. [restore] limits this to the controls that were held fixed. */
+    private fun applyCameraControlsLocked(owner: ActiveSession, controls: CameraControlState,
+        restore: RecordingLock = RecordingLock()) {
+        if (restore.shutter || restore.iso) {
+            if (configuredPreferences.aeEngine == AeEngine.SPEKTRA) resetCustomExposureLocked(owner, controls.exposureMode, SensorExposure(controls.iso, controls.exposureTimeNs))
+            else if (controls.autoExposure) owner.session.setAutoExposure()
+            else { owner.session.setIso(controls.iso); owner.session.setExposureTimeNs(controls.exposureTimeNs) }
+        }
+        if (restore.focus) {
+            if (controls.autoFocus) owner.session.setAutoFocus() else owner.session.setFocusDistance(controls.focusDistance)
+        }
+        if (restore.whiteBalance) {
+            if (controls.autoWhiteBalance) owner.session.setAutoWhiteBalance()
+            else controls.whiteBalanceTemperatureKelvin?.let { owner.session.setWhiteBalanceTemperatureKelvin(it) }
+        }
     }
 
     private fun restorePanoramaControlsLocked() {
@@ -1904,10 +1943,25 @@ class RawVulkanPreviewController(
 
     fun configure(camera: CameraDescriptor?, preferences: CameraPreferences) { commands.submit { configureOnWorker(camera, preferences) } }
 
+    /** Photo OIS of the active lens profile. It has no effect in a video profile, which keeps the running session's value. */
+    private fun sessionPhotoOisLocked(preferences: CameraPreferences): Boolean {
+        val profile = preferences.lensProfiles.firstOrNull { it.id == preferences.activeLensProfileId && it.enabled }
+        return if (profile?.mode == com.unspektrawesome.settings.LensProfileMode.VIDEO)
+            active?.key?.photoOisEnabled ?: profile.photoOisEnabled
+        else profile?.photoOisEnabled ?: true
+    }
+
     private fun configureOnWorker(camera: CameraDescriptor?, preferences: CameraPreferences) = synchronized(lock) {
         check(!closed) { "Preview controller is closed" }
-        if (configuredCamera?.route != camera?.route ||
-            configuredPreferences.activeLensProfileId != preferences.activeLensProfileId ||
+        val previousProfile = configuredPreferences.lensProfiles.firstOrNull { it.id == configuredPreferences.activeLensProfileId }
+        val nextProfile = preferences.lensProfiles.firstOrNull { it.id == preferences.activeLensProfileId }
+        // The photo and video profiles of one lens are the same lens in another capture mode.
+        // Switching between them keeps the exposure controls, and the session when both need the same one.
+        val captureModeSwitch = previousProfile != null && nextProfile != null && previousProfile.mode != nextProfile.mode &&
+            previousProfile.routeId == nextProfile.routeId && configuredCamera?.route == camera?.route
+        val profileChanged = configuredPreferences.activeLensProfileId != preferences.activeLensProfileId && !captureModeSwitch
+        val nextSessionProfileId = if (captureModeSwitch) sessionLensProfileId else preferences.activeLensProfileId
+        if (configuredCamera?.route != camera?.route || profileChanged ||
             configuredPreferences.rawPreviewStreams[configuredCamera?.route?.routeId] !=
                 preferences.rawPreviewStreams[camera?.route?.routeId]) {
             lensSwitchExposure = if (configuredPreferences.aeEngine == AeEngine.SPEKTRA &&
@@ -1928,13 +1982,13 @@ class RawVulkanPreviewController(
             configuredPreferences.cfaOverride() != preferences.cfaOverride() ||
             configuredPreferences.rawLayoutOverride() != preferences.rawLayoutOverride() ||
             configuredPreferences.rawEdgeCrop() != preferences.rawEdgeCrop() ||
-            configuredPreferences.aeLimits() != preferences.aeLimits() ||
-            configuredPreferences.activeLensProfileId != preferences.activeLensProfileId
+            configuredPreferences.aeLimits() != preferences.aeLimits() || profileChanged
         val sessionChanged = active?.let { owner ->
             camera != null && runCatching {
                 val plan = RawPreviewPlanSelector.select(camera, preferences,
                     importCapabilities = mutableRawImportCapabilities.value, frameRateOverride = videoFrameRateOverride())
-                owner.key != ConfigurationKey(camera, plan, preferences, videoFrameRateOverride())
+                owner.key != ConfigurationKey(camera, plan, preferences, nextSessionProfileId,
+                    sessionPhotoOisLocked(preferences), videoFrameRateOverride())
             }.getOrDefault(true)
         } == true
         val previousRawSession = configuredPreferences.lensProfiles.firstOrNull {
@@ -1951,8 +2005,7 @@ class RawVulkanPreviewController(
             configuredPreferences.previewShortEdge != preferences.previewShortEdge ||
             configuredPreferences.viewfinderSource != preferences.viewfinderSource ||
             configuredPreferences.rawPreviewStreams != preferences.rawPreviewStreams ||
-            configuredPreferences.rawEdgeCrop() != preferences.rawEdgeCrop() ||
-            configuredPreferences.activeLensProfileId != preferences.activeLensProfileId
+            configuredPreferences.rawEdgeCrop() != preferences.rawEdgeCrop() || profileChanged
         if (sessionChanged) {
             lensSwitching = true
             active?.let { owner ->
@@ -1992,6 +2045,7 @@ class RawVulkanPreviewController(
             if (panoramaState.value.enabled) com.unspektrawesome.camera.FlashMode.OFF else preferences.flashMode)
         configuredCamera = camera
         configuredPreferences = preferences
+        sessionLensProfileId = nextSessionProfileId
         burstRecorder.configureHistory(preferences.burstPreShutterSeconds)
         if (restoreLensStabilizationLocked() && !sessionChanged)
             active?.session?.setOpticalStabilization(mutableVideoState.value.requestedOis)
@@ -2609,7 +2663,8 @@ class RawVulkanPreviewController(
             failSessionRecoveryLocked("RAW preview selection failed: ${error.message ?: error.javaClass.simpleName}")
             return
         }
-        val key = ConfigurationKey(camera, plan, configuredPreferences, videoFrameRateOverride())
+        val key = ConfigurationKey(camera, plan, configuredPreferences, sessionLensProfileId,
+            sessionPhotoOisLocked(configuredPreferences), videoFrameRateOverride())
         if (blockedConfiguration == key) return
         val current = active
         if (current != null) {
@@ -3787,9 +3842,10 @@ class RawVulkanPreviewController(
         val profileRawSession: com.unspektrawesome.camera.session.RawSessionConfiguration?,
         val ispViewfinder: Boolean,
     ) {
-        constructor(camera: CameraDescriptor, plan: RawPreviewPolicy.Plan, preferences: CameraPreferences, frameRateOverride: Int? = null) : this(
+        constructor(camera: CameraDescriptor, plan: RawPreviewPolicy.Plan, preferences: CameraPreferences,
+            lensProfileId: String?, photoOisEnabled: Boolean, frameRateOverride: Int? = null) : this(
             camera,
-            preferences.activeLensProfileId,
+            lensProfileId,
             plan.acquisitionOutput,
             plan.processingSize.width,
             plan.processingSize.height,
@@ -3798,7 +3854,7 @@ class RawVulkanPreviewController(
             preferences.vendorOverrides(),
             preferences.rawLayoutOverride(),
             preferences.lensCaptureSettings().sessionSettings().let { it.copy(frameRate = frameRateOverride ?: it.frameRate) },
-            preferences.lensProfiles.firstOrNull { it.id == preferences.activeLensProfileId && it.enabled }?.photoOisEnabled ?: true,
+            photoOisEnabled,
             preferences.lensProfiles.firstOrNull { it.id == preferences.activeLensProfileId && it.enabled }?.rawSession,
             preferences.viewfinderSource == com.unspektrawesome.settings.ViewfinderSource.ISP,
         )

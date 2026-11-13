@@ -91,8 +91,6 @@ private val recordingValueStyle = TextStyle(fontFamily = com.unspektrawesome.ui.
 private val recordingLabelStyle = TextStyle(fontSize = 9.sp, lineHeight = 11.sp,
     lineBreak = LineBreak(LineBreak.Strategy.Simple, LineBreak.Strictness.Loose, LineBreak.WordBreak.Default),
     fontWeight = FontWeight.Medium, textAlign = TextAlign.Center)
-// Standard camera abbreviations, shown the same in every language.
-private const val LOCKED_CONTROLS_LABEL = "AE/AF/WB"
 private val recordingTimerStyle = TextStyle(fontFamily = com.unspektrawesome.ui.camera.CameraTypography.Readout, fontSize = 14.sp,
     lineHeight = 18.sp, fontWeight = FontWeight.SemiBold)
 
@@ -192,9 +190,7 @@ private fun RecordingReadings(state: VideoRecordingState, performance: PreviewPe
                 horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 RecordingMetricGroup(metrics.take(3), cellWidths, metricValueStyle, metricLabelStyle, valueHeight, labelHeight, Modifier.weight(1f))
                 Column(Modifier.width(timerWidth).testTag("Recording duration").languageSemantics(mergeDescendants = true) { language ->
-                    contentDescription = language.format(if (state.controlsLocked)
-                        "Recording {value1}, exposure, focus and white balance locked" else "Recording {value1}",
-                        mapOf("value1" to duration))
+                    contentDescription = language.format(state.lockedControls.recordingDescription, mapOf("value1" to duration))
                 }, horizontalAlignment = Alignment.CenterHorizontally) {
                     // While locked, the timer shares the metric rows' height so the lock label fits without growing the bar.
                     val rowStyle = if (state.controlsLocked) timerStyle.copy(lineHeight = metricValueStyle.lineHeight) else timerStyle
@@ -210,8 +206,10 @@ private fun RecordingReadings(state: VideoRecordingState, performance: PreviewPe
                             horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
                             RecordingLockIcon(Modifier.size(6.dp, 7.dp))
                             Spacer(Modifier.width(2.dp))
-                            Text(LOCKED_CONTROLS_LABEL, translate = false, color = CameraColors.Accent,
-                                style = fittingRecordingStyle(LOCKED_CONTROLS_LABEL, metricLabelStyle, timerWidth - 10.dp),
+                            // Standard camera abbreviations of the locked controls, shown the same in every language.
+                            val lockLabel = state.lockedControls.label
+                            Text(lockLabel, translate = false, color = CameraColors.Accent,
+                                style = fittingRecordingStyle(lockLabel, metricLabelStyle, timerWidth - 10.dp),
                                 maxLines = 1, softWrap = false)
                         }
                     }
