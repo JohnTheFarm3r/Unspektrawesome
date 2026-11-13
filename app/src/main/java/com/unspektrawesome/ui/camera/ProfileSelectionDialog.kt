@@ -12,6 +12,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -40,30 +41,32 @@ internal fun ProfileSelectionDialog(
             secondAccent = true, secondEnabled = selected.isNotEmpty())
     }) {
         LazyColumn(Modifier.fillMaxSize().testTag("Profile transfer list"),
-            contentPadding = PaddingValues(vertical = 18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            contentPadding = PaddingValues(vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             item(key = "description") { LensToolNotice(description) }
             if (options != null) item(key = "options") { options() }
             item(key = "selection") {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("{size} of {size_2} selected", arguments = mapOf("size" to (selected.size), "size_2" to (profiles.size)),
-                        color = CameraColors.Text, fontSize = 13.sp, lineHeight = 19.sp, fontWeight = FontWeight.Medium)
+                        color = Color(0xFFCFCFCF), fontSize = 11.5.sp, lineHeight = 16.sp, fontFamily = Diagram.Mono,
+                        modifier = Modifier.padding(horizontal = 2.dp))
                     LensToolActionPair("Select none", "Select all", { selected = emptyList() }, { selected = profiles.map { it.id } },
                         firstEnabled = selected.isNotEmpty(), secondEnabled = selected.size != profiles.size)
                 }
             }
             items(profiles, key = { "profile:${it.id}" }) { profile ->
                 val checked = profile.id in selected
-                Row(Modifier.fillMaxWidth().clip(SettingsStyle.PanelShape)
-                    .background(if (checked) CameraColors.MenuSelectedCard else CameraColors.MenuCard)
-                    .border(1.dp, if (checked) CameraColors.Accent else CameraColors.MenuBorder, SettingsStyle.PanelShape)
+                Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clip(Diagram.ControlShape)
+                    .background(if (checked) Color(0x99202020) else Diagram.Glass)
+                    .border(1.dp, if (checked) CameraColors.Accent else Diagram.Border, Diagram.ControlShape)
                     .toggleable(checked, role = Role.Checkbox) { selected = if (it) selected + profile.id else selected - profile.id }
                     .languageSemantics { language -> contentDescription = language.format("Select {name}", mapOf("name" to (profile.name))) }
-                    .padding(16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    LensToolCheck(checked)
-                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text(profile.name, translate = false, color = if (checked) CameraColors.Accent else CameraColors.Text, fontSize = 15.sp,
-                            lineHeight = 21.sp, fontWeight = FontWeight.SemiBold)
-                        if (profile.detail.isNotBlank()) Text(profile.detail, color = CameraColors.Muted, fontSize = 12.sp, lineHeight = 18.sp)
+                    .padding(horizontal = 10.dp, vertical = 9.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    LensToolCheck(checked, filled = true)
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(profile.name, translate = false, color = if (checked) CameraColors.Accent else CameraColors.Text, fontSize = 13.sp,
+                            lineHeight = 18.sp, fontWeight = FontWeight.SemiBold)
+                        if (profile.detail.isNotBlank()) Text(profile.detail, color = Diagram.Hint, fontSize = 10.5.sp, lineHeight = 14.sp,
+                            fontFamily = Diagram.Mono)
                     }
                 }
             }

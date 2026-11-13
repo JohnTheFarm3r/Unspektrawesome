@@ -70,6 +70,7 @@ internal enum class SettingsSymbol(@param:DrawableRes val drawable: Int) {
     Saved(R.drawable.ic_settings_cloud_check),
     Dropdown(R.drawable.ic_settings_chevron_down),
     Reset(R.drawable.ic_settings_rotate_ccw),
+    RotateClockwise(R.drawable.ic_settings_rotate_cw),
     Info(R.drawable.ic_settings_info),
     Update(R.drawable.ic_settings_refresh_cw),
     Logs(R.drawable.ic_settings_file_text),

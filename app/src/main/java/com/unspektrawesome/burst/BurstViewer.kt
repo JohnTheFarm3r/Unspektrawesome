@@ -39,15 +39,25 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.unspektrawesome.gallery.BurstTimelineArt
+import com.unspektrawesome.gallery.BurstTimelineLegend
 import com.unspektrawesome.gallery.GallerySymbol
 import com.unspektrawesome.gallery.GallerySymbolIcon
+import com.unspektrawesome.gallery.ImageTag
+import com.unspektrawesome.gallery.MediaArt
+import com.unspektrawesome.gallery.MediaSpinner
 import com.unspektrawesome.gallery.PhotoSelectionIndicator
 import com.unspektrawesome.gallery.ZoomableBitmap
+import com.unspektrawesome.ui.camera.Diagram
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import com.unspektrawesome.language.AppLanguage
 import com.unspektrawesome.language.languageSemantics
 import com.unspektrawesome.language.LanguageText as Text
 import com.unspektrawesome.ui.camera.CameraColors
-import com.unspektrawesome.ui.camera.CameraTypography
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -156,44 +166,41 @@ internal fun BurstViewer(uri: Uri, onDismiss: () -> Unit, onExported: () -> Unit
         }
     }
     BackHandler { if (!exporting) goBack() }
+    val timestamps = remember(session) {
+        session?.reader?.let { reader -> (0 until reader.count).map { reader.frames.getJSONObject(it).getLong("timestamp") } }.orEmpty()
+    }
     BoxWithConstraints(Modifier.fillMaxSize().background(CameraColors.Background).testTag("Burst viewer")) {
-        val controlsHeight = (maxHeight * .45f).coerceAtMost(250.dp)
+        val controlsHeight = maxHeight * .58f
+        val showTimeline = maxHeight >= 620.dp && timestamps.isNotEmpty()
         val count = session?.reader?.count ?: 0
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            val native = nativeBitmap?.takeIf { nativeRequested && nativeFrame == selected && !it.isRecycled }
-            if (native != null) ZoomableBitmap(native)
-            else bitmap?.let { Image(it.asImageBitmap(), null, Modifier.fillMaxSize().languageSemantics { language ->
-                contentDescription = language.text("BURST preview")
-            }, contentScale = ContentScale.Fit) }
-                ?: Text(if (failed) "Unable to open BURST" else "Loading preview", color = CameraColors.Muted)
-        }
-        BoxWithConstraints(Modifier.align(Alignment.TopCenter).fillMaxWidth().heightIn(min = 56.dp)
-            .background(CameraColors.Background.copy(alpha = .6f)).padding(horizontal = 8.dp, vertical = 4.dp)) {
+        Column(Modifier.fillMaxSize()) {
+        BoxWithConstraints(Modifier.fillMaxWidth().heightIn(min = 56.dp).padding(horizontal = 8.dp, vertical = 4.dp)) {
             val density = LocalDensity.current
             val measurer = rememberTextMeasurer()
             val backWidth = with(density) { measurer.measure(AppLanguage.text("Back"),
-                LocalTextStyle.current.copy(fontSize = 15.sp)).size.width.toDp() } + 40.dp
+                LocalTextStyle.current.copy(fontSize = 14.sp)).size.width.toDp() } + 40.dp
             val back: @Composable () -> Unit = {
-                Row(Modifier.heightIn(min = 44.dp).clip(RoundedCornerShape(50)).clickable(enabled = !exporting,
+                val ink = if (exporting) Color(0xFF6A6A6A) else CameraColors.Text
+                Row(Modifier.heightIn(min = 44.dp).clip(Diagram.ControlShape).clickable(enabled = !exporting,
                     role = Role.Button, onClick = ::goBack).languageSemantics { language -> contentDescription = language.text("Back") }
-                    .padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically,
+                    .padding(horizontal = 6.dp), verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    GallerySymbolIcon(GallerySymbol.BACK, CameraColors.Text, Modifier.size(20.dp))
-                    Text("Back", color = CameraColors.Text, fontSize = 15.sp)
+                    GallerySymbolIcon(GallerySymbol.BACK, ink, Modifier.size(18.dp))
+                    Text("Back", color = ink, fontSize = 14.sp, lineHeight = 18.sp)
                 }
             }
             val heading: @Composable () -> Unit = {
                 Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text("BURST", color = CameraColors.Muted, fontFamily = CameraTypography.Readout, fontSize = 11.sp)
+                        Text("BURST", color = Diagram.Hint, fontFamily = Diagram.Mono, fontSize = 11.sp, lineHeight = 14.sp)
                         if (count > 0) Text("{value1} / {size}", arguments = mapOf("value1" to selected + 1, "size" to count),
-                            color = CameraColors.Text, fontFamily = CameraTypography.Readout, fontSize = 11.sp,
+                            color = CameraColors.Text, fontFamily = Diagram.Mono, fontSize = 11.sp, lineHeight = 14.sp,
                             modifier = Modifier.testTag("Burst frame position"))
                     }
                     session?.let { current ->
                         Text(com.unspektrawesome.gallery.date(current.reader.index.getLong("capturedAt"), "d MMM yyyy · HH:mm"),
-                            translate = false, color = CameraColors.Text, fontSize = 13.sp,
-                            textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                            translate = false, color = CameraColors.Text, fontSize = 13.sp, lineHeight = 17.sp,
+                            fontWeight = FontWeight.Medium, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
                     }
                 }
             }
@@ -208,20 +215,48 @@ internal fun BurstViewer(uri: Uri, onDismiss: () -> Unit, onExported: () -> Unit
                 Spacer(Modifier.width(backWidth))
             }
         }
-        Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth().heightIn(max = controlsHeight)
-            .background(CameraColors.Background.copy(alpha = .6f)).verticalScroll(rememberScrollState())
-            .padding(top = 8.dp, bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        BoxWithConstraints(Modifier.weight(1f).fillMaxWidth().padding(start = 14.dp, end = 26.dp, top = 16.dp, bottom = 6.dp),
+            contentAlignment = Alignment.Center) {
+            val native = nativeBitmap?.takeIf { nativeRequested && nativeFrame == selected && !it.isRecycled }
+            if (native != null) Box(Modifier.fillMaxSize().border(1.dp, CameraColors.Accent, RoundedCornerShape(2.dp))) {
+                ZoomableBitmap(native)
+                ImageTag("Full resolution", Modifier.align(Alignment.TopStart).padding(8.dp))
+                ImageTag("Pinch to zoom", Modifier.align(Alignment.BottomEnd).padding(8.dp), accent = false)
+            }
+            else bitmap?.let { frame ->
+                // Fit the preview and draw the frames behind it as a stack.
+                val ratio = frame.width.toFloat() / frame.height.coerceAtLeast(1)
+                val width = minOf(maxWidth, maxHeight * ratio)
+                Box(Modifier.size(width, width / ratio).drawBehind {
+                    listOf(12.dp to Color(0xFF262626), 8.dp to Color(0xFF2E2E2E), 4.dp to Color(0xFF3A3A3A)).forEach { (shift, color) ->
+                        drawRect(color, Offset(shift.toPx(), -shift.toPx()), size, style = Stroke(1.dp.toPx()))
+                    }
+                }.background(CameraColors.Background).border(1.dp, MediaArt.SoftInk, RoundedCornerShape(2.dp))) {
+                    Image(frame.asImageBitmap(), null, Modifier.fillMaxSize().padding(1.dp).languageSemantics { language ->
+                        contentDescription = language.text("BURST preview")
+                    }, contentScale = ContentScale.Fit)
+                }
+            }
+                ?: Text(if (failed) "Unable to open BURST" else "Loading preview", color = if (failed) CameraColors.FocusFailed else Diagram.Hint,
+                    fontSize = 12.5.sp)
+        }
+        Column(Modifier.fillMaxWidth().heightIn(max = controlsHeight).verticalScroll(rememberScrollState())
+            .padding(top = 4.dp, bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            if (showTimeline) {
+                BurstTimelineArt(timestamps, prepared, selected, selecting, selectedFrames.toSet(), Modifier.padding(horizontal = 12.dp))
+                BurstTimelineLegend(selecting, Modifier.padding(horizontal = 16.dp))
+            }
             if (nativeLoading || count > 0 && prepared < count) {
-                val shape = RoundedCornerShape(12.dp)
-                Row(Modifier.padding(horizontal = 12.dp).fillMaxWidth().border(1.dp, CameraColors.MenuBorder, shape)
-                    .background(CameraColors.Background.copy(alpha = .7f), shape).padding(horizontal = 12.dp, vertical = 8.dp),
+                Row(Modifier.padding(horizontal = 12.dp).fillMaxWidth().heightIn(min = 34.dp).clip(Diagram.ControlShape)
+                    .background(Color.Black.copy(alpha = .7f)).border(1.dp, Diagram.Border, Diagram.ControlShape)
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    androidx.compose.material3.CircularProgressIndicator(Modifier.size(14.dp), color = CameraColors.Accent, strokeWidth = 1.dp)
+                    MediaSpinner(size = 14.dp, track = Diagram.Border)
                     Text(if (nativeLoading) "Loading preview" else "Preparing previews · {count} / {total}",
                         arguments = mapOf("count" to prepared, "total" to count), color = CameraColors.Text,
-                        fontSize = 12.sp, modifier = Modifier.weight(1f))
+                        fontSize = 12.sp, lineHeight = 16.sp, modifier = Modifier.weight(1f))
                     if (!nativeLoading) androidx.compose.material3.LinearProgressIndicator(progress = { prepared.toFloat() / count },
-                        color = CameraColors.Accent, trackColor = CameraColors.MenuBorder, modifier = Modifier.width(64.dp).height(1.dp))
+                        color = CameraColors.Accent, trackColor = Diagram.Border, modifier = Modifier.width(64.dp).height(1.dp))
                 }
             }
             session?.let { current ->
@@ -232,22 +267,22 @@ internal fun BurstViewer(uri: Uri, onDismiss: () -> Unit, onExported: () -> Unit
             }
             if (selecting) Text(if (exporting) "Adding to queue · {count} / {total}" else "{size} selected",
                 arguments = mapOf("count" to queued, "total" to queueTotal, "size" to selectedFrames.size),
-                color = CameraColors.Accent, fontSize = 12.sp,
+                color = CameraColors.Accent, fontSize = 12.sp, lineHeight = 16.sp,
                 modifier = Modifier.padding(horizontal = 16.dp).testTag("Burst selection count"))
             val labels = listOf("Full resolution", "Exporting", "Export JPEG", "Select frames", "Select all", "Select none", "Done", "Add to export queue")
             val measurer = rememberTextMeasurer()
             val density = LocalDensity.current
             val actionWidth = with(density) { labels.maxOf {
-                measurer.measure(AnnotatedString(AppLanguage.text(it)), LocalTextStyle.current.copy(fontSize = 14.sp, lineHeight = 19.sp)).size.width
-            }.toDp() + 52.dp }
+                measurer.measure(AnnotatedString(AppLanguage.text(it)), LocalTextStyle.current.copy(fontSize = 12.5.sp, lineHeight = 17.sp)).size.width
+            }.toDp() + 48.dp }
             BoxWithConstraints(Modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
                 val columns = when {
                     density.fontScale <= 1.2f && maxWidth >= 300.dp -> 2
-                    maxWidth >= actionWidth * 2 + 8.dp -> 2
+                    maxWidth >= actionWidth * 2 + 6.dp -> 2
                     else -> 1
                 }
-                val cellWidth = with(density) { ((maxWidth.roundToPx() - 4.dp.roundToPx() * (columns - 1)) / columns).toDp() }
-                FlowRow(Modifier.fillMaxWidth().testTag("Burst frame actions"), horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.CenterHorizontally),
+                val cellWidth = with(density) { ((maxWidth.roundToPx() - 6.dp.roundToPx() * (columns - 1)) / columns).toDp() }
+                FlowRow(Modifier.fillMaxWidth().testTag("Burst frame actions"), horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally),
                     verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     if (!selecting) BurstAction(if (playing) "Pause" else "Play", if (playing) GallerySymbol.PAUSE else GallerySymbol.PLAY,
                         enabled = count > 0 && prepared == count && !exporting, modifier = Modifier.width(cellWidth).testTag("Burst playback")) {
@@ -268,7 +303,7 @@ internal fun BurstViewer(uri: Uri, onDismiss: () -> Unit, onExported: () -> Unit
                         playing = false; nativeBitmap = null; nativeFrame = -1; nativeRequested = !nativeRequested; notice = null
                     }
                     if (selecting) BurstAction("Add to export queue", GallerySymbol.EXPORT,
-                        enabled = session != null && selectedFrames.isNotEmpty() && !exporting,
+                        enabled = session != null && selectedFrames.isNotEmpty() && !exporting, primary = true,
                         modifier = Modifier.width(cellWidth).testTag("Queue burst frames")) {
                         val current = session ?: return@BurstAction
                         val frames = selectedFrames.sorted()
@@ -314,33 +349,49 @@ internal fun BurstViewer(uri: Uri, onDismiss: () -> Unit, onExported: () -> Unit
                     }
                 }
             }
+            if (!selecting && count > 0 && prepared < count) Row(Modifier.padding(horizontal = 12.dp),
+                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                androidx.compose.foundation.Canvas(Modifier.size(18.dp, 7.dp)) {
+                    drawLine(CameraColors.Accent.copy(alpha = .7f), Offset(0f, center.y), Offset(size.width, center.y), 1.dp.toPx())
+                    drawCircle(CameraColors.Accent, 3.5.dp.toPx(), Offset(0f, center.y))
+                }
+                Text("Play starts once all {count} previews are ready", arguments = mapOf("count" to count), color = Diagram.Hint,
+                    fontSize = 10.5.sp, lineHeight = 14.sp)
+            }
+        }
         }
     }
 }
 
 @Composable
 private fun BurstAction(label: String, icon: GallerySymbol, modifier: Modifier, active: Boolean = false,
-    enabled: Boolean = true, resolution: Bitmap? = null, onClick: () -> Unit) {
-    val shape = RoundedCornerShape(12.dp)
-    val color = if (active) CameraColors.Accent else CameraColors.Text
-    Column(modifier.heightIn(min = 48.dp).clip(shape).background(CameraColors.Background.copy(alpha = .7f))
-        .border(1.dp, if (active) CameraColors.Accent else CameraColors.MenuBorder, shape)
+    enabled: Boolean = true, resolution: Bitmap? = null, primary: Boolean = false, onClick: () -> Unit) {
+    val shape = Diagram.ControlShape
+    val lit = active || primary
+    val color = when {
+        lit && !enabled -> CameraColors.Accent.copy(alpha = .55f)
+        !enabled -> Color(0xFF6A6A6A)
+        lit -> CameraColors.Accent
+        else -> CameraColors.Text
+    }
+    Row(modifier.heightIn(min = 44.dp).clip(shape)
+        .background(if (lit) CameraColors.Accent.copy(alpha = .06f) else Color.Black.copy(alpha = .7f))
+        .border(1.dp, if (lit) CameraColors.Accent.copy(alpha = if (enabled) 1f else .45f) else Diagram.Border, shape)
         .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
         .languageSemantics { language ->
             contentDescription = language.text(label)
             selected = active
             resolution?.let { stateDescription = language.format("{width} × {height}", mapOf("width" to it.width, "height" to it.height)) }
         }
-        .padding(horizontal = 8.dp, vertical = 6.dp), verticalArrangement = Arrangement.Center,
-        horizontalAlignment = Alignment.CenterHorizontally) {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally)) {
-            GallerySymbolIcon(icon, if (enabled) color else CameraColors.Muted.copy(alpha = .5f), Modifier.size(18.dp))
-            Text(label, color = if (enabled) color else CameraColors.Muted.copy(alpha = .5f), fontSize = 14.sp, lineHeight = 16.sp,
-                modifier = Modifier.weight(1f).fillMaxWidth())
-        }
-        resolution?.let {
-            Text("{width} × {height}", arguments = mapOf("width" to it.width, "height" to it.height), color = CameraColors.Muted,
-                fontFamily = CameraTypography.Readout, fontSize = 11.sp, modifier = Modifier.testTag("Burst preview resolution"))
+        .padding(horizontal = 10.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        GallerySymbolIcon(icon, color, Modifier.size(15.dp))
+        Column(Modifier.weight(1f)) {
+            Text(label, color = color, fontSize = 12.5.sp, lineHeight = 16.sp, fontWeight = FontWeight.Medium)
+            resolution?.let {
+                Text("{width} × {height}", arguments = mapOf("width" to it.width, "height" to it.height), color = color,
+                    fontFamily = Diagram.Mono, fontSize = 9.5.sp, lineHeight = 12.sp, modifier = Modifier.testTag("Burst preview resolution"))
+            }
         }
     }
 }
@@ -364,20 +415,26 @@ private fun BurstFilmstrip(session: BurstViewSession, dispatcher: kotlinx.corout
             val thumbnail by produceState<Bitmap?>(null, session, frame, frame < prepared) {
                 if (frame < prepared) value = withContext(dispatcher) { session.thumbnail(frame) }
             }
-            val shape = RoundedCornerShape(8.dp)
-            Box(Modifier.size(44.dp).clip(shape).background(CameraColors.MenuCard)
-                .clickable(enabled = enabled, role = if (selecting) Role.Checkbox else Role.Button) { onSelect(frame) }.testTag("Burst thumbnail $frame")
-                .languageSemantics { language ->
-                    contentDescription = language.format("{value1} / {size}", mapOf("value1" to frame + 1, "size" to session.reader.count))
-                    this.selected = if (selecting) frame in selectedFrames else frame == selected
-                    if (selecting) toggleableState = if (frame in selectedFrames) androidx.compose.ui.state.ToggleableState.On
-                        else androidx.compose.ui.state.ToggleableState.Off
-                }, contentAlignment = Alignment.Center) {
-                thumbnail?.let { Image(it.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }
-                    ?: GallerySymbolIcon(GallerySymbol.STACK, CameraColors.Muted, Modifier.size(20.dp))
-                Box(Modifier.matchParentSize().border(1.dp, if (if (selecting) frame in selectedFrames else frame == selected)
-                    CameraColors.Accent else CameraColors.MenuBorder, shape))
-                if (selecting) PhotoSelectionIndicator(frame in selectedFrames, !enabled, Modifier.align(Alignment.TopEnd).padding(2.dp))
+            val shape = RoundedCornerShape(4.dp)
+            val highlighted = if (selecting) frame in selectedFrames else frame == selected
+            Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Box(Modifier.size(44.dp).clip(shape).background(Color(0xFF141414))
+                    .clickable(enabled = enabled, role = if (selecting) Role.Checkbox else Role.Button) { onSelect(frame) }.testTag("Burst thumbnail $frame")
+                    .languageSemantics { language ->
+                        contentDescription = language.format("{value1} / {size}", mapOf("value1" to frame + 1, "size" to session.reader.count))
+                        this.selected = if (selecting) frame in selectedFrames else frame == selected
+                        if (selecting) toggleableState = if (frame in selectedFrames) androidx.compose.ui.state.ToggleableState.On
+                            else androidx.compose.ui.state.ToggleableState.Off
+                    }, contentAlignment = Alignment.Center) {
+                    thumbnail?.let { Image(it.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }
+                        ?: GallerySymbolIcon(GallerySymbol.STACK, Diagram.Hint, Modifier.size(18.dp))
+                    Box(Modifier.matchParentSize().border(if (highlighted) 2.dp else 1.dp,
+                        if (highlighted) CameraColors.Accent else Diagram.Border, shape))
+                    if (selecting) PhotoSelectionIndicator(frame in selectedFrames, !enabled, Modifier.align(Alignment.TopEnd).padding(2.dp),
+                        round = true, size = 14.dp)
+                }
+                Text("${frame + 1}", translate = false, color = if (highlighted) CameraColors.Accent else Diagram.Hint, fontSize = 9.sp,
+                    lineHeight = 11.sp, fontFamily = Diagram.Mono, modifier = Modifier.clearAndSetSemantics { })
             }
         }
     }

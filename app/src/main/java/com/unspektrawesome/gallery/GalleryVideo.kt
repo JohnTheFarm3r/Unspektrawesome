@@ -11,9 +11,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -56,6 +54,9 @@ import com.unspektrawesome.R
 import com.unspektrawesome.language.AppLanguage
 import com.unspektrawesome.language.LanguageText as Text
 import com.unspektrawesome.ui.camera.CameraColors
+import com.unspektrawesome.ui.camera.Diagram
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import kotlinx.coroutines.delay
 import java.util.Locale
 
@@ -188,11 +189,11 @@ internal fun GalleryVideo(photo: GalleryPhoto, active: Boolean, initialPosition:
                     if (controlsVisible) { controlsVisible = false; onControlsHidden() } else revealControls()
                 }
                 .languageSemantics { language -> contentDescription = language.text(if (controlsVisible) "Hide controls" else "Show controls") })
-            if (!frameReady && !error && active) CircularProgressIndicator(
-                modifier = Modifier.size(24.dp), color = CameraColors.Accent, strokeWidth = 2.dp)
-            if (error) Column(Modifier.background(CameraColors.Glass, RoundedCornerShape(12.dp)).padding(16.dp),
+            if (!frameReady && !error && active) MediaSpinner(size = 24.dp, track = Diagram.Border)
+            if (error) Column(Modifier.clip(Diagram.ControlShape).background(Color(0xE60A0A0A))
+                .border(1.dp, Diagram.Border, Diagram.ControlShape).padding(horizontal = 16.dp, vertical = 12.dp),
                 horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Unable to play video", color = CameraColors.Text)
+                Text("Unable to play video", color = CameraColors.Text, fontSize = 12.5.sp, lineHeight = 17.sp)
                 GalleryAction("Try again") { error = false; retry++ }
             }
         }
@@ -205,21 +206,21 @@ internal fun GalleryVideo(photo: GalleryPhoto, active: Boolean, initialPosition:
             enter = fadeIn(tween(180)), exit = fadeOut(tween(220))) {
             BoxWithConstraints(Modifier.fillMaxWidth()
                 .onSizeChanged { onControlsHeightChanged(with(density) { it.height.toDp() } + 16.dp) }) {
-                val shape = com.unspektrawesome.ui.camera.CameraStyle.PanelShape
+                val shape = Diagram.ControlShape
                 val playback: @Composable (Modifier) -> Unit = { playbackModifier ->
                 Row(playbackModifier.widthIn(max = 600.dp).fillMaxWidth()
                     .padding(horizontal = 4.dp).testTag("Video controls").clip(shape)
-                    .background(CameraColors.MenuBackground, alpha = .55f).border(1.dp, CameraColors.MenuBorder, shape)
-                    .padding(horizontal = 6.dp, vertical = 2.dp),
+                    .background(Color(0xD90C0C0C)).border(1.dp, Diagram.Border, shape)
+                    .padding(start = 2.dp, end = 10.dp, top = 2.dp, bottom = 2.dp),
                     verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Box(Modifier.size(48.dp).testTag("Video play pause")
                         .clickable(enabled = enabled, role = Role.Button, onClick = ::togglePlayback)
                         .semantics { contentDescription = label }, contentAlignment = Alignment.Center) {
                         Box(Modifier.size(40.dp).clip(CircleShape)
-                            .border(1.dp, if (enabled) CameraColors.Accent else CameraColors.MenuBorder, CircleShape),
+                            .border(1.dp, if (enabled) CameraColors.Accent else Diagram.Line, CircleShape),
                             contentAlignment = Alignment.Center) {
                             GallerySymbolIcon(if (playRequested) GallerySymbol.PAUSE else GallerySymbol.PLAY,
-                                if (enabled) CameraColors.Accent else CameraColors.Muted, Modifier.size(18.dp))
+                                if (enabled) CameraColors.Accent else Diagram.Hint, Modifier.size(16.dp))
                         }
                     }
                     VideoSeekBar(position, duration, enabled = enabled && duration > 0, modifier = Modifier.weight(1f),
@@ -241,11 +242,11 @@ internal fun GalleryVideo(photo: GalleryPhoto, active: Boolean, initialPosition:
                                 revealControls()
                                 savePosition(position)
                             })
-                    Column(Modifier.padding(end = 6.dp), horizontalAlignment = Alignment.End) {
-                        Text(videoDuration(position), translate = false, color = CameraColors.Text,
-                            fontSize = 11.sp, lineHeight = 13.sp, fontFamily = com.unspektrawesome.ui.camera.CameraTypography.Readout, maxLines = 1)
-                        Text(videoDuration(duration), translate = false, color = CameraColors.Muted,
-                            fontSize = 10.sp, lineHeight = 13.sp, fontFamily = com.unspektrawesome.ui.camera.CameraTypography.Readout, maxLines = 1)
+                    Column(horizontalAlignment = Alignment.End) {
+                        Text(videoDuration(position), translate = false, color = CameraColors.Text, fontWeight = FontWeight.Medium,
+                            fontSize = 11.sp, lineHeight = 13.sp, fontFamily = Diagram.Mono, maxLines = 1)
+                        Text(videoDuration(duration), translate = false, color = Diagram.Hint,
+                            fontSize = 10.sp, lineHeight = 13.sp, fontFamily = Diagram.Mono, maxLines = 1)
                     }
                 }
                 }

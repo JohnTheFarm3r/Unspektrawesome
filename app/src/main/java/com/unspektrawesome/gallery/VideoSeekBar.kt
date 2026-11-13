@@ -10,7 +10,10 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.key.*
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
@@ -80,10 +83,11 @@ internal fun VideoSeekBar(position: Long, duration: Long, enabled: Boolean,
         val right = Offset((size.width - inset).coerceAtLeast(inset), center.y)
         val thumb = Offset(left.x + (right.x - left.x) * (position.toDouble() / limit).coerceIn(0.0, 1.0).toFloat(), center.y)
         val color = if (enabled) CameraColors.Accent else CameraColors.Muted
-        drawLine(CameraColors.MenuBorder, left, right, 2.dp.toPx(), StrokeCap.Round)
+        drawLine(Color(0xFF3A3A3A), left, right, 2.dp.toPx(), StrokeCap.Round)
         drawLine(color, left, thumb, 2.dp.toPx(), StrokeCap.Round)
-        if (dragging) drawCircle(color.copy(alpha = .14f), 15.dp.toPx(), thumb)
-        drawCircle(CameraColors.MenuBackground, 8.dp.toPx(), thumb)
-        drawCircle(color, (if (dragging) 6 else 5).dp.toPx(), thumb)
+        // The dot grows and gains a dashed ring while it is dragged.
+        if (dragging) drawCircle(color, 11.dp.toPx(), thumb, style = Stroke(1.dp.toPx(),
+            pathEffect = PathEffect.dashPathEffect(floatArrayOf(2.dp.toPx(), 2.dp.toPx()))))
+        drawCircle(color, (if (dragging) 6 else 4).dp.toPx(), thumb)
     }
 }

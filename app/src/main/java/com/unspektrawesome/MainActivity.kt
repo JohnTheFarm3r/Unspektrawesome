@@ -415,6 +415,8 @@ open class MainActivity : ComponentActivity() {
                     )
                 }
 
+                // The camera screen keeps its original text layout.
+                androidx.compose.runtime.CompositionLocalProvider(com.unspektrawesome.language.LocalOwnTextWidth provides false) {
                 CameraScreen(
                     onAutoLensDiscovery = { discoveryVisible = true },
                     manualLensProfilesRequest = manualLensProfilesRequest,
@@ -599,6 +601,7 @@ open class MainActivity : ComponentActivity() {
                         )
                     },
                 )
+                }
             }
         }
     }

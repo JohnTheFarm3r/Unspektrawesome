@@ -23,10 +23,20 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
+import com.unspektrawesome.gallery.GalleryButton
+import com.unspektrawesome.gallery.GalleryButtonStyle
+import com.unspektrawesome.gallery.StorageAccessDrawing
 import com.unspektrawesome.language.LanguageText as Text
 import com.unspektrawesome.ui.camera.CameraColors
 import com.unspektrawesome.ui.camera.AmbientScreen
-import com.unspektrawesome.R
+import com.unspektrawesome.ui.camera.Diagram
+import com.unspektrawesome.ui.camera.DiagramNote
 
 internal object StorageAccessSetup {
     const val REVISION = 2
@@ -65,42 +75,42 @@ internal fun StorageAccessOnboarding(onComplete: () -> Unit) {
 internal fun StorageAccessPage(granted: Boolean, unavailable: Boolean = false, onRequest: () -> Unit, onComplete: () -> Unit) {
     AmbientScreen(Modifier.fillMaxSize()) {
     Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)
-        .padding(horizontal = 20.dp).testTag("Storage access onboarding"), horizontalAlignment = Alignment.CenterHorizontally) {
+        .testTag("Storage access onboarding"), horizontalAlignment = Alignment.CenterHorizontally) {
         Column(Modifier.widthIn(max = 520.dp).fillMaxHeight()) {
-            OnboardingHeader()
-            Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(top = 24.dp, bottom = 32.dp),
-                verticalArrangement = Arrangement.spacedBy(24.dp)) {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text("GALLERY & STORAGE", color = CameraColors.Muted, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 1.sp)
-                    Text("Find your photos and RAW queue", color = CameraColors.Text, fontSize = 32.sp, lineHeight = 36.sp,
-                        fontWeight = FontWeight.SemiBold)
-                }
-                OnboardingPanel(R.drawable.ic_onboarding_folder_search) {
-                    Text("Allow all-files access so Gallery can find photos, videos and waiting RAWs in DCIM/Unspektrawesome after an update, reinstall or app-data reset. Saved DNGs keep the settings needed to restore your processing queue, including older captures.",
-                        color = CameraColors.Muted, fontSize = 15.sp, lineHeight = 23.sp)
-                }
-                OnboardingPanel(R.drawable.ic_onboarding_settings_2) {
-                    Text("Android will open its All files access settings. Enable access for Unspektrawesome, then return here. This grants broad access to shared storage; Gallery looks in the app's media folder.",
-                        color = CameraColors.Muted, fontSize = 15.sp, lineHeight = 23.sp)
-                    if (unavailable) {
-                        OnboardingDivider()
-                        Text("Open Android settings to allow all-files access, or use Media access in Gallery.",
-                            color = CameraColors.Text, fontSize = 14.sp, lineHeight = 21.sp)
-                    }
-                }
-                OnboardingPanel(R.drawable.ic_onboarding_shield_check) {
-                    Text("You can skip this. Gallery will still show Missing photos or videos? and Media access when access is limited. Your saved photos and RAWs stay on the phone.",
-                        color = CameraColors.Muted, fontSize = 15.sp, lineHeight = 23.sp)
-                }
-                if (granted) {
-                    Text("All-files access granted", color = CameraColors.Accent, fontSize = 14.sp)
+            Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(start = 12.dp, end = 12.dp, top = 10.dp, bottom = 20.dp)) {
+                StorageAccessDrawing(granted)
+                Column(Modifier.padding(horizontal = 6.dp).padding(top = 12.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+                    Text("GALLERY & STORAGE", color = CameraColors.Accent, fontSize = 10.sp, lineHeight = 14.sp,
+                        fontWeight = FontWeight.SemiBold, letterSpacing = 1.6.sp)
+                    Text("Find your photos and RAW queue", color = CameraColors.Text, fontSize = 21.sp, lineHeight = 26.sp,
+                        fontWeight = FontWeight.SemiBold, modifier = Modifier.semantics { heading() })
+                    StorageParagraph("Allow all-files access so Gallery can find photos, videos and waiting RAWs in DCIM/Unspektrawesome after an update, reinstall or app-data reset. Saved DNGs keep the settings needed to restore your processing queue, including older captures.")
+                    StorageParagraph("Android will open its All files access settings. Enable access for Unspektrawesome, then return here. This grants broad access to shared storage; Gallery looks in the app's media folder.")
+                    if (unavailable) DiagramNote("Open Android settings to allow all-files access, or use Media access in Gallery.", warning = true)
+                    StorageParagraph("You can skip this. Gallery will still show Missing photos or videos? and Media access when access is limited. Your saved photos and RAWs stay on the phone.")
                 }
             }
-            OnboardingNavigation(primaryLabel = if (granted) "Continue" else "Allow all-files access",
-                primaryModifier = Modifier.testTag("Storage grant"), onPrimary = if (granted) onComplete else onRequest,
-                secondaryLabel = "Not now", secondaryModifier = Modifier.testTag("Storage skip"),
-                onSecondary = onComplete, sizingLabels = listOf("Allow all-files access", "Not now", "Continue"))
+            Column(Modifier.fillMaxWidth().drawBehind {
+                drawLine(Diagram.StageBorder, Offset.Zero, Offset(size.width, 0f), 1.dp.toPx())
+            }.padding(start = 18.dp, end = 18.dp, top = 8.dp, bottom = 14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                if (granted) Row(Modifier.padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Box(Modifier.size(6.dp).background(CameraColors.Accent, CircleShape))
+                    Text("All-files access granted", color = CameraColors.Accent, fontSize = 12.sp, lineHeight = 16.sp)
+                }
+                FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.End)) {
+                    GalleryButton("Not now", Modifier.testTag("Storage skip"), onClick = onComplete)
+                    GalleryButton(if (granted) "Continue" else "Allow all-files access", Modifier.testTag("Storage grant"),
+                        style = GalleryButtonStyle.Filled, sizingLabels = listOf("Allow all-files access", "Continue"),
+                        onClick = if (granted) onComplete else onRequest)
+                }
+            }
         }
     }
     }
+}
+
+@Composable
+private fun StorageParagraph(text: String) {
+    Text(text, color = Color(0xFFB0B0B0), fontSize = 12.5.sp, lineHeight = 18.sp)
 }

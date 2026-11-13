@@ -24,8 +24,10 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.PagerState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import com.unspektrawesome.language.LanguageText as Text
+import androidx.compose.ui.graphics.Color
+import com.unspektrawesome.ui.camera.Diagram
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -43,16 +45,12 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.selected
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.unit.sp
 import com.unspektrawesome.ui.camera.CameraColors
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun PhotoViewer(photos: List<GalleryPhoto>, initialUri: String, jobs: List<GalleryShot>, onDismiss: () -> Unit,
     onError: (String) -> Unit, onDeleted: () -> Unit) {
@@ -119,41 +117,24 @@ internal fun PhotoViewer(photos: List<GalleryPhoto>, initialUri: String, jobs: L
     val viewerHeader: @Composable (Boolean, () -> Unit) -> Unit = { compact, onInteraction ->
         Row(Modifier.fillMaxWidth().testTag("Video viewer header")
             .onSizeChanged { videoHeaderHeight = with(density) { it.height.toDp() } + 20.dp }, verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            GalleryIconButton("Back", onClick = { onInteraction(); closeViewer() }) {
-                GallerySymbolIcon(GallerySymbol.BACK, CameraColors.Text, Modifier.size(24.dp))
-            }
-            if (!compact) Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
-                photo?.let {
-                    Column(Modifier.clip(RoundedCornerShape(12.dp)).background(CameraColors.MenuBackground, alpha = .45f)
-                        .padding(horizontal = 12.dp, vertical = 4.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(date(it.capturedAt, "d MMMM yyyy"), translate = false, color = CameraColors.Text,
-                            fontSize = 13.sp, fontWeight = FontWeight.Medium, textAlign = TextAlign.Center)
-                        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally),
-                            itemVerticalAlignment = Alignment.CenterVertically) {
-                            Text(date(it.capturedAt, "HH:mm:ss"), translate = false, color = CameraColors.Muted, fontSize = 10.sp)
-                            Text("{value1} / {size}", arguments = mapOf("value1" to pager.currentPage + 1, "size" to photos.size),
-                                color = CameraColors.Muted, fontSize = 10.sp)
-                        }
-                    }
-                }
-                if (photo == null) {
-                    Text("Media unavailable", color = CameraColors.Muted, fontSize = 13.sp)
-                    Text("{value1} / {size}", arguments = mapOf("value1" to 0, "size" to 0), color = CameraColors.Muted, fontSize = 10.sp)
-                }
-            }
+            horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            ViewerIconButton("Back", GallerySymbol.BACK, onClick = { onInteraction(); closeViewer() })
+            if (!compact) ViewerDatePill(photo, pager.currentPage, photos.size, Modifier.weight(1f))
             if (!compact) Spacer(Modifier.width(48.dp))
         }
     }
     val videoHeader: @Composable (() -> Unit) -> Unit = { viewerHeader(false, it) }
     val viewerActions: @Composable (() -> Unit) -> Unit = { onInteraction ->
         photo?.let { target -> key(target.uri) {
-            GalleryViewerActions(info, { onInteraction(); share(target.uri, false) }, { onInteraction(); info = !info },
-                modifier = if (target.isVideo) Modifier.testTag("Video viewer actions") else Modifier.testTag("Photo viewer actions"),
-                onMoreChanged = { moreVisible = it; onInteraction() }) { dismissMenu ->
-                if (shot?.hasRaw == true && !shot.panorama) GalleryMenuItem("Share RAW") { dismissMenu(); share(shot.rawUri, true) }
-                GalleryMenuItem("Delete", enabled = processing.currentId != shot?.id || shot == null) {
-                    dismissMenu(); onInteraction(); deleting = target
+            fun dismissMenu() { moreVisible = false; onInteraction() }
+            ViewerActionBar(info, moreVisible, { onInteraction(); share(target.uri, false) }, { onInteraction(); info = !info },
+                onMore = { moreVisible = true; onInteraction() }, onDismissMore = ::dismissMenu,
+                modifier = if (target.isVideo) Modifier.testTag("Video viewer actions") else Modifier.testTag("Photo viewer actions")) {
+                if (shot?.hasRaw == true && !shot.panorama) MediaMenuItem("Share RAW", choice = false,
+                    trailing = { MenuFormatTag("DNG") }) { dismissMenu(); share(shot.rawUri, true) }
+                MediaMenuItem("Delete", choice = false, enabled = processing.currentId != shot?.id || shot == null,
+                    trailing = formatTag(target.mimeType)?.let { tag -> @Composable { MenuFormatTag(tag) } }) {
+                    dismissMenu(); deleting = target
                 }
             }
         } }
@@ -195,7 +176,7 @@ internal fun PhotoViewer(photos: List<GalleryPhoto>, initialUri: String, jobs: L
                         enter = fadeIn(tween(180)) + slideInHorizontally(tween(220)) { it / 4 },
                         exit = fadeOut(tween(180)) + slideOutHorizontally(tween(220)) { it / 4 }) {
                         photo?.let { PhotoMetadata(it, shot, Modifier.fillMaxSize(), showDate = true,
-                            onClose = { info = false }) }
+                            videoPosition = videoPositions[it.uri.toString()] ?: 0, onClose = { info = false }) }
                     }
                     if (controlsVisible && !videoPage) Row(Modifier.align(Alignment.TopStart).fillMaxWidth()
                         .padding(start = 8.dp, top = 8.dp, end = if (info) metadataWidth + 16.dp else 8.dp)) {
@@ -203,8 +184,9 @@ internal fun PhotoViewer(photos: List<GalleryPhoto>, initialUri: String, jobs: L
                     }
                     AnimatedVisibility(controlsVisible && !videoPage, modifier = Modifier.align(Alignment.BottomCenter).padding(8.dp),
                         enter = fadeIn(tween(180)), exit = fadeOut(tween(180))) {
-                        Column(Modifier.widthIn(max = 600.dp).fillMaxWidth().clip(RoundedCornerShape(18.dp))
-                            .background(CameraColors.MenuBackground).testTag("Photo viewer floating controls")
+                        Column(Modifier.widthIn(max = 600.dp).fillMaxWidth().clip(Diagram.WindowShape)
+                            .background(Color(0xE60C0C0C)).border(1.dp, Diagram.Border, Diagram.WindowShape)
+                            .testTag("Photo viewer floating controls")
                             .onSizeChanged { photoControlsHeight = with(density) { it.height.toDp() } }) {
                             viewerActions { }
                         }
@@ -235,7 +217,8 @@ internal fun PhotoViewer(photos: List<GalleryPhoto>, initialUri: String, jobs: L
                                 .height(informationHeight),
                             enter = fadeIn(tween(180)) + slideInVertically(tween(260)) { it },
                             exit = fadeOut(tween(180)) + slideOutVertically(tween(220)) { it }) {
-                            photo?.let { PhotoMetadata(it, shot, Modifier.fillMaxSize(), onClose = { info = false }) }
+                            photo?.let { PhotoMetadata(it, shot, Modifier.fillMaxSize(),
+                                videoPosition = videoPositions[it.uri.toString()] ?: 0, onClose = { info = false }) }
                         }
                     }
                     if (photo != null && !videoPage) {
@@ -289,7 +272,8 @@ private fun ViewerMedia(photo: GalleryPhoto, active: Boolean,
         PhotoImage(photo.uri, null, Modifier.fillMaxSize(), imageKey = photo.generation, isVideo = photo.isVideo,
             contentScale = if (photo.isBurst) ContentScale.Fit else ContentScale.Crop)
         if (photo.isBurst) BurstCoverButton(active, onOpenMedia)
-        else GalleryIconButton("Play", Modifier.background(CameraColors.Glass, RoundedCornerShape(24.dp)), onClick = onOpenMedia) {
+        else GalleryIconButton("Play", Modifier.size(64.dp).background(Diagram.Glass, CircleShape)
+            .border(1.dp, Diagram.Border, CircleShape), onClick = onOpenMedia) {
             GallerySymbolIcon(GallerySymbol.PLAY, CameraColors.Text, Modifier.size(24.dp))
         }
     }
@@ -311,12 +295,11 @@ private fun BurstCoverButton(active: Boolean, onClick: () -> Unit) {
             opacity.animateTo(1f, tween(420))
         } else opacity.snapTo(1f)
     }
-    val shape = RoundedCornerShape(24.dp)
     GalleryIconButton("BURST", Modifier.size(64.dp).testTag("Burst cover action")
         .graphicsLayer { alpha = opacity.value }
-        .background(CameraColors.Glass, shape).border(2.dp, CameraColors.Accent, shape),
+        .background(Diagram.Glass, CircleShape).border(2.dp, CameraColors.Accent, CircleShape),
         enabled = active, onClick = onClick) {
-        GallerySymbolIcon(GallerySymbol.STACK, CameraColors.Accent, Modifier.size(32.dp))
+        GallerySymbolIcon(GallerySymbol.STACK, CameraColors.Accent, Modifier.size(30.dp))
     }
 }
 
@@ -324,16 +307,21 @@ private fun BurstCoverButton(active: Boolean, onClick: () -> Unit) {
 private fun PhotoFilmstrip(photos: List<GalleryPhoto>, selected: Int, onSelect: (Int) -> Unit) {
     val scroll = androidx.compose.foundation.lazy.rememberLazyListState()
     LaunchedEffect(selected) { scroll.animateScrollToItem((selected - 2).coerceAtLeast(0)) }
-    androidx.compose.foundation.lazy.LazyRow(state = scroll, contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
-        horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth().testTag("Photo filmstrip")) {
+    androidx.compose.foundation.lazy.LazyRow(state = scroll, contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(2.dp, Alignment.CenterHorizontally),
+        modifier = Modifier.fillMaxWidth().testTag("Photo filmstrip")) {
         items(photos.size, key = { photos[it].uri.toString() }) { index ->
             val item = photos[index]
-            val shape = RoundedCornerShape(7.dp)
-            Box(Modifier.size(60.dp, 44.dp).clip(shape).background(CameraColors.MenuCard)
-                .clickable(role = Role.Button) { onSelect(index) }
-                .languageSemantics { contentDescription = item.name; this.selected = index == selected }) {
-                PhotoImage(item.uri, null, Modifier.fillMaxSize(), imageKey = item.generation, isVideo = item.isVideo)
-                if (index == selected) Box(Modifier.matchParentSize().border(2.dp, CameraColors.Accent, shape))
+            val current = index == selected
+            Box(Modifier.size(44.dp).clip(Diagram.ControlShape).clickable(role = Role.Button) { onSelect(index) }
+                .languageSemantics { contentDescription = item.name; this.selected = current }, contentAlignment = Alignment.Center) {
+                Box(Modifier.size(42.dp, 32.dp).then(if (current) Modifier.border(1.5.dp, CameraColors.Accent, RoundedCornerShape(3.dp))
+                    .padding(2.5.dp) else Modifier.padding(1.dp)).clip(RoundedCornerShape(2.dp)).background(CameraColors.MenuCard)
+                    .graphicsLayer { alpha = if (current) 1f else .55f }, contentAlignment = Alignment.Center) {
+                    PhotoImage(item.uri, null, Modifier.fillMaxSize(), imageKey = item.generation, isVideo = item.isVideo)
+                    if (item.isVideo) GalleryIcon(4, CameraColors.Text, Modifier.size(10.dp))
+                    if (item.isBurst) GallerySymbolIcon(GallerySymbol.STACK, CameraColors.Text, Modifier.size(12.dp))
+                }
             }
         }
     }

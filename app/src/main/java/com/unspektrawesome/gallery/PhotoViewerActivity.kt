@@ -46,7 +46,9 @@ class PhotoViewerActivity : ComponentActivity() {
         setContent {
             UnspektrawesomeTheme {
                 SavedCameraBrightness()
-                photoUri?.let { uri -> key(uri) { CameraPhotoReview(uri, onDismiss = ::finish) } }
+                androidx.compose.runtime.CompositionLocalProvider(com.unspektrawesome.language.LocalOwnTextWidth provides true) {
+                    photoUri?.let { uri -> key(uri) { CameraPhotoReview(uri, onDismiss = ::finish) } }
+                }
             }
         }
     }

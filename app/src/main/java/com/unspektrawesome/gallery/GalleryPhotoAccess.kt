@@ -8,9 +8,14 @@ import android.os.Build
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
@@ -56,11 +61,15 @@ internal fun GalleryPhotoAccess(revision: Int, onAccessChanged: () -> Unit) {
 @Composable
 internal fun GalleryPhotoAccessCard(onRequest: () -> Unit, onSettings: () -> Unit, modifier: Modifier = Modifier) {
     GalleryCard(modifier = modifier.testTag("Gallery photo access")) {
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Missing photos or videos?", color = CameraColors.Text, fontSize = 13.sp, lineHeight = 18.sp,
-                fontWeight = FontWeight.SemiBold, modifier = Modifier.align(Alignment.CenterVertically))
-            GalleryAction("Media access", selected = true, onClick = onRequest)
-            GalleryAction("Settings", onClick = onSettings)
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(0.dp)) {
+            Row(Modifier.align(Alignment.CenterVertically).padding(end = 4.dp), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Box(Modifier.size(6.dp).background(CameraColors.Accent, CircleShape))
+                Text("Missing photos or videos?", color = CameraColors.Text, fontSize = 12.5.sp, lineHeight = 17.sp,
+                    fontWeight = FontWeight.SemiBold)
+            }
+            GalleryButton("Media access", style = GalleryButtonStyle.Accent, compact = true, onClick = onRequest)
+            GalleryButton("Settings", compact = true, onClick = onSettings)
         }
     }
 }

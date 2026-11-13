@@ -141,7 +141,7 @@ internal fun AmbientScreen(
     val backdrop = if (nested) inherited else remember { AmbientBackdrop() }
     Box(modifier.then(if (nested) Modifier else Modifier.background(CameraColors.Background))) {
         CompositionLocalProvider(LocalAmbientView provides view, LocalPageCardColor provides CameraColors.AmbientCard,
-            LocalAmbientBackdrop provides backdrop) {
+            LocalAmbientBackdrop provides backdrop, com.unspektrawesome.language.LocalOwnTextWidth provides true) {
             if (!nested) AmbientBackground(Modifier.matchParentSize(), active)
             content()
         }

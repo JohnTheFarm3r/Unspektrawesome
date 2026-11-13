@@ -121,11 +121,11 @@ internal fun rememberLensProfileTransfer(preferences: CameraPreferences, mode: L
 @Composable
 internal fun LensProfileImportChoices(mode: LensProfileImportMode, target: LensProfileMode,
     onChange: (LensProfileImportMode) -> Unit) {
-    SettingsCard {
-        SettingsChoices(listOf("Keep existing", "Replace all"), mode.ordinal) {
+    androidx.compose.foundation.layout.Column {
+        DiagramSegmented(listOf("Keep existing", "Replace all"), mode.ordinal) {
             onChange(LensProfileImportMode.entries[it])
         }
-        SettingsHint(when {
+        DiagramHint(when {
             mode == LensProfileImportMode.KEEP_EXISTING -> "Existing profiles are kept. Matching names become copies."
             target == LensProfileMode.VIDEO -> "All existing video lens profiles are removed and replaced by the selected imports."
             else -> "All existing photo lens profiles are removed and replaced by the selected imports."
