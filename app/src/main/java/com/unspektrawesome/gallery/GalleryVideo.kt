@@ -56,6 +56,7 @@ import com.unspektrawesome.language.LanguageText as Text
 import com.unspektrawesome.ui.camera.CameraColors
 import com.unspektrawesome.ui.camera.Diagram
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontWeight
 import kotlinx.coroutines.delay
 import java.util.Locale
@@ -77,6 +78,8 @@ internal fun GalleryVideo(photo: GalleryPhoto, active: Boolean, initialPosition:
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     var resumed by remember(lifecycle) { mutableStateOf(lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) }
     var position by remember(photo.uri) { mutableLongStateOf(initialPosition) }
+    // Where the still under the player was taken; it moves only when the player is released.
+    var stillPosition by remember(photo.uri) { mutableLongStateOf(initialPosition) }
     val savePosition by rememberUpdatedState(onPositionChanged)
     var duration by remember(photo.uri, photo.generation) { mutableLongStateOf(photo.durationMs) }
     var player by remember { mutableStateOf<ExoPlayer?>(null) }
@@ -85,6 +88,11 @@ internal fun GalleryVideo(photo: GalleryPhoto, active: Boolean, initialPosition:
     var scrubbing by remember { mutableStateOf(false) }
     var error by remember(photo.uri) { mutableStateOf(false) }
     var frameReady by remember { mutableStateOf(false) }
+    var stillCovering by remember(photo.uri) { mutableStateOf(true) }
+    LaunchedEffect(frameReady) {
+        // The first rendered frame reaches the screen a few refreshes after the player reports it.
+        if (frameReady) { delay(120); stillCovering = false } else stillCovering = true
+    }
     var retry by remember { mutableIntStateOf(0) }
     var controlsVisible by remember(photo.uri) { mutableStateOf(true) }
     var controlsInteraction by remember { mutableIntStateOf(0) }
@@ -131,6 +139,7 @@ internal fun GalleryVideo(photo: GalleryPhoto, active: Boolean, initialPosition:
             if (instance != null) {
                 position = instance.currentPosition
                 savePosition(position)
+                stillPosition = position
                 instance.release()
             }
             player = null
@@ -184,6 +193,9 @@ internal fun GalleryVideo(photo: GalleryPhoto, active: Boolean, initialPosition:
                     onRelease = { it.player = null; it.keepScreenOn = false }, modifier = Modifier.fillMaxSize().clipToBounds()
                         .then(if (frameReady) Modifier.testTag("Video picture") else Modifier))
             }
+            // A sharp still of the starting frame covers the player until its first picture is on screen,
+            // so moving onto a video never shows a blurry thumbnail swap or a black gap.
+            if (stillCovering) VideoStill(photo, stillPosition, Modifier.fillMaxSize())
             Box(Modifier.matchParentSize().testTag("Video playback surface")
                 .clickable(interactionSource = null, indication = null, role = Role.Button) {
                     if (controlsVisible) { controlsVisible = false; onControlsHidden() } else revealControls()
@@ -263,5 +275,55 @@ internal fun GalleryVideo(photo: GalleryPhoto, active: Boolean, initialPosition:
                 }
             }
         }
+    }
+}
+
+/** Screen-sized frames already read from videos, so swiping back shows them at once. */
+private object VideoStills {
+    val cache = object : android.util.LruCache<String, android.graphics.Bitmap>(64 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: android.graphics.Bitmap) = value.allocationByteCount
+    }
+
+    /** Reads the frame at [positionMs] scaled to fit [viewport] pixels, upright as the player shows it. */
+    fun load(context: android.content.Context, photo: GalleryPhoto, positionMs: Long, viewport: androidx.compose.ui.unit.IntSize): android.graphics.Bitmap? =
+        android.media.MediaMetadataRetriever().use { retriever ->
+            retriever.setDataSource(context, photo.uri)
+            val width = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: return null
+            val height = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: return null
+            val rotation = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+            val turned = rotation % 180 != 0
+            val shownWidth = if (turned) height else width
+            val shownHeight = if (turned) width else height
+            val scale = minOf(1f, viewport.width.toFloat() / shownWidth, viewport.height.toFloat() / shownHeight)
+            val targetWidth = (width * scale).toInt().coerceAtLeast(1)
+            val targetHeight = (height * scale).toInt().coerceAtLeast(1)
+            val frame = retriever.getScaledFrameAtTime(positionMs * 1000, android.media.MediaMetadataRetriever.OPTION_CLOSEST,
+                if (turned) targetHeight else targetWidth, if (turned) targetWidth else targetHeight) ?: return null
+            // Some decoders return the stored orientation; turn it to match what playback shows.
+            if (turned && (frame.width > frame.height) != (shownWidth > shownHeight)) {
+                val matrix = android.graphics.Matrix().apply { postRotate(rotation.toFloat()) }
+                android.graphics.Bitmap.createBitmap(frame, 0, 0, frame.width, frame.height, matrix, true).also { frame.recycle() }
+            } else frame
+        }
+}
+
+/** The small gallery thumbnail at once, replaced by a screen-sized frame from the video itself. */
+@Composable
+private fun VideoStill(photo: GalleryPhoto, positionMs: Long, modifier: Modifier) {
+    val context = LocalContext.current
+    var viewport by remember { mutableStateOf(androidx.compose.ui.unit.IntSize.Zero) }
+    val key = listOf(photo.uri, photo.generation, positionMs, viewport.width, viewport.height).joinToString("|")
+    val sharp by produceState(VideoStills.cache.get(key), key) {
+        if (value != null || viewport.width == 0 || viewport.height == 0) return@produceState
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching { VideoStills.load(context, photo, positionMs, viewport) }.getOrNull()
+        }?.also { VideoStills.cache.put(key, it) }
+    }
+    Box(modifier.onSizeChanged { viewport = it }) {
+        val frame = sharp
+        if (frame != null) androidx.compose.foundation.Image(frame.asImageBitmap(), null, Modifier.fillMaxSize(),
+            contentScale = androidx.compose.ui.layout.ContentScale.Fit)
+        else PhotoImage(photo.uri, null, Modifier.fillMaxSize(), imageKey = photo.generation, isVideo = true,
+            contentScale = androidx.compose.ui.layout.ContentScale.Fit)
     }
 }

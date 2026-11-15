@@ -1,106 +1,89 @@
 package com.unspektrawesome.ui.onboarding
 
-import androidx.annotation.DrawableRes
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.LocalTextStyle
-import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.unspektrawesome.language.LocalAppLanguage
 import com.unspektrawesome.language.LanguageText as Text
 import com.unspektrawesome.ui.camera.CameraColors
-import com.unspektrawesome.ui.camera.pageCardBackground
+import com.unspektrawesome.ui.camera.Diagram
 import com.unspektrawesome.ui.camera.SettingsIcon
 import com.unspektrawesome.ui.camera.SettingsSymbol
 
+/** App name, an optional small Skip link and the page progress, in the settings page style. */
 @Composable
 internal fun OnboardingHeader(
     page: Int? = null,
-    reserveSkip: Boolean = false,
     onSkip: (() -> Unit)? = null,
     cameraAccess: Boolean = false,
 ) {
-    val language = LocalAppLanguage.current.renderer
-    val measurer = rememberTextMeasurer()
-    val density = LocalDensity.current
-    val brandStyle = LocalTextStyle.current.copy(fontSize = 11.sp, lineHeight = 16.sp, fontWeight = FontWeight.Medium)
-    val actionStyle = LocalTextStyle.current.copy(fontSize = 14.sp, lineHeight = 20.sp, fontWeight = FontWeight.SemiBold)
-    BoxWithConstraints(Modifier.fillMaxWidth().padding(top = 16.dp, bottom = 16.dp)) {
-        val brandWidth = with(density) { measurer.measure("UNSPEKTRAWESOME", brandStyle).size.width.toDp() } + 38.dp
-        val naturalSkipWidth = with(density) { measurer.measure(language.text("Skip introduction"), actionStyle).size.width.toDp() } + 32.dp
-        val skipWidth = naturalSkipWidth.coerceAtMost(maxWidth)
-        val skipHeight = with(density) {
-            measurer.measure(language.text("Skip introduction"), actionStyle,
-                constraints = Constraints(maxWidth = (skipWidth - 32.dp).roundToPx().coerceAtLeast(1))).size.height.toDp()
-        }.plus(28.dp).coerceAtLeast(56.dp)
-        val inline = brandWidth + skipWidth + 12.dp <= maxWidth
-        val glyph: @Composable () -> Unit = {
-            Box(Modifier.size(28.dp).border(1.dp, CameraColors.MenuBorder, RoundedCornerShape(8.dp)),
-                contentAlignment = Alignment.Center) {
-                SettingsIcon(SettingsSymbol.Aperture, Modifier.size(16.dp), CameraColors.Text)
+    Column(Modifier.fillMaxWidth().padding(top = 10.dp, bottom = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(Modifier.fillMaxWidth().heightIn(min = 44.dp), verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Box(Modifier.size(26.dp).border(1.dp, Diagram.Border, Diagram.ControlShape), contentAlignment = Alignment.Center) {
+                SettingsIcon(SettingsSymbol.Aperture, Modifier.size(14.dp), CameraColors.Text)
             }
+            Text("UNSPEKTRAWESOME", translate = false, color = Diagram.Hint, fontSize = 10.sp, lineHeight = 14.sp,
+                letterSpacing = 1.4.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+            if (onSkip != null) OnboardingSkip(onSkip)
         }
-        val name: @Composable () -> Unit = {
-            Text("UNSPEKTRAWESOME", translate = false, color = CameraColors.Muted, style = brandStyle)
-        }
-        val brand: @Composable () -> Unit = {
-            if (brandWidth > maxWidth) Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { glyph(); name() }
-            else Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) { glyph(); name() }
-        }
-        val skip: @Composable () -> Unit = {
-            if (onSkip != null) {
-                OnboardingAction("Skip introduction", Modifier.width(skipWidth).height(skipHeight), primary = false, onClick = onSkip)
-            } else Spacer(Modifier.size(skipWidth, skipHeight))
-        }
-        Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            if (reserveSkip && inline) {
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween) { brand(); skip() }
-            } else {
-                brand()
-                if (reserveSkip) Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) { skip() }
-            }
-            if (page != null) {
-                val counter = "${page + 1} / $ONBOARDING_PAGES"
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        repeat(ONBOARDING_PAGES) { index ->
-                            Box(Modifier.weight(1f).height(4.dp).clip(RoundedCornerShape(2.dp))
-                                .background(if (index <= page) CameraColors.Accent else CameraColors.MenuBorder))
-                        }
+        if (page != null) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(Modifier.weight(1f).clearAndSetSemantics { }, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    repeat(ONBOARDING_PAGES) { index ->
+                        Box(Modifier.weight(1f).height(2.dp).clip(RoundedCornerShape(1.dp))
+                            .background(if (index <= page) CameraColors.Accent else Diagram.Border))
                     }
-                    Text(counter, translate = false,
-                        color = CameraColors.Muted, fontSize = 12.sp, lineHeight = 16.sp)
                 }
-            } else if (cameraAccess) {
-                Text("CAMERA ACCESS", color = CameraColors.Muted, fontSize = 12.sp, lineHeight = 16.sp)
+                val counter = "${page + 1} / $ONBOARDING_PAGES"
+                Text(counter, translate = false, color = Diagram.Hint, fontSize = 10.sp,
+                    lineHeight = 14.sp, fontFamily = Diagram.Mono)
             }
+        } else if (cameraAccess) {
+            Text("CAMERA ACCESS", color = Diagram.Hint, fontSize = 10.sp, lineHeight = 14.sp, letterSpacing = 1.4.sp)
         }
     }
     OnboardingDivider()
 }
 
+/** Small text link that jumps to the permissions page. */
 @Composable
-internal fun OnboardingDivider() {
-    Box(Modifier.fillMaxWidth().height(1.dp).background(CameraColors.MenuBorder))
+private fun OnboardingSkip(onClick: () -> Unit) {
+    Row(Modifier.heightIn(min = 44.dp).clip(Diagram.ControlShape).clickable(role = Role.Button, onClick = onClick)
+        .testTag("Skip introduction").padding(horizontal = 6.dp), verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text("Skip introduction", color = Diagram.Hint, fontSize = 11.5.sp, lineHeight = 15.sp,
+            textDecoration = TextDecoration.Underline, modifier = Modifier.widthIn(max = 160.dp))
+    }
 }
 
+@Composable
+internal fun OnboardingDivider() {
+    Box(Modifier.fillMaxWidth().height(1.dp).background(Diagram.Hairline))
+}
+
+/** Back and Continue at the bottom of the page. They share a row when the translated labels fit, and stack otherwise. */
 @Composable
 internal fun OnboardingNavigation(
     primaryLabel: String,
@@ -116,21 +99,23 @@ internal fun OnboardingNavigation(
     val language = LocalAppLanguage.current.renderer
     val measurer = rememberTextMeasurer()
     val density = LocalDensity.current
-    val style = LocalTextStyle.current.copy(fontSize = 14.sp, lineHeight = 20.sp, fontWeight = FontWeight.SemiBold)
-    OnboardingDivider()
-    BoxWithConstraints(Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 16.dp)) {
+    val style = LocalTextStyle.current.copy(fontSize = 13.sp, lineHeight = 18.sp, fontWeight = FontWeight.SemiBold)
+    BoxWithConstraints(Modifier.fillMaxWidth().drawBehind {
+        drawLine(Diagram.Hairline, Offset.Zero, Offset(size.width, 0f), 1.dp.toPx())
+    }.padding(top = 10.dp, bottom = 12.dp)) {
+        val icon = 22.dp
         val naturalWidth = with(density) { sizingLabels.maxOf {
-            measurer.measure(language.text(it), style).size.width + if (it == "Back") 24.dp.roundToPx() else 0
-        }.toDp() } + 32.dp
-        val paired = secondaryLabel != null && naturalWidth <= (maxWidth - 12.dp) / 2
-        val buttonWidth = if (paired) (maxWidth - 12.dp) / 2 else maxWidth
+            measurer.measure(language.text(it), style).size.width + if (it == "Back") icon.roundToPx() else 0
+        }.toDp() } + 28.dp
+        val paired = secondaryLabel != null && naturalWidth <= (maxWidth - 8.dp) / 2
+        val buttonWidth = if (paired) (maxWidth - 8.dp) / 2 else maxWidth
         val buttonHeight = with(density) {
             sizingLabels.maxOf {
-                val iconWidth = if (it == "Back") 24.dp else 0.dp
+                val iconWidth = if (it == "Back") icon else 0.dp
                 measurer.measure(language.text(it), style,
-                    constraints = Constraints(maxWidth = (buttonWidth - 32.dp - iconWidth).roundToPx().coerceAtLeast(1))).size.height
+                    constraints = Constraints(maxWidth = (buttonWidth - 28.dp - iconWidth).roundToPx().coerceAtLeast(1))).size.height
             }.toDp()
-        }.plus(28.dp).coerceAtLeast(56.dp)
+        }.plus(20.dp).coerceAtLeast(48.dp)
         val secondary: @Composable () -> Unit = {
             secondaryLabel?.let {
                 OnboardingAction(it, secondaryModifier.width(buttonWidth).height(buttonHeight), primary = false,
@@ -141,44 +126,12 @@ internal fun OnboardingNavigation(
             OnboardingAction(primaryLabel, primaryModifier.width(buttonWidth).height(buttonHeight),
                 enabled = primaryEnabled, onClick = onPrimary)
         }
-        if (paired) Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) { secondary(); primary() }
+        if (paired) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { secondary(); primary() }
         else Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { secondary(); primary() }
     }
 }
 
-@Composable
-internal fun OnboardingPanel(
-    @DrawableRes symbol: Int,
-    title: String? = null,
-    content: @Composable ColumnScope.() -> Unit,
-) {
-    val shape = RoundedCornerShape(18.dp)
-    Column(Modifier.fillMaxWidth().clip(shape).pageCardBackground()
-        .border(1.dp, CameraColors.MenuBorder, shape).padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        if (title != null) {
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                OnboardingGlyph(symbol)
-                Text(title, color = CameraColors.Text, fontSize = 15.sp, lineHeight = 21.sp,
-                    fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            }
-            content()
-        } else Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            OnboardingGlyph(symbol)
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(16.dp), content = content)
-        }
-    }
-}
-
-@Composable
-internal fun OnboardingGlyph(@DrawableRes symbol: Int, active: Boolean = false, modifier: Modifier = Modifier) {
-    Box(modifier.size(26.dp).border(1.dp, if (active) CameraColors.Accent else CameraColors.MenuBorder,
-        RoundedCornerShape(7.dp)), contentAlignment = Alignment.Center) {
-        Icon(painterResource(symbol), contentDescription = null, modifier = Modifier.size(15.dp),
-            tint = if (active) CameraColors.Accent else CameraColors.Muted)
-    }
-}
-
+/** Outlined button with the settings corners: lime outline for the main action, grey for the other. */
 @Composable
 internal fun OnboardingAction(
     label: String,
@@ -188,20 +141,19 @@ internal fun OnboardingAction(
     symbol: SettingsSymbol? = null,
     onClick: () -> Unit,
 ) {
-    val shape = RoundedCornerShape(28.dp)
     val ink = when {
         !enabled -> CameraColors.Muted.copy(alpha = .5f)
         primary -> CameraColors.Accent
         else -> CameraColors.Text
     }
-    Row(modifier.fillMaxWidth().heightIn(min = 56.dp).clip(shape)
-        .pageCardBackground()
-        .border(1.dp, if (primary && enabled) CameraColors.Accent else CameraColors.MenuBorder, shape)
+    Row(modifier.fillMaxWidth().heightIn(min = 48.dp).clip(Diagram.ControlShape)
+        .background(if (primary && enabled) CameraColors.Accent.copy(alpha = .06f) else Diagram.Glass)
+        .border(1.dp, if (primary && enabled) CameraColors.Accent else Diagram.Border, Diagram.ControlShape)
         .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
-        .padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally)) {
-        symbol?.let { SettingsIcon(it, Modifier.size(16.dp), ink) }
-        Text(label, color = ink, modifier = Modifier.weight(1f), fontSize = 14.sp, lineHeight = 20.sp,
+        .padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(7.dp, Alignment.CenterHorizontally)) {
+        symbol?.let { SettingsIcon(it, Modifier.size(15.dp), ink) }
+        Text(label, color = ink, modifier = Modifier.weight(1f), fontSize = 13.sp, lineHeight = 18.sp,
             fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center)
     }
 }

@@ -26,13 +26,16 @@ data class AeLimits(
     val maxIso: Int? = null,
     val minShutterNs: Long? = null,
     val maxShutterNs: Long? = null,
+    /** Saved before tested ISO ceilings, when the top choice was the advertised maximum. */
+    val legacyMaxIso: Boolean = false,
 ) {
     fun resolve(device: ExposureBounds): ExposureBounds {
         val lowerIso = (minIso ?: device.minIso).coerceIn(device.minIso, device.maxIso)
-        val upperIso = (maxIso ?: device.maxIso).coerceIn(lowerIso, device.maxIso)
+        val chosenMaxIso = maxIso?.takeUnless { legacyMaxIso && it >= device.reportedMaxIso }
+        val upperIso = (chosenMaxIso ?: device.maxIso).coerceIn(lowerIso, device.maxIso)
         val lowerTime = (minShutterNs ?: device.minShutterNs).coerceIn(device.minShutterNs, device.maxShutterNs)
         val upperTime = (maxShutterNs ?: DEFAULT_MAX_SHUTTER_NS).coerceIn(lowerTime, device.maxShutterNs)
-        return ExposureBounds(lowerIso, upperIso, lowerTime, upperTime)
+        return ExposureBounds(lowerIso, upperIso, lowerTime, upperTime, minOf(device.reportedMaxIso, upperIso))
     }
 
     companion object {
@@ -40,8 +43,12 @@ data class AeLimits(
     }
 }
 
-data class ExposureBounds(val minIso: Int, val maxIso: Int, val minShutterNs: Long, val maxShutterNs: Long) {
-    init { require(minIso > 0 && maxIso >= minIso && minShutterNs > 0 && maxShutterNs >= minShutterNs) }
+data class ExposureBounds(
+    val minIso: Int, val maxIso: Int, val minShutterNs: Long, val maxShutterNs: Long,
+    /** Upper end of the camera's advertised range; [maxIso] can be higher once tested. */
+    val reportedMaxIso: Int = maxIso,
+) {
+    init { require(minIso > 0 && maxIso >= minIso && minShutterNs > 0 && maxShutterNs >= minShutterNs && reportedMaxIso > 0) }
     fun clamp(value: SensorExposure) = SensorExposure(value.iso.coerceIn(minIso, maxIso), value.timeNs.coerceIn(minShutterNs, maxShutterNs))
 }
 

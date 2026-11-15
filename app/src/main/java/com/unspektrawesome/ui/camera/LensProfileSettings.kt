@@ -83,6 +83,14 @@ private fun LensProfileSettingsContent(
     var mode by rememberSaveable { mutableStateOf(preferences.lensProfileMode) }
     val sensors = profiles.associateBy { it.profile.id.value }
     val transfer = rememberLensProfileTransfer(preferences, mode, onChange)
+    // A search result for a setting inside a profile opens the profile in use.
+    val editorRequest = LocalSettingsSearch.current?.profileEditorRequest ?: 0
+    LaunchedEffect(editorRequest) {
+        if (editorRequest > 0) {
+            val listed = preferences.lensProfiles.filter { it.mode == mode && it.sensorId in sensors }
+            editingId = (listed.firstOrNull { it.id == preferences.activeLensProfileId } ?: listed.firstOrNull())?.id ?: editingId
+        }
+    }
     val scroll = rememberLazyListState()
     val haptics = LocalHapticFeedback.current
     val renderer = LocalAppLanguage.current.renderer
@@ -114,9 +122,10 @@ private fun LensProfileSettingsContent(
         val allPaths = profiles.flatMap { it.profile.paths }
         fun pathOf(profile: LensProfile) =
             sensors[profile.sensorId]?.profile?.paths?.firstOrNull { it.route.routeId == profile.routeId }
-        LazyColumn(Modifier.fillMaxSize().testTag("Lens profile list").reorderLensProfiles(reorder) {
+        val fling = rememberPanelFlingBehavior()
+        LazyColumn(Modifier.fillMaxSize().testTag("Lens profile list").trackPanelFling(fling).reorderLensProfiles(reorder) {
             haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-        }, state = scroll, userScrollEnabled = reorder.draggedKey == null,
+        }, state = scroll, userScrollEnabled = reorder.draggedKey == null, flingBehavior = fling,
             contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 28.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
             item(key = "lens-profile-header") {
@@ -129,13 +138,13 @@ private fun LensProfileSettingsContent(
                     })
                     LensProfilesHeader {
                         if (onAutoLensDiscovery != null) {
-                            DiagramButton("Auto Lens Discovery", Modifier.fillMaxWidth(), symbol = SettingsSymbol.Discover,
+                            DiagramButton("Auto Lens Discovery", settingsSearchTarget("Auto Lens Discovery").fillMaxWidth(), symbol = SettingsSymbol.Discover,
                                 accent = true, onClick = onAutoLensDiscovery)
                         }
                         DiagramButtonRow(Modifier.padding(vertical = 0.dp)) {
-                            DiagramButton("Export", Modifier.weight(1f), enabled = !transfer.busy && modeProfiles.isNotEmpty(),
+                            DiagramButton("Export", settingsSearchTarget("Export lens profiles").weight(1f), enabled = !transfer.busy && modeProfiles.isNotEmpty(),
                                 symbol = SettingsSymbol.Export, onClick = transfer.exportProfiles)
-                            DiagramButton("Import", Modifier.weight(1f), enabled = !transfer.busy,
+                            DiagramButton("Import", settingsSearchTarget("Import lens profiles").weight(1f), enabled = !transfer.busy,
                                 symbol = SettingsSymbol.Import, onClick = transfer.importProfile)
                         }
                         if (transfer.busy) CircularProgressIndicator(Modifier.padding(4.dp).size(20.dp), color = CameraColors.Accent, strokeWidth = 2.dp)
@@ -178,7 +187,7 @@ private fun LensProfileSettingsContent(
                     val lifted = moving || reorder.settlingKey == profile.id
                     Surface(color = Color.Transparent,
                         border = BorderStroke(if (lifted) 2.dp else 1.dp, if (active || lifted) CameraColors.Accent else Diagram.Border),
-                        shape = Diagram.ControlShape, modifier = Modifier.fillMaxWidth()
+                        shape = Diagram.ControlShape, modifier = settingsSearchTarget(profile.displayName, translate = false).fillMaxWidth()
                             .animateItem(placementSpec = if (lifted) null else tween(180))
                             .zIndex(if (lifted) 1f else 0f).graphicsLayer { translationY = reorder.translation(profile.id) }
                             .pageCardBackground(Diagram.ControlShape).background(Diagram.Glass, Diagram.ControlShape)
@@ -307,7 +316,7 @@ private fun LensProfileEditor(
     val camera = sensor.paths.firstOrNull { it.route.routeId == route } ?: sensor.primary
     val context = LocalContext.current
     val renderer = LocalAppLanguage.current.renderer
-    val exposureBounds = remember(camera) { readExposureBounds(context, camera) }
+    val exposureBounds = remember(camera, profile.verification) { readExposureBounds(context, camera, profile) }
     val photoOisSupported = remember(context, camera) {
         runCatching {
             val manager = context.getSystemService(CameraManager::class.java)
@@ -349,7 +358,10 @@ private fun LensProfileEditor(
                 verification = it.verification.takeIf { _ -> nextRoute == it.routeId && nextStream == it.rawStream }) }
         }
     }
-    fun streamSummary(output: RawOutput): String = renderer.format("{megapixels} MP · {bits} bits per pixel", mapOf(
+    // RAW_SENSOR stores each pixel in 16 bits, but the phone does not say how many of them hold image data.
+    fun streamSummary(output: RawOutput): String = renderer.format(
+        if (output.format == com.unspektrawesome.camera.RawFormat.RAW_SENSOR) "{megapixels} MP · 16-bit container"
+        else "{megapixels} MP · {bits} bits per pixel", mapOf(
         "megapixels" to String.format(Locale.ROOT, "%.1f", output.size.width.toDouble() * output.size.height / 1_000_000.0),
         "bits" to output.format.storageBitsPerPixel))
     BackHandler(enabled = isActive, onBack = onClose)
@@ -559,11 +571,14 @@ private fun AeLimitsEditor(limits: AeLimits, device: ExposureBounds?, onChange: 
             val iso = remember(device) { isoStops(device.minIso, device.maxIso) }
             val shutter = remember(device) { shutterStops(device.minShutterNs, device.maxShutterNs) }
             AeLimitsStage(device, bounds)
-            AeLimitChoice("MINIMUM ISO", bounds.minIso.toString(), iso.map(Int::toString), iso.indexOf(bounds.minIso)) {
-                onChange(limits.copy(minIso = iso[it], maxIso = maxOf(iso[it], bounds.maxIso)))
+            AeLimitChoice("MINIMUM ISO", bounds.minIso.toString(), iso.map(Int::toString), iso.indexOf(bounds.minIso)) { index ->
+                val chosenMax = bounds.maxIso.takeIf { it < device.maxIso }
+                onChange(limits.copy(minIso = iso[index], maxIso = chosenMax?.let { maxOf(it, iso[index]) }, legacyMaxIso = false))
             }
-            AeLimitChoice("MAXIMUM ISO", bounds.maxIso.toString(), iso.map(Int::toString), iso.indexOf(bounds.maxIso)) {
-                onChange(limits.copy(maxIso = iso[it], minIso = minOf(iso[it], bounds.minIso)))
+            AeLimitChoice("MAXIMUM ISO", bounds.maxIso.toString(), iso.map(Int::toString), iso.indexOf(bounds.maxIso)) { index ->
+                // The highest choice follows the camera's tested maximum as it rises.
+                onChange(limits.copy(maxIso = iso[index].takeIf { index < iso.lastIndex },
+                    minIso = minOf(iso[index], bounds.minIso), legacyMaxIso = false))
             }
             AeLimitChoice("FASTEST SHUTTER", "${formatShutter(bounds.minShutterNs)} s", shutter.map { "${it.label} s" }, shutter.indexOfFirst { it.nanoseconds == bounds.minShutterNs }) {
                 val value = shutter[it].nanoseconds

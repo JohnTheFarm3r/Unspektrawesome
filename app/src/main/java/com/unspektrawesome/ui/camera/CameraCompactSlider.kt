@@ -34,7 +34,7 @@ internal fun CameraCompactSlider(value: Float, onValueChange: (Float) -> Unit, e
     modifier: Modifier = Modifier, thumbSize: Dp = 12.dp, minimumHeight: Dp = 48.dp,
     valueRange: ClosedFloatingPointRange<Float> = 0f..1f, sensitivity: Float = 1f,
     onReset: (() -> Unit)? = null, requireThumb: Boolean = true,
-    valueStep: Float? = null) {
+    valueStep: Float? = null, stepMarks: Boolean = false) {
     val span = valueRange.endInclusive - valueRange.start
     val currentValue by rememberUpdatedState(((value - valueRange.start) / span).coerceIn(0f, 1f))
     val currentNumber by rememberUpdatedState(value)
@@ -154,12 +154,21 @@ internal fun CameraCompactSlider(value: Float, onValueChange: (Float) -> Unit, e
         val radius = thumbSize.toPx() / 2f
         val left = Offset(radius, center.y)
         val right = Offset(size.width - radius, center.y)
-        val displayed = touchFraction ?: currentValue
+        // With step marks the thumb jumps between the marks instead of following the finger.
+        val displayed = if (stepMarks && valueStep != null) currentValue else touchFraction ?: currentValue
         val fraction = if (rtl) 1f - displayed else displayed
         val thumb = Offset(left.x + (right.x - left.x) * fraction, center.y)
         val stroke = thumbSize.toPx() / 4f
         drawLine(CameraColors.Surface, left, right, stroke, StrokeCap.Round)
         drawLine(accent, if (rtl) right else left, thumb, stroke, StrokeCap.Round)
+        if (stepMarks && valueStep != null) {
+            val marks = (span / valueStep).roundToInt()
+            for (index in 0..marks) {
+                val markFraction = index.toFloat() / marks
+                val x = left.x + (right.x - left.x) * if (rtl) 1f - markFraction else markFraction
+                drawCircle(if (markFraction <= displayed) accent else CameraColors.Muted, stroke * 1.2f, Offset(x, center.y))
+            }
+        }
         if (enabled && (dragging || focused)) drawCircle(accent, radius + 4.dp.toPx(), thumb, style = Stroke(1.dp.toPx()))
         drawCircle(accent, radius, thumb)
     }

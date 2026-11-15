@@ -73,7 +73,7 @@ internal fun EditorValueDialog(label: String, value: Float, range: ClosedFloatin
     val focus = remember { FocusRequester() }
     fun apply() { parsed?.let { onApply(it); onDismiss() } }
     Dialog(onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) { AppSizedWindow {
         val view = LocalView.current
         DisposableEffect(view) {
             val window = generateSequence(view as View?) { it.parent as? View }
@@ -115,5 +115,5 @@ internal fun EditorValueDialog(label: String, value: Float, range: ClosedFloatin
             }
         }
         LaunchedEffect(Unit) { focus.requestFocus() }
-    }
+    }}
 }

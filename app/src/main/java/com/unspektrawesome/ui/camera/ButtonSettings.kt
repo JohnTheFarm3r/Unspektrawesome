@@ -267,7 +267,7 @@ internal fun ButtonSettings(isActive: Boolean, onAssign: (ControlAction) -> Unit
 @Composable
 private fun NumberedSection(number: Int, label: String, trailing: @Composable () -> Unit) {
     val renderer = LocalAppLanguage.current.renderer
-    Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 16.dp, bottom = 4.dp),
+    Row(settingsSearchTarget(label, heading = true).fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 16.dp, bottom = 4.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         DiagramNumber(number)
         Text(renderer.text(label).uppercase(), translate = false, color = Diagram.Hint, fontSize = 10.sp, lineHeight = 14.sp,
@@ -736,7 +736,7 @@ private fun DirectConnectionStage(deviceName: String, connected: Boolean) {
 @Composable
 private fun ControlActionRow(action: ControlAction, number: Int, bindings: List<ControlBinding>, live: CapturedInput?,
     onAssign: () -> Unit) {
-    Column(Modifier.fillMaxWidth().diagramHairline().clickable(role = Role.Button, onClick = onAssign)
+    Column(settingsSearchTarget(action.label).fillMaxWidth().diagramHairline().clickable(role = Role.Button, onClick = onAssign)
         .languageSemantics { language -> contentDescription = language.format("Assign a button to {action}",
             mapOf("action" to language.text(action.label))) }
         .padding(start = 4.dp, end = 0.dp, top = 2.dp, bottom = 6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -1147,7 +1147,7 @@ private fun DirectUsbSettings() {
     devices.forEach { device ->
         val on = device.key in enabled
         val state = status[device.key]
-        Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).diagramHairline().padding(horizontal = 4.dp, vertical = 6.dp),
+        Row(settingsSearchTarget("Direct connection").fillMaxWidth().heightIn(min = 48.dp).diagramHairline().padding(horizontal = 4.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             DiagramNumber(3)
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {

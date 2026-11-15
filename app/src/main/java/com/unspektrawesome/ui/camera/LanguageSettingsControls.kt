@@ -59,7 +59,7 @@ internal fun LanguageSettingsControls() {
     val custom = language.custom
     val idle = !busy && !exporter.busy
     // Numbers match the callouts of the drawing shown above for the current state.
-    Row(Modifier.fillMaxWidth().heightIn(min = 52.dp).diagramHairline().padding(horizontal = 4.dp, vertical = 6.dp),
+    Row(settingsSearchTarget("Choose language").fillMaxWidth().heightIn(min = 52.dp).diagramHairline().padding(horizontal = 4.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         if (custom == null) DiagramNumber(1)
         BuiltInLanguage.all.firstOrNull { it.code == language.selectedCode }?.let { selected ->

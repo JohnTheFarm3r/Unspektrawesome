@@ -43,7 +43,8 @@ object AutoLensProfiles {
                     color = LensColorSettings(matrixEnabled = camera.sensorMetadata.colorCalibration.hasUsableColorTransform()),
                     mode = mode))
                     .copy(name = configuration.profileName, sensorId = configuration.sensorId, routeId = configuration.routeId,
-                        rawStream = configuration.raw, verification = LensVerification(report.environment, configuration), autoManaged = true)
+                        rawStream = configuration.raw, verification = LensVerification(report.environment, configuration,
+                            isoMax = resultsByConfiguration[configuration.key]?.isoMax), autoManaged = true)
             }
         }
         val retained = previous.filterNot { it.managedByDiscovery }.map { old ->
@@ -51,7 +52,8 @@ object AutoLensProfiles {
             val result = proof?.configuration?.key?.let(resultsByConfiguration::get)
             val updated = when {
                 proof != null && result?.status == LensProbeStatus.VERIFIED && result.resourcesReleased ->
-                    old.copy(name = old.displayName, verification = LensVerification(report.environment, result.configuration))
+                    old.copy(name = old.displayName, verification = LensVerification(report.environment, result.configuration,
+                        isoMax = result.isoMax))
                 proof != null && result?.tested == true && result.status != LensProbeStatus.VERIFIED ->
                     old.copy(verification = proof.copy(verified = false))
                 else -> old

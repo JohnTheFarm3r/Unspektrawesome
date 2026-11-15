@@ -81,7 +81,7 @@ internal fun CameraDialogWindow(
         securePolicy = properties.securePolicy,
         usePlatformDefaultWidth = false,
         decorFitsSystemWindows = false,
-    )) {
+    )) { AppSizedWindow {
         CameraWindowBackdrop()
         Box(Modifier.fillMaxSize().safeDrawingPadding().imePadding().padding(16.dp), contentAlignment = Alignment.Center) {
             if (properties.dismissOnClickOutside) Box(Modifier.matchParentSize()
@@ -90,7 +90,7 @@ internal fun CameraDialogWindow(
                 CameraDialogSurface(modifier, header, footer, content)
             }
         }
-    }
+    }}
 }
 
 @Composable
@@ -133,7 +133,7 @@ internal fun CameraAlertDialog(
         securePolicy = properties.securePolicy,
         usePlatformDefaultWidth = false,
         decorFitsSystemWindows = false,
-    )) {
+    )) { AppSizedWindow {
         CameraWindowBackdrop()
         Box(Modifier.fillMaxSize().safeDrawingPadding().imePadding().padding(16.dp), contentAlignment = Alignment.Center) {
             if (properties.dismissOnClickOutside) Box(Modifier.matchParentSize()
@@ -159,7 +159,7 @@ internal fun CameraAlertDialog(
                 }
             }
         }
-    }
+    }}
 }
 
 internal class CenteredCameraMenuPosition(private val margin: Int) : PopupPositionProvider {
@@ -177,8 +177,8 @@ internal fun CompactCameraMenu(expanded: Boolean, onDismiss: () -> Unit, modifie
     properties: PopupProperties = CameraPopupProperties, content: @Composable ColumnScope.() -> Unit) {
     if (!expanded) return
     val margin = with(androidx.compose.ui.platform.LocalDensity.current) { 12.dp.roundToPx() }
-    val maximumHeight = (LocalConfiguration.current.screenHeightDp.dp - 48.dp).coerceIn(96.dp, 420.dp)
-    Popup(popupPositionProvider = CenteredCameraMenuPosition(margin), onDismissRequest = onDismiss, properties = properties) {
+    val maximumHeight = (appScreenSize().height - 48.dp).coerceIn(96.dp, 420.dp)
+    Popup(popupPositionProvider = CenteredCameraMenuPosition(margin), onDismissRequest = onDismiss, properties = properties) { AppSizedWindow {
         CameraWindowBackdrop()
         RotatingCameraPanel(LocalCameraWindowRotation.current, maxWidth = 320.dp) {
         Column(modifier.widthIn(min = 184.dp, max = 320.dp).heightIn(max = maximumHeight)
@@ -187,5 +187,5 @@ internal fun CompactCameraMenu(expanded: Boolean, onDismiss: () -> Unit, modifie
             .border(BorderStroke(1.dp, CameraColors.MenuBorder), CameraStyle.PopupShape)
             .verticalScroll(rememberScrollState()).padding(4.dp), content = content)
         }
-    }
+    }}
 }

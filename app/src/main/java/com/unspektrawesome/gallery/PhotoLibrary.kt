@@ -284,7 +284,6 @@ internal fun PhotoLibrary(
                                 Modifier.drawWithContent { drawContent(); drawRect(Color.Black.copy(alpha = .55f)) } else Modifier),
                                 imageKey = photo.generation, isVideo = photo.isVideo)
                             if (photo.isVideo) VideoDurationBadge(photo.durationMs, Modifier.align(Alignment.BottomStart).padding(7.dp))
-                            if (photo.developed && !photo.isBurst) SpektrafilmBadge(Modifier.align(Alignment.TopStart).padding(6.dp))
                             if (photo.isBurst) {
                                 if (selecting) Row(Modifier.align(Alignment.BottomStart).padding(8.dp), verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.spacedBy(6.dp)) {

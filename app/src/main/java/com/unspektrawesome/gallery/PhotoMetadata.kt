@@ -38,6 +38,10 @@ internal fun PhotoMetadata(photo: GalleryPhoto, shot: GalleryShot?, modifier: Mo
                 val capture = shot?.let { runCatching { GalleryStore.get(context).recipe(it.id).metadata }.getOrNull() }
                 runCatching {
                     if (photo.isVideo) VideoInformation.read(context, photo)
+                    // Every burst frame keeps its capture details; the newest frame describes the burst.
+                    else if (photo.isBurst) com.unspektrawesome.burst.BurstContainer.Reader(context, photo.uri).use { reader ->
+                        PhotoInformation.fromCapture(reader.capture(reader.count - 1).metadata)
+                    }
                     else if (capture != null) PhotoInformation.fromCapture(capture)
                     else context.contentResolver.openInputStream(photo.uri)?.use { PhotoInformation.fromExif(ExifInterface(it)) }.orEmpty()
                 }.getOrDefault(emptyList())

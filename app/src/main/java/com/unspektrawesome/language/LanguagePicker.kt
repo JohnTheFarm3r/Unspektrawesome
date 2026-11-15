@@ -1,5 +1,6 @@
 package com.unspektrawesome.language
 
+import com.unspektrawesome.ui.camera.AppSizedWindow
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -128,7 +129,7 @@ private fun MoreLanguagesNote(compact: Boolean) {
 
 @Composable
 internal fun LanguagePickerDialog(onDismiss: () -> Unit) {
-    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) { AppSizedWindow {
         CameraWindowBackdrop()
         Box(Modifier.fillMaxSize()) {
             Box(Modifier.matchParentSize().clickable(interactionSource = null, indication = null, onClick = onDismiss))
@@ -143,5 +144,5 @@ internal fun LanguagePickerDialog(onDismiss: () -> Unit) {
                 }
             }
         }
-    }
+    }}
 }

@@ -164,6 +164,8 @@ data class CameraControlState(
     val manualExposureSupported: Boolean = false,
     val isoMin: Int = 100,
     val isoMax: Int = 100,
+    /** Upper end of the advertised range, or 0 before the camera reports it. */
+    val isoReportedMax: Int = 0,
     val exposureTimeMinNs: Long = 1_000_000L,
     val exposureTimeMaxNs: Long = 10_000_000L,
     val autoExposure: Boolean = true,
@@ -197,6 +199,7 @@ data class CameraControlState(
             manualExposureSupported = state.manualExposureSupported,
             isoMin = state.isoMin,
             isoMax = state.isoMax,
+            isoReportedMax = state.isoReportedMax,
             exposureTimeMinNs = state.exposureTimeMinNs,
             exposureTimeMaxNs = state.exposureTimeMaxNs,
             autoExposure = state.autoExposure,
@@ -339,6 +342,16 @@ class RawVulkanPreviewController(
     private var pendingCapture: PendingCapture? = null
     private var latestPreviewGeometry: PreviewGeometry? = null
     private var displayedPreviewGeometry: PreviewGeometry? = null
+        set(value) {
+            field = value
+            mutableTrackedFace.value = value?.let { geometry ->
+                geometry.owner.trackedFace?.let { face -> TrackedFaceBox.from(geometry.framing.target, face) }
+            }
+            if (com.unspektrawesome.camera.session.FaceDetectionDebug.enabled) {
+                com.unspektrawesome.camera.session.FaceDetectionDebug.geometry = value?.framing?.target
+                if (value == null) com.unspektrawesome.camera.session.FaceDetectionDebug.clear()
+            }
+        }
     private val cropTransition = PreviewCropTransition()
     private var serializedPreviewGeometry: FrameGeometrySnapshot? = null
     private var cropPreview: PhotoCrop? = null
@@ -588,10 +601,11 @@ class RawVulkanPreviewController(
     }
 
     /** Starts or stops recording. [lockControls] holds the controls chosen in the settings until recording stops. */
-    fun toggleVideoRecording(lockControls: Boolean = false) { commands.submit { synchronized(lock) {
+    /** With [startOnly], a request that arrives while a recording is running leaves it running. */
+    fun toggleVideoRecording(lockControls: Boolean = false, startOnly: Boolean = false) { commands.submit { synchronized(lock) {
         val state = mutableVideoState.value
         if (state.busy) {
-            stopVideoLocked()
+            if (!startOnly) stopVideoLocked()
             return@synchronized
         }
         if (!state.enabled || !state.outputSupported || !captureReadyLocked()) return@synchronized
@@ -643,6 +657,7 @@ class RawVulkanPreviewController(
         owner.session.setOpticalStabilization(mutableVideoState.value.requestedOis)
         val recordingBufferBytes = configuredPreferences.recordingBufferMb.coerceIn(512, 4096) * 1024L * 1024
         val audioFormat = configuredPreferences.videoAudioFormat
+        val microphoneProcessing = configuredPreferences.microphoneProcessing
         val gyroHistoryNs = ((recordingBufferBytes / owner.packedFrameBytes.coerceAtLeast(1) /
             state.frameRate.coerceAtLeast(1.0) + 2.0) * 1_000_000_000).toLong()
         val recording = VideoRecording(applicationContext)
@@ -664,7 +679,7 @@ class RawVulkanPreviewController(
                     InternalLogRecorder.error("VideoTelemetry", "Camera telemetry unavailable", it)
                     if (state.liveStabilization) throw it
                 }
-                recording.prepare(encoding, state.bitrate, rotation, recordingConfiguration, audioFormat) {
+                recording.prepare(encoding, state.bitrate, rotation, recordingConfiguration, audioFormat, microphoneProcessing) {
                     commands.submit { synchronized(lock) {
                         if (videoRecorder === recording) stopVideoLocked("Video recording failed")
                     } }
@@ -1170,6 +1185,9 @@ class RawVulkanPreviewController(
     }
     val tapMeteringStatus: StateFlow<TapMeteringStatus> =
         mutableTapMeteringStatus.asStateFlow()
+    private val mutableTrackedFace = MutableStateFlow<TrackedFaceBox?>(null)
+    /** The face that focus and exposure follow, placed on the viewfinder surface. */
+    val trackedFace: StateFlow<TrackedFaceBox?> = mutableTrackedFace.asStateFlow()
     val cameraControls: StateFlow<CameraControlState> = mutableCameraControls.asStateFlow()
     val rawImportCapabilities: StateFlow<Map<RawImportStreamKey, RawImportCapability>> =
         mutableRawImportCapabilities.asStateFlow()
@@ -1344,7 +1362,8 @@ class RawVulkanPreviewController(
     private fun currentExposure() = mutableCameraControls.value.let { SensorExposure(it.iso, it.exposureTimeNs) }
 
     private fun exposureBounds(): ExposureBounds = mutableCameraControls.value.let {
-        ExposureBounds(it.isoMin, it.isoMax, it.exposureTimeMinNs, it.exposureTimeMaxNs)
+        ExposureBounds(it.isoMin, it.isoMax, it.exposureTimeMinNs, it.exposureTimeMaxNs,
+            it.isoReportedMax.takeIf { reported -> reported > 0 } ?: it.isoMax)
     }
 
     private fun resetCustomExposureLocked(owner: ActiveSession, mode: AeMode, exposure: SensorExposure = currentExposure()): Boolean {
@@ -2041,6 +2060,10 @@ class RawVulkanPreviewController(
         if (changed || configuredPreferences.performanceOverlay != preferences.performanceOverlay)
             resetPerformanceLocked()
         if (configuredPreferences.histogramEnabled != preferences.histogramEnabled) histogramGeneration++
+        if (configuredPreferences.faceFocusActive() != preferences.faceFocusActive() ||
+            configuredPreferences.faceExposureActive() != preferences.faceExposureActive()) {
+            active?.session?.setFaceTracking(preferences.faceFocusActive(), preferences.faceExposureActive())
+        }
         if (configuredPreferences.flashMode != preferences.flashMode) active?.session?.setFlashMode(
             if (panoramaState.value.enabled) com.unspektrawesome.camera.FlashMode.OFF else preferences.flashMode)
         configuredCamera = camera
@@ -2708,6 +2731,11 @@ class RawVulkanPreviewController(
         session.setFlashMode(if (panoramaState.value.enabled) com.unspektrawesome.camera.FlashMode.OFF else configuredPreferences.flashMode)
         session.setOpticalStabilization(mutableVideoState.value.requestedOis)
         session.setExternalAutoExposure(configuredPreferences.aeEngine == AeEngine.SPEKTRA)
+        session.setIsoCeilingSource { route, _ ->
+            configuredPreferences.lensProfiles.firstOrNull { it.id == key.lensProfileId }?.verification
+                ?.takeIf { it.configuration.routeId == route.routeId }?.isoMax ?: 0
+        }
+        session.setFaceTracking(configuredPreferences.faceFocusActive(), configuredPreferences.faceExposureActive())
         session.setInitialControls(retainedControls)
         if (retainedControls == null && configuredPreferences.aeEngine == AeEngine.SPEKTRA) {
             lensSwitchExposure?.let { session.setInitialAutoExposure(it, configuredPreferences.aeLimits()) }
@@ -2863,6 +2891,16 @@ class RawVulkanPreviewController(
 
                 override fun onExposureStateChanged(generation: Long, state: Camera2RawSession.MeteringState) {
                     handleMeteringState(owner, generation, state, exposure = true)
+                }
+
+                override fun onTrackedFaceChanged(face: FloatArray?) {
+                    synchronized(lock) {
+                        if (closed || active !== owner) return@synchronized
+                        owner.trackedFace = face
+                        val geometry = displayedPreviewGeometry?.takeIf { it.owner === owner }
+                        mutableTrackedFace.value = if (face == null || geometry == null) null
+                            else TrackedFaceBox.from(geometry.framing.target, face)
+                    }
                 }
 
                 override fun onControlsChanged(state: Camera2RawSession.ControlState) {
@@ -3162,6 +3200,16 @@ class RawVulkanPreviewController(
         val render: () -> Boolean,
     )
 
+    /** Meters at the followed face when no exposure point was tapped. */
+    private fun faceMeterPointLocked(owner: ActiveSession): Pair<Float, Float>? {
+        if (!configuredPreferences.faceExposureActive()) return null
+        val face = owner.trackedFace ?: return null
+        val geometry = displayedPreviewGeometry?.takeIf { it.owner === owner }?.framing?.target ?: return null
+        val center = com.unspektrawesome.capture.FaceGeometry.toSurface(geometry, (face[0] + face[2]) / 2f, (face[1] + face[3]) / 2f)
+        if (!center.x.isFinite() || !center.y.isFinite()) return null
+        return center.x.coerceIn(0f, 1f) to center.y.coerceIn(0f, 1f)
+    }
+
     private fun prepareCustomMeterLocked(
         owner: ActiveSession, metadata: com.unspektrawesome.camera.session.RawCaptureMetadata,
     ): ((Double) -> Unit)? {
@@ -3395,7 +3443,7 @@ class RawVulkanPreviewController(
                     val meter = prepareCustomMeterLocked(owner, metadata)
                     val meterId = if (meter != null) ++exposureMeterSequence else 0L
                     val meterMethod = configuredPreferences.aeMeter.ordinal
-                    val meterPoint = owner.exposurePoint
+                    val meterPoint = owner.exposurePoint ?: faceMeterPointLocked(owner)
                     val meterSurfaceGeneration = surfaceGeneration
                     val copiedBytes = pixels.takeIf { rawUpload == null }
                     val directHardware = hardwareBuffer.takeUnless { isp != null || configuredPreferences.rawLayoutOverride().enabled }
@@ -3924,6 +3972,8 @@ class RawVulkanPreviewController(
         val exposureController: SpektraExposureController = SpektraExposureController(),
         var lastExposureSampleNs: Long = 0,
         var exposurePoint: Pair<Float, Float>? = null,
+        /** Face that focus and exposure follow, as active-array fractions. */
+        var trackedFace: FloatArray? = null,
         @Volatile var ispRejected: Boolean = false,
         @Volatile var ispCopyPlanes: Boolean = false,
         var ispFailures: Int = 0,

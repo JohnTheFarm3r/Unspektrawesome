@@ -12,10 +12,14 @@ import com.unspektrawesome.gallery.GalleryPhoto
 
 internal object BurstMedia {
     const val LEGACY_DIRECTORY = "Download/Unspektrawesome/BURST/"
-    const val SELECTION = "${MediaStore.MediaColumns.RELATIVE_PATH} IN (?, ?) AND ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?"
+    // Bursts saved by earlier versions used the .spektra extension.
+    private const val NAME_PATTERN = "%.unspektra"
+    private const val OLD_NAME_PATTERN = "%.spektra"
+    const val SELECTION = "${MediaStore.MediaColumns.RELATIVE_PATH} IN (?, ?) AND " +
+        "(${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ? OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?)"
     private const val PUBLISHED = "${MediaStore.MediaColumns.IS_PENDING} = 0 AND ${MediaStore.MediaColumns.IS_TRASHED} = 0"
     private val collection get() = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-    fun selectionArguments() = arrayOf(BurstContainer.DIRECTORY, LEGACY_DIRECTORY, "%.spektra")
+    fun selectionArguments() = arrayOf(BurstContainer.DIRECTORY, LEGACY_DIRECTORY, NAME_PATTERN, OLD_NAME_PATTERN)
 
     fun canonicalUri(uri: Uri): Uri {
         val parts = uri.pathSegments
@@ -38,9 +42,10 @@ internal object BurstMedia {
         if (!Environment.isExternalStorageManager()) return
         val resolver = context.contentResolver
         val pending = resolver.query(collection, arrayOf(MediaStore.MediaColumns._ID),
-            "${MediaStore.MediaColumns.RELATIVE_PATH} = ? AND ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ? AND $PUBLISHED AND " +
+            "${MediaStore.MediaColumns.RELATIVE_PATH} = ? AND (${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ? OR " +
+                "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?) AND $PUBLISHED AND " +
                 "(${MediaStore.MediaColumns.OWNER_PACKAGE_NAME} = ? OR ${MediaStore.MediaColumns.OWNER_PACKAGE_NAME} IS NULL)",
-            arrayOf(LEGACY_DIRECTORY, "%.spektra", context.packageName), null)?.use { cursor ->
+            arrayOf(LEGACY_DIRECTORY, NAME_PATTERN, OLD_NAME_PATTERN, context.packageName), null)?.use { cursor ->
             buildList { while (cursor.moveToNext()) add(ContentUris.withAppendedId(collection, cursor.getLong(0))) }
         }.orEmpty()
         pending.forEach { uri ->
@@ -54,7 +59,7 @@ internal object BurstMedia {
 
     fun import(context: Context, source: Uri): Uri {
         val resolver = context.contentResolver
-        val uri = create(context, "Unspektrawesome-${System.currentTimeMillis()}.spektra")
+        val uri = create(context, "Unspektrawesome-${System.currentTimeMillis()}.unspektra")
         try {
             resolver.openInputStream(source)!!.use { input ->
                 android.os.ParcelFileDescriptor.AutoCloseOutputStream(requireNotNull(resolver.openFileDescriptor(uri, "w"))).use { output ->
@@ -88,7 +93,8 @@ internal object BurstMedia {
         val item = canonicalUri(uri)
         if (context.contentResolver.getType(item) == BurstContainer.MIME_TYPE) return true
         return context.contentResolver.query(item, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)?.use {
-            it.moveToFirst() && it.getString(0).endsWith(".spektra", ignoreCase = true)
+            it.moveToFirst() && it.getString(0).let { name ->
+                name.endsWith(".unspektra", ignoreCase = true) || name.endsWith(".spektra", ignoreCase = true) }
         } == true
     }
 

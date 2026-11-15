@@ -54,6 +54,57 @@ class Camera2LensProbe(
         val captureReceived = java.util.concurrent.atomic.AtomicBoolean()
         val starter = Executors.newSingleThreadExecutor { Thread(it, "LensProbeStart").apply { isDaemon = true } }
         fun complete(status: LensProbeStatus, detail: String) { completion.complete(status to detail) }
+        val controls = AtomicReference<Camera2RawSession.ControlState?>()
+        val isoMeasurement = AtomicReference<IsoRangeMeasurement?>()
+        val isoStartedMs = AtomicLong()
+        val isoMax = AtomicReference<Int?>()
+        val isoRequests = AtomicLong()
+        val verifiedDetail = "RAW preview, still capture and resumed viewfinder verified"
+        fun requestIso(request: IsoRangeMeasurement.Request) {
+            session.setIsoCeiling(request.iso)
+            session.setSensorExposure(request.iso, request.timeNs, isoRequests.incrementAndGet())
+        }
+        // After the lens is verified, measure how far ISO really goes. A failed measurement keeps the lens verified.
+        fun measureIso(frame: RawHardwareFrame) {
+            val sensor = camera.sensorMetadata
+            val measurement = isoMeasurement.get()
+            if (measurement == null) {
+                val state = controls.get()
+                if (state == null || !state.manualExposureSupported || sensor == null ||
+                    SystemClock.elapsedRealtime() - started > timeoutMs - ISO_BUDGET_MS - 2_000) {
+                    complete(LensProbeStatus.VERIFIED, verifiedDetail)
+                    return
+                }
+                val created = IsoRangeMeasurement(state.isoReportedMax, state.exposureTimeMinNs, state.exposureTimeMaxNs)
+                isoMeasurement.set(created)
+                isoStartedMs.set(SystemClock.elapsedRealtime())
+                phase("Measuring the highest ISO…")
+                session.setExternalAutoExposure(true)
+                requestIso(created.begin())
+                return
+            }
+            if (SystemClock.elapsedRealtime() - isoStartedMs.get() > ISO_BUDGET_MS) {
+                com.unspektrawesome.diagnostics.InternalLogRecorder.event("LensIso", "route=${configuration.routeId} timeout")
+                complete(LensProbeStatus.VERIFIED, verifiedDetail)
+                return
+            }
+            val requested = frame.metadata.requestedSensitivityIso ?: return
+            val applied = frame.metadata.sensitivityIso ?: return
+            val time = frame.metadata.exposureTimeNs ?: return
+            val brightness = RawBrightness.mean(frame.packedRawBytes, frame.output.format, frame.output.size.width,
+                frame.output.size.height, frame.rowStrideBytes, frame.metadata.dynamicBlackLevel() ?: sensor!!.blackLevel(),
+                frame.metadata.dynamicWhiteLevel ?: sensor!!.whiteLevel)
+            when (val step = measurement.onFrame(requested, applied, time, brightness)) {
+                null -> Unit
+                is IsoRangeMeasurement.Step.Next -> requestIso(step.request)
+                is IsoRangeMeasurement.Step.Done -> {
+                    isoMax.set(step.isoMax)
+                    com.unspektrawesome.diagnostics.InternalLogRecorder.event("LensIso",
+                        "route=${configuration.routeId} reported=${controls.get()?.isoReportedMax} max=${step.isoMax} reason=${step.reason}")
+                    complete(LensProbeStatus.VERIFIED, verifiedDetail)
+                }
+            }
+        }
         fun validFrame(frame: RawHardwareFrame): Boolean = configuration.raw.matches(frame.output) &&
             frame.metadata.sensorTimestampNs > 0 && frame.metadata.sensorTimestampNs > timestamp.getAndSet(frame.metadata.sensorTimestampNs) &&
             frame.rowStrideBytes > 0 && frame.packedRawBytes.isDirect && frame.packedRawBytes.remaining() > 0 &&
@@ -96,7 +147,7 @@ class Camera2LensProbe(
                                 return
                             }
                             if (captureReceived.get() && session.state() == Camera2RawSession.State.STREAMING) {
-                                complete(LensProbeStatus.VERIFIED, "RAW preview, still capture and resumed viewfinder verified")
+                                measureIso(frame)
                             } else if (frames.incrementAndGet() >= 3 &&
                                 (configuration.session.companionFormat == 0 || !configuration.session.targetCompanion || session.companionFrames() > 0) &&
                                 captureRequested.compareAndSet(false, true)) {
@@ -106,6 +157,10 @@ class Camera2LensProbe(
                             }
                         }
                     }, object : RawSessionListener {
+                        override fun onControlsChanged(state: Camera2RawSession.ControlState) {
+                            controls.set(state)
+                        }
+
                         override fun onStateChanged(next: Camera2RawSession.State) {
                             state.set(next)
                             when (next) {
@@ -150,10 +205,12 @@ class Camera2LensProbe(
             result = LensProbeStatus.DEVICE_ERROR to "Frames worked, but the camera did not acknowledge closure"
         }
         if (result.first != LensProbeStatus.VERIFIED) delay(250)
-        return LensProbeResult(configuration, result.first, result.second, SystemClock.elapsedRealtime() - started, released)
+        return LensProbeResult(configuration, result.first, result.second, SystemClock.elapsedRealtime() - started, released,
+            isoMax.get().takeIf { result.first == LensProbeStatus.VERIFIED })
     }
 
     companion object {
+        private const val ISO_BUDGET_MS = 5_000L
         private val closer = Executors.newCachedThreadPool { Thread(it, "LensProbeClose").apply { isDaemon = true } }
     }
 }

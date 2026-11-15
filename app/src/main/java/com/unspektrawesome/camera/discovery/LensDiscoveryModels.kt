@@ -102,11 +102,19 @@ data class DiscoveredLensConfiguration(
     }
 }
 
-data class LensVerification(val environment: String, val configuration: DiscoveredLensConfiguration, val verified: Boolean = true) {
-    fun toJson(): JSONObject = JSONObject().put("environment", environment).put("configuration", configuration.toJson()).put("verified", verified)
+data class LensVerification(
+    val environment: String,
+    val configuration: DiscoveredLensConfiguration,
+    val verified: Boolean = true,
+    /** Highest ISO the lens scan measured above the advertised range. */
+    val isoMax: Int? = null,
+) {
+    fun toJson(): JSONObject = JSONObject().put("environment", environment).put("configuration", configuration.toJson())
+        .put("verified", verified).apply { isoMax?.let { put("isoMax", it) } }
     companion object {
         fun fromJson(json: JSONObject): LensVerification = LensVerification(json.getString("environment"),
-            DiscoveredLensConfiguration.fromJson(json.getJSONObject("configuration")), json.optBoolean("verified", true))
+            DiscoveredLensConfiguration.fromJson(json.getJSONObject("configuration")), json.optBoolean("verified", true),
+            json.optInt("isoMax").takeIf { it > 0 })
     }
 }
 
@@ -116,6 +124,8 @@ data class LensProbeResult(
     val detail: String,
     val elapsedMs: Long = 0,
     val resourcesReleased: Boolean = true,
+    /** Highest ISO measured to brighten RAW frames, when it is above the advertised range. */
+    val isoMax: Int? = null,
 ) {
     val tested: Boolean get() = status !in listOf(LensProbeStatus.NOT_TESTED, LensProbeStatus.CANCELLED,
         LensProbeStatus.SKIPPED, LensProbeStatus.BLOCKED)
@@ -145,6 +155,7 @@ data class LensDiscoveryReport(
         put("results", JSONArray().apply { results.forEach { result -> put(JSONObject().apply {
             put("configuration", result.configuration.toJson()); put("status", result.status.name)
             put("detail", result.detail); put("elapsed", result.elapsedMs); put("released", result.resourcesReleased)
+            result.isoMax?.let { put("isoMax", it) }
         }) } })
     }.toString()
 
@@ -158,7 +169,8 @@ data class LensDiscoveryReport(
                 val result = results.getJSONObject(it)
                 LensProbeResult(DiscoveredLensConfiguration.fromJson(result.getJSONObject("configuration")),
                     LensProbeStatus.valueOf(result.getString("status")), result.getString("detail"),
-                    result.getLong("elapsed"), result.getBoolean("released"))
+                    result.getLong("elapsed"), result.getBoolean("released"),
+                    result.optInt("isoMax").takeIf { it > 0 })
             }, json.getBoolean("cancelled"), json.optionalString("message"), json.getInt("candidateCount"))
         }.getOrNull()
     }

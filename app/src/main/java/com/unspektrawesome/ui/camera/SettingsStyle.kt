@@ -79,6 +79,7 @@ internal enum class SettingsSymbol(@param:DrawableRes val drawable: Int) {
     Erase(R.drawable.ic_settings_eraser),
     Gamepad(R.drawable.ic_settings_gamepad_2),
     Add(R.drawable.ic_settings_plus),
+    Search(R.drawable.ic_settings_search),
 }
 
 @Composable

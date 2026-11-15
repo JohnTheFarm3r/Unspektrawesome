@@ -143,7 +143,6 @@ open class MainActivity : ComponentActivity() {
     }
     private val onboardingPreferences by lazy { getSharedPreferences("onboarding", MODE_PRIVATE) }
     private var onboardingCompleted by mutableStateOf(false)
-    private var storageAccessReviewed by mutableStateOf(false)
     private var cameraGuideStep by mutableIntStateOf(0)
     private var processingGuideStep by mutableIntStateOf(0)
     private var videoGuideStep by mutableIntStateOf(0)
@@ -212,7 +211,6 @@ open class MainActivity : ComponentActivity() {
         }
         selectedLensId = cameraPreferences.defaultLensId
         onboardingCompleted = guideProgress.load("introduction", ONBOARDING_REVISION, ONBOARDING_PAGES) == ONBOARDING_PAGES
-        storageAccessReviewed = !com.unspektrawesome.ui.onboarding.StorageAccessSetup.needed(this)
         val savedGuide = guideProgress.load("camera", CAMERA_GUIDE_REVISION,
             CAMERA_GUIDE_STEPS + CAMERA_PROCESSING_GUIDE_STEPS)
         cameraGuideStep = savedGuide.coerceAtMost(CAMERA_GUIDE_STEPS)
@@ -230,7 +228,7 @@ open class MainActivity : ComponentActivity() {
             ContextCompat.registerReceiver(this, screenOffReceiver,
                 android.content.IntentFilter(android.content.Intent.ACTION_SCREEN_OFF), ContextCompat.RECEIVER_NOT_EXPORTED)
             // First-run setup and permission prompts cannot appear above the lock screen.
-            if (!AppLanguage.state.value.choiceMade || !storageAccessReviewed || !onboardingCompleted || !cameraPermissionGranted)
+            if (!AppLanguage.state.value.choiceMade || !onboardingCompleted || !cameraPermissionGranted)
                 whenUnlocked(onCancelled = ::finish) {}
         }
         setContent {
@@ -238,15 +236,6 @@ open class MainActivity : ComponentActivity() {
             if (!language.choiceMade) {
                 UnspektrawesomeTheme(CameraOrientation.controlRotation(uiOrientationDegrees)) {
                     LanguagePicker(firstLaunch = true) {
-                        if (onboardingCompleted && cameraPermissionGranted) startCamera()
-                    }
-                }
-                return@setContent
-            }
-            if (!storageAccessReviewed) {
-                UnspektrawesomeTheme(CameraOrientation.controlRotation(uiOrientationDegrees)) {
-                    com.unspektrawesome.ui.onboarding.StorageAccessOnboarding {
-                        storageAccessReviewed = true
                         if (onboardingCompleted && cameraPermissionGranted) startCamera()
                     }
                 }
@@ -328,6 +317,7 @@ open class MainActivity : ComponentActivity() {
             val tapMeteringStatus by previewController.tapMeteringStatus.collectAsState()
             val focusLoupeStatus by previewController.focusLoupeStatus.collectAsState()
             val exposureMeteringStatus by previewController.exposureMeteringStatus.collectAsState()
+            val trackedFace by previewController.trackedFace.collectAsState()
             var showCaptureQueue by remember { mutableStateOf(false) }
             val captureFeedback = rememberCaptureFeedbackState(captureStatus)
             val cameraControls by previewController.cameraControls.collectAsState()
@@ -534,6 +524,12 @@ open class MainActivity : ComponentActivity() {
                         } else previewController.captureStill()
                     },
                     onLockedRecording = { if (videoState.enabled && !videoState.busy) startVideo(lockControls = true) },
+                    onStartRecording = {
+                        val granted = ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECORD_AUDIO) ==
+                            PackageManager.PERMISSION_GRANTED
+                        if (granted) previewController.toggleVideoRecording(startOnly = true) else startVideo(lockControls = false)
+                        granted
+                    },
                     onHardwareControlsChanged = { hardwareControls = it },
                     onOpenGallery = { if (!burstState.busy && !panoramaState.busy) whenUnlocked {
                         if (panoramaState.enabled && panoramaState.frames >= 2) startActivity(GalleryActivity.intent(this@MainActivity, processing = true))
@@ -572,6 +568,7 @@ open class MainActivity : ComponentActivity() {
                     captureFeedback = captureFeedback.visible,
                     tapMeteringStatus = tapMeteringStatus,
                     exposureMeteringStatus = exposureMeteringStatus,
+                    trackedFace = trackedFace,
                     onExposurePointChanged = { x, y -> previewController.meterExposure(x, y) },
                     onFocusPointChanged = { x, y -> previewController.focusAt(x, y) },
                     onClearExposurePoint = { previewController.clearExposurePoint() },
@@ -716,7 +713,6 @@ open class MainActivity : ComponentActivity() {
     ) == PackageManager.PERMISSION_GRANTED
 
     private fun startCamera() {
-        if (!storageAccessReviewed) return
         if (!AppLanguage.state.value.choiceMade) return
         if (shaderWarmup.state.value.blocksCamera) return
         if (discoveryProgress.running) return
@@ -877,6 +873,8 @@ open class MainActivity : ComponentActivity() {
         if (!hasCameraPermission()) return
         onboardingPreferences.edit().putBoolean("completed", true).apply()
         guideProgress.save("introduction", ONBOARDING_REVISION, ONBOARDING_PAGES)
+        // The introduction's permissions page already offered all-files access, so Gallery does not ask again.
+        com.unspektrawesome.ui.onboarding.StorageAccessSetup.complete(this)
         cameraPermissionGranted = true
         onboardingCompleted = true
         startCamera()

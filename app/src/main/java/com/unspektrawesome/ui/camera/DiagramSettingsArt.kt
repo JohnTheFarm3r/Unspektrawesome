@@ -202,7 +202,7 @@ private fun Legend(x: Number, y: Number, items: List<Pair<String, LegendLine>>, 
 @Composable
 internal fun SetupPartHeader(title: String, section: String) {
     val renderer = LocalAppLanguage.current.renderer
-    Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 18.dp, bottom = 2.dp),
+    Row(settingsSearchTarget(title, heading = true).fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 18.dp, bottom = 2.dp),
         verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         Text(title, color = CameraColors.Text, fontSize = 15.sp, lineHeight = 20.sp, fontWeight = FontWeight.SemiBold,
             modifier = Modifier.weight(1f).semantics { heading() })
@@ -219,7 +219,7 @@ internal fun SetupPartHeader(title: String, section: String) {
 @Composable
 internal fun SetupSection(label: String, number: Int? = null) {
     val shown = LocalAppLanguage.current.renderer.text(label)
-    Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 16.dp, bottom = 4.dp),
+    Row(settingsSearchTarget(label, heading = true).fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 16.dp, bottom = 4.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         number?.let { DiagramNumber(it) }
         Text(shown.uppercase(), translate = false, color = Diagram.Hint, fontSize = 10.sp, lineHeight = 14.sp, letterSpacing = 1.4.sp,
@@ -248,7 +248,7 @@ internal fun SetupChoice(
     choiceModifier: (Int) -> Modifier = { Modifier },
     onSelect: (Int) -> Unit,
 ) {
-    Column(modifier.fillMaxWidth().diagramHairline().padding(horizontal = 4.dp).padding(top = 6.dp, bottom = 4.dp)) {
+    Column(modifier.then(settingsSearchTarget(title)).fillMaxWidth().diagramHairline().padding(horizontal = 4.dp).padding(top = 6.dp, bottom = 4.dp)) {
         if (title == null) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 number?.let { DiagramNumber(it) }
@@ -272,7 +272,7 @@ internal fun SetupChoice(
 @Composable
 internal fun SetupActionRow(title: String, symbol: SettingsSymbol, modifier: Modifier = Modifier, detail: String? = null,
     number: Int? = null, enabled: Boolean = true, onClick: () -> Unit) {
-    Row(modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(enabled = enabled, role = Role.Button, onClick = onClick)
+    Row(modifier.then(settingsSearchTarget(title)).fillMaxWidth().heightIn(min = 48.dp).clickable(enabled = enabled, role = Role.Button, onClick = onClick)
         .diagramHairline().padding(horizontal = 4.dp, vertical = 6.dp).alpha(if (enabled) 1f else .45f),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         Box(Modifier.size(26.dp).border(1.dp, Diagram.Border, RoundedCornerShape(6.dp)), contentAlignment = Alignment.Center) {
@@ -290,7 +290,7 @@ internal fun SetupActionRow(title: String, symbol: SettingsSymbol, modifier: Mod
 /** Guide replay row: title, step count, chevron and one dot per step. */
 @Composable
 internal fun SetupGuideRow(title: String, steps: Int, onClick: () -> Unit) {
-    Column(Modifier.fillMaxWidth().heightIn(min = 52.dp).clickable(role = Role.Button, onClick = onClick).diagramHairline()
+    Column(settingsSearchTarget(title).fillMaxWidth().heightIn(min = 52.dp).clickable(role = Role.Button, onClick = onClick).diagramHairline()
         .padding(horizontal = 4.dp, vertical = 9.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(title, color = CameraColors.Text, fontSize = 13.sp, lineHeight = 18.sp, modifier = Modifier.weight(1f))
@@ -558,6 +558,34 @@ internal fun SetupBurstStage(seconds: Int, memoryBytes: Long) {
                 mapOf("value1" to (memoryBytes + 1024 * 1024 - 1) / (1024 * 1024))) else renderer.text("Automatic RAM"),
                 color = Lime, size = 10f, translate = false, mono = true, maxWidth = 138.dp)
         }
+    }
+}
+
+@Composable
+internal fun SetupFaceTrackingStage(enabled: Boolean, focus: Boolean, exposure: Boolean) {
+    val focusOn = enabled && focus
+    val exposureOn = enabled && exposure
+    SetupStage(194) {
+        DiagramDrawing {
+            rbox(16, 14, 132, 150, 8)
+            ln(16, 140, 148, 140, Color(0xFF2E2E2E), 1)
+            mountains(pts(16, 134, 40, 120, 58, 130, 72, 124))
+            mountains(pts(98, 126, 118, 116, 148, 132))
+            ring(82, 76, 17, Diagram.Ink, 1.3)
+            arc(82, 140, 34, 200f, 140f, Diagram.Ink, 1.3)
+            val bracket = if (enabled) Lime else Diagram.Line
+            poly(pts(58, 60, 58, 50, 68, 50), bracket); poly(pts(106, 60, 106, 50, 96, 50), bracket)
+            poly(pts(58, 92, 58, 102, 68, 102), bracket); poly(pts(106, 92, 106, 102, 96, 102), bracket)
+            route(pts(106, 64, 156, 64, 156, 42, 168, 42), focusOn)
+            route(pts(106, 88, 156, 88, 156, 108, 168, 108), exposureOn)
+        }
+        Num(1, 112, 30, enabled)
+        Note("Focus", "sharp on the face", 174, 30, if (focusOn) NoteTone.On else NoteTone.Dim, 120)
+        Num(2, 300, 30, focusOn)
+        Note("Exposure", "brightness set for the face", 174, 96, if (exposureOn) NoteTone.On else NoteTone.Dim, 120)
+        Num(3, 300, 96, exposureOn)
+        Txt(if (enabled) "Tap the viewfinder to choose another point." else "Off: focus and exposure use the whole frame.",
+            16, 172, Diagram.Hint, 9.5f, maxWidth = 300)
     }
 }
 
@@ -1122,9 +1150,9 @@ internal fun SetupOverlaysStage(horizon: Boolean, performance: Boolean, viewfind
 // Video
 
 @Composable
-internal fun SetupRecordingStage(aac: Boolean, bufferMb: Int, bufferLabel: String) {
+internal fun SetupRecordingStage(aac: Boolean, bufferMb: Int, bufferLabel: String, microphone: String) {
     val filled = ((bufferMb - 512) / 512 + 1).coerceIn(1, 8)
-    SetupStage(290) {
+    SetupStage(304) {
         DiagramDrawing {
             rbox(14, 50, 56, 56, 6, fill = null)
             rbox(24, 60, 36, 36, 0, Diagram.Line, 1, fill = null)
@@ -1167,8 +1195,9 @@ internal fun SetupRecordingStage(aac: Boolean, bufferMb: Int, bufferLabel: Strin
         Txt("uncompressed", 184, 205, if (!aac) Lime else Diagram.Hint, 8f, maxWidth = 96, maxLines = 1)
         Lab("Audio format", if (aac) "AAC" else "PCM", null, 120, 136, true, 120, valueTranslate = false, mono = true)
         Num(1, 96, 146)
-        Lab("Microphone", null, null, 14, 236, maxWidth = 160)
-        Legend(14, 266, listOf("Current choice" to LegendLine.Current, "Other choice" to LegendLine.Other))
+        Num(3, 14, 162)
+        Lab("Microphone", microphone, null, 14, 236, true, 160)
+        Legend(14, 280, listOf("Current choice" to LegendLine.Current, "Other choice" to LegendLine.Other))
     }
 }
 
@@ -1216,5 +1245,311 @@ internal fun SetupRecordingLockStage(shutter: Boolean, iso: Boolean, focus: Bool
             Txt(status, 150, y - 5, if (on || status != "can change") Lime else Diagram.Hint, 8f, width = 182, align = TextAlign.End,
                 maxLines = 1)
         }
+    }
+}
+
+/** App size: a phone screen with a sample interface drawn at the chosen size. */
+@Composable
+internal fun SetupAppSizeStage(auto: Boolean, percent: Int, systemPercent: Int) {
+    val renderer = LocalAppLanguage.current.renderer
+    val applied = if (auto) systemPercent else percent
+    val s = (applied / 100f).coerceIn(.2f, 1.4f).toDouble()
+    SetupStage(200) {
+        DiagramDrawing {
+            rbox(22, 16, 96, 172, 14)
+            rbox(29, 23, 82, 158, 8, Faint, 1, fill = null)
+            // Sample interface: a title, text lines and a button, all scaled together.
+            val left = 36.0
+            var y = 32.0
+            fill(left, y, 40 * s, 4 * s, Lime, 1)
+            y += 10 * s
+            for (width in listOf(52, 38, 46, 30)) {
+                fill(left, y, width * s, 3 * s, Diagram.Line, 1)
+                y += 8 * s
+            }
+            y += 4 * s
+            rbox(left, y, 32 * s, 12 * s, 3 * s, if (auto) Diagram.Line else Lime, 1, fill = null)
+            val callout = Lime.copy(alpha = .7f)
+            poly(pts(76, 34, 118, 34, 134, 21), callout, 1); spot(76, 34)
+            poly(pts(96, 120, 118, 120, 134, 101), if (auto) Color.White.copy(alpha = .35f) else callout, 1)
+            spot(96, 120, 2.5, if (auto) Diagram.Hint else Lime)
+        }
+        val value = renderer.format("{value}%", mapOf("value" to applied))
+        Num(1, 134, 12)
+        Lab("Interface size", if (auto) "Auto" else "Standard",
+            if (auto) "Follows the phone's display size" else "Ignores the phone's display size", 160, 10, true, 170)
+        Num(2, 134, 92, !auto)
+        Lab("Size", value, if (auto) "Set by the phone" else "100% is the same on every phone", 160, 90, !auto, 170,
+            valueTranslate = false)
+        Txt("Text also follows the phone's font size.", 160, 160, Diagram.Hint, 9.5f, maxWidth = 170)
+    }
+}
+
+// Introduction drawings
+
+/** The four permissions as switches on a phone, each joined to its current state. */
+@Composable
+internal fun IntroPermissionsStage(camera: Boolean, microphone: Boolean, notifications: Boolean, files: Boolean) {
+    val rows = listOf(
+        Triple("Camera", camera, if (camera) "Allowed" else "Required") to "Viewfinder, photos and video",
+        Triple("Microphone", microphone, if (microphone) "Allowed" else "Optional") to "Sound in videos",
+        Triple("Notifications", notifications, if (notifications) "Allowed" else "Optional") to "Progress outside Gallery",
+        Triple("All files access", files, if (files) "Allowed" else "Optional") to "Gallery finds your files again",
+    )
+    SetupStage(236) {
+        DiagramDrawing {
+            rbox(18, 14, 100, 210, 16)
+            rbox(25, 22, 86, 194, 10, Faint, 1, fill = null)
+            fill(56, 28, 24, 3, Diagram.Line, 1)
+            rows.forEachIndexed { index, (row, _) ->
+                val on = row.second
+                val y = 46 + index * 50
+                fill(32, y - 5, 40, 3, if (on) Soft else Diagram.Line, 1)
+                fill(32, y + 2, 28, 2, Faint, 1)
+                rbox(82, y - 6, 20, 12, 6, if (on) Lime else Diagram.Line, 1, dashed = !on, fill = if (on) Lime.copy(alpha = .15f) else null)
+                spot(if (on) 96 else 88, y, 3, if (on) Lime else Diagram.Line)
+                route(pts(106, y, 152, y), on, arrow = false)
+            }
+        }
+        rows.forEachIndexed { index, (row, detail) ->
+            val y = 46 + index * 50
+            Num(index + 1, 124, y - 9, row.second)
+            Lab(row.first, row.third, detail, 160, y - 19, row.second, 170, emLines = 1, valueLines = 1)
+        }
+    }
+}
+
+/** A phone showing the film look live, the film cards under it and the shutter. */
+@Composable
+internal fun IntroLookStage() {
+    SetupStage(196) {
+        DiagramDrawing {
+            rbox(18, 14, 100, 170, 16)
+            rbox(26, 24, 84, 106, 4, Faint, 1, fill = Lime.copy(alpha = .05f))
+            mountains(pts(26, 112, 46, 90, 62, 102, 82, 80, 110, 106), Lime.copy(alpha = .6f))
+            ring(92, 46, 7, Lime.copy(alpha = .6f), 1.2)
+            listOf(28, 54, 80).forEachIndexed { index, x ->
+                rbox(x, 138, 22, 14, 2, if (index == 1) Lime else Diagram.Line, 1, fill = null)
+            }
+            ring(68, 168, 9)
+            ring(68, 168, 6, Diagram.Ink, 0, fill = Diagram.Ink)
+            val callout = Lime.copy(alpha = .7f)
+            poly(pts(104, 70, 124, 70, 150, 38), callout, 1); spot(104, 70)
+            poly(pts(102, 145, 124, 145, 150, 104), callout, 1); spot(102, 145)
+            poly(pts(77, 168, 124, 168, 150, 166), callout, 1); spot(77, 168)
+        }
+        Num(1, 132, 24)
+        Num(2, 132, 90)
+        Num(3, 132, 152)
+        Lab("Viewfinder", "Live film look", "spektrafilm while you frame", 158, 22, true, 170, emLines = 1, valueLines = 1)
+        Lab("Swipe up", "Film cards", "Format, effects, processing, exposure", 158, 88, true, 170, emLines = 2, valueLines = 1)
+        Lab("Shutter", "RAW capture", "Developed with the same look", 158, 150, true, 170, emLines = 1, valueLines = 1)
+    }
+}
+
+/** Sensor data developed, shaped by spektrafilm and saved, with the live viewfinder branch. */
+@Composable
+internal fun IntroPipelineStage() {
+    SetupStage(176) {
+        DiagramDrawing {
+            rbox(12, 26, 56, 28, 4)
+            route(pts(68, 40, 80, 40), true)
+            rbox(82, 26, 66, 28, 4)
+            route(pts(148, 40, 158, 40), true)
+            rbox(160, 26, 78, 28, 4, Lime, fill = Lime.copy(alpha = .06f))
+            route(pts(238, 40, 248, 40), true)
+            rbox(250, 26, 74, 28, 4, Lime)
+            poly(pts(40, 54, 40, 94, 120, 94), Diagram.Line, 1.2)
+            route(pts(120, 94, 248, 94), true, color = Diagram.Line)
+            rbox(250, 80, 74, 28, 4, Diagram.Ink, dashed = true)
+            route(pts(220, 54, 220, 128), true, color = Diagram.Ink)
+            rbox(170, 130, 100, 34, 4, Diagram.Ink, dashed = true)
+        }
+        Num(1, 12, 4)
+        Num(2, 82, 4)
+        Num(3, 160, 4)
+        Num(4, 250, 4)
+        Num(5, 150, 138)
+        TxtC("Sensor", 40, 33, 52, CameraColors.Text, 9.5f, maxLines = 1)
+        TxtC("Develop", 115, 33, 62, CameraColors.Text, 9.5f, maxLines = 1)
+        TxtC("spektrafilm", 199, 33, 74, Lime, 9.5f, FontWeight.SemiBold, translate = false, mono = true, maxLines = 1)
+        TxtC("JPEG", 287, 33, 70, Lime, 9.5f, translate = false, mono = true, maxLines = 1)
+        TxtC("DNG", 287, 87, 70, CameraColors.Text, 9.5f, translate = false, mono = true, maxLines = 1)
+        TxtC("demosaic, color", 115, 58, 76, Diagram.Hint, 8.5f)
+        TxtC("on the GPU", 186, 58, 60, Diagram.Hint, 8.5f)
+        Txt("original RAW", 50, 78, Diagram.Hint, 8.5f, maxWidth = 120, maxLines = 1)
+        TxtC("JPEG+DNG", 287, 112, 74, Diagram.Hint, 8f, translate = false, mono = true, maxLines = 1)
+        TxtC("Viewfinder", 220, 134, 96, CameraColors.Text, 9.5f, maxLines = 1)
+        TxtC("live, lower resolution", 220, 147, 96, Diagram.Hint, 8f, maxLines = 1)
+    }
+}
+
+/** The capture mode rail with a small picture of what each mode records. */
+@Composable
+internal fun IntroModesStage() {
+    val renderer = LocalAppLanguage.current.renderer
+    val positions = listOf(40, 102, 166, 228, 290)
+    SetupStage(176) {
+        DiagramDrawing {
+            rbox(12, 14, 312, 30, 6, Rule, 1)
+            ln(151, 38, 181, 38, Lime)
+            route(pts(186, 56, 214, 56), true)
+            route(pts(146, 56, 118, 56), false)
+            val y = 92
+            // BURST: frames kept before the shutter press.
+            for (i in 2 downTo 0) rbox(26 + i * 6, y - 14 + i * 4, 22, 16, 2, if (i == 0) Diagram.Ink else Diagram.Line, 1)
+            // VIDEO: record button.
+            ring(102, y, 12); ring(102, y, 6, Lime, 0, fill = Lime)
+            // PHOTO: shutter.
+            ring(166, y, 12, Lime); ring(166, y, 8, Diagram.Ink, 0, fill = Diagram.Ink)
+            // 3×3: nine panels.
+            for (row in 0..2) for (col in 0..2) rbox(214 + col * 10, y - 14 + row * 10, 8, 8, 1, Diagram.Line, 1, fill = null)
+            // PANORAMA: one wide frame.
+            rbox(262, y - 12, 56, 24, 3, Diagram.Ink, 1, fill = null)
+            mountains(pts(262, y + 10, 276, y - 2, 288, y + 6, 302, y - 6, 318, y + 8), Diagram.Line)
+        }
+        CaptureMode.entries.forEachIndexed { index, mode ->
+            val x = positions.getOrElse(index) { 290 }
+            TxtC(renderer.text(mode.label), x, 22, if (mode == CaptureMode.PANORAMA) 66 else 54,
+                if (mode == CaptureMode.PHOTO) Lime else Diagram.Hint, 10f, translate = false, mono = true, maxLines = 1)
+            Num(index + 1, x - 9, 118, mode == CaptureMode.PHOTO)
+        }
+        Cap("Swipe on viewfinder or tap a mode name", 12, 148, Diagram.Hint, 312, 8.5f)
+    }
+}
+
+/** Process now or later: the two ways a photo reaches Gallery, and the original that stays. */
+@Composable
+internal fun IntroGalleryStage() {
+    SetupStage(196) {
+        DiagramDrawing {
+            ring(28, 90, 13, fill = Color.Black)
+            ring(28, 90, 6, Lime, 1)
+            ln(41, 90, 56, 90, Lime)
+            poly(pts(64, 82, 72, 90, 64, 98, 56, 90, 64, 82), Lime)
+            route(pts(64, 82, 64, 44, 92, 44), true)
+            rbox(94, 32, 80, 24, 4)
+            route(pts(174, 44, 240, 44), true)
+            rbox(242, 32, 62, 24, 4, Lime)
+            route(pts(64, 98, 64, 136, 92, 136), true, color = Diagram.Ink)
+            rbox(94, 124, 40, 24, 4)
+            route(pts(134, 136, 158, 136), true, color = Diagram.Ink)
+            rbox(160, 124, 64, 24, 4)
+            route(pts(224, 136, 240, 136), true, color = Diagram.Ink)
+            rbox(242, 124, 62, 24, 4, Lime)
+            ln(114, 148, 114, 172, Diagram.Line, 1, dashed = true)
+            rbox(94, 172, 96, 18, 4, Diagram.Line, 1, dashed = true)
+        }
+        Cap("Process now", 96, 16, Lime, 140, 8.5f)
+        Cap("Later in Gallery", 96, 108, CameraColors.Text, 140, 8.5f)
+        TxtC("spektrafilm", 134, 38, 78, CameraColors.Text, 9.5f, translate = false, mono = true, maxLines = 1)
+        TxtC("JPEG", 273, 38, 60, Lime, 9.5f, translate = false, mono = true, maxLines = 1)
+        TxtC("DNG", 114, 130, 38, CameraColors.Text, 9.5f, translate = false, mono = true, maxLines = 1)
+        TxtC("Processing", 192, 130, 62, CameraColors.Text, 9f, maxLines = 1)
+        TxtC("JPEG", 273, 130, 60, Lime, 9.5f, translate = false, mono = true, maxLines = 1)
+        TxtC("Original kept", 142, 174, 94, Diagram.Hint, 8.5f, maxLines = 1)
+        TxtC("Shutter", 28, 106, 54, Diagram.Hint, 9f)
+        Num(1, 180, 14)
+        Num(2, 70, 104)
+        Num(3, 183, 152)
+        Num(4, 196, 172)
+    }
+}
+
+/** Heat and power on the left, and the two viewfinder paths chosen from the chip. */
+@Composable
+internal fun IntroDemandStage() {
+    SetupStage(158) {
+        DiagramDrawing {
+            rbox(18, 16, 76, 128, 14)
+            rbox(48, 36, 14, 64, 7, Diagram.Ink, 1.2, fill = null)
+            fill(52, 62, 6, 40, Lime.copy(alpha = .8f), 3)
+            ring(55, 110, 10, Diagram.Ink, 1.2, fill = Lime.copy(alpha = .8f))
+            val callout = Lime.copy(alpha = .7f)
+            poly(pts(62, 50, 104, 50, 116, 34), callout, 1); spot(62, 50)
+            route(pts(94, 120, 106, 120), true, arrow = false, color = Diagram.Line)
+            poly(pts(106, 98, 106, 132), Diagram.Line, 1.2)
+            route(pts(106, 98, 118, 98), true)
+            route(pts(106, 132, 118, 132), true, color = Diagram.Ink)
+            rbox(120, 86, 98, 24, 4, Lime, fill = Lime.copy(alpha = .06f))
+            rbox(226, 86, 98, 24, 4, Diagram.Line, 1, fill = null)
+            rbox(120, 120, 98, 24, 4, Diagram.Ink)
+            rbox(226, 120, 98, 24, 4, Diagram.Line, 1, fill = null)
+        }
+        Num(1, 116, 18)
+        Num(2, 300, 62)
+        Lab("Heat and power", "Higher than usual", "Long sessions warm the phone", 140, 14, true, 180, emLines = 1, valueLines = 1)
+        Cap("Viewfinder by chip", 120, 68, Diagram.Hint, 170, 8.5f)
+        TxtC("Recent flagships", 169, 92, 94, Lime, 8.5f, maxLines = 1)
+        TxtC("Full preview", 275, 92, 94, CameraColors.Text, 8.5f, maxLines = 1)
+        TxtC("Older chips", 169, 126, 94, CameraColors.Text, 8.5f, maxLines = 1)
+        TxtC("Lighter preview", 275, 126, 94, CameraColors.Text, 8.5f, maxLines = 1)
+    }
+}
+
+/** Live video: RAW through spektrafilm into the encoder, gyro stabilization and the hold-to-lock shutter. */
+@Composable
+internal fun IntroVideoStage() {
+    SetupStage(168) {
+        DiagramDrawing {
+            rbox(12, 26, 52, 28, 4)
+            route(pts(64, 40, 80, 40), true)
+            rbox(82, 26, 88, 28, 4, Lime, fill = Lime.copy(alpha = .06f))
+            route(pts(170, 40, 186, 40), true)
+            rbox(188, 26, 68, 28, 4, Lime)
+            ring(38, 112, 14, Diagram.Ink, 1.2)
+            ln(26, 112, 50, 112, Diagram.Line, 1); ln(38, 100, 38, 124, Diagram.Line, 1)
+            route(pts(52, 112, 80, 112), true, color = Diagram.Ink)
+            rbox(82, 98, 88, 28, 4)
+            route(pts(170, 112, 222, 112, 222, 56), true, color = Diagram.Ink)
+            ring(292, 112, 13)
+            ring(292, 112, 8, Lime, 0, fill = Lime)
+            lock(286f, 72f, true, Lime)
+        }
+        Num(1, 82, 4)
+        Num(2, 150, 58)
+        Num(3, 82, 76)
+        Num(4, 262, 76)
+        TxtC("RAW", 38, 33, 48, CameraColors.Text, 9.5f, translate = false, mono = true, maxLines = 1)
+        TxtC("spektrafilm", 126, 33, 84, Lime, 9.5f, FontWeight.SemiBold, translate = false, mono = true, maxLines = 1)
+        TxtC("H.265", 222, 33, 64, Lime, 9.5f, translate = false, mono = true, maxLines = 1)
+        TxtC("lighter effects", 112, 58, 64, Diagram.Hint, 8.5f)
+        TxtC("Gyro", 38, 130, 50, Diagram.Hint, 8.5f, maxLines = 1)
+        TxtC("Stabilization", 126, 105, 84, CameraColors.Text, 9f, maxLines = 1)
+        TxtC("Hold shutter", 292, 130, 72, Diagram.Hint, 8.5f)
+    }
+}
+
+/** The lenses tested one by one into separate photo and video profiles. */
+@Composable
+internal fun IntroLensStage() {
+    SetupStage(160) {
+        DiagramDrawing {
+            rbox(18, 20, 76, 116, 16)
+            ring(42, 46, 11); ring(42, 46, 5, Diagram.Line, 1)
+            ring(72, 46, 11); ring(72, 46, 5, Diagram.Line, 1)
+            ring(42, 80, 11); ring(42, 80, 5, Diagram.Line, 1)
+            spot(72, 80, 4, Diagram.Line)
+            route(pts(94, 78, 116, 78), true)
+            rbox(118, 62, 60, 32, 4, Lime, fill = Lime.copy(alpha = .06f))
+            route(pts(178, 70, 190, 70, 190, 40, 204, 40), true)
+            route(pts(178, 86, 190, 86, 190, 116, 204, 116), true, color = Diagram.Ink)
+            rbox(206, 26, 64, 28, 4, Lime)
+            rbox(206, 102, 64, 28, 4)
+            route(pts(270, 40, 296, 40, 296, 64), true, color = Diagram.Line)
+            route(pts(270, 116, 296, 116, 296, 92), true, color = Diagram.Line)
+            rbox(276, 66, 48, 24, 4, Diagram.Line, 1, fill = null)
+            rbox(284, 73, 10, 10, 2, Lime, 1, fill = Lime.copy(alpha = .2f))
+            rbox(302, 73, 10, 10, 2, Diagram.Line, 1, fill = null)
+        }
+        Num(1, 118, 40)
+        Num(2, 206, 4)
+        Num(3, 306, 44)
+        TxtC("Test", 148, 66, 56, Lime, 9.5f, FontWeight.SemiBold, maxLines = 1)
+        TxtC("RAW10 first", 148, 79, 56, Diagram.Hint, 7.5f, maxLines = 1)
+        TxtC("Photo", 238, 33, 60, Lime, 9.5f, maxLines = 1)
+        TxtC("Video", 238, 109, 60, CameraColors.Text, 9.5f, maxLines = 1)
+        TxtC("Shown", 300, 94, 48, Diagram.Hint, 8f, maxLines = 1)
+        TxtC("Each lens", 56, 140, 76, Diagram.Hint, 8.5f, maxLines = 1)
     }
 }

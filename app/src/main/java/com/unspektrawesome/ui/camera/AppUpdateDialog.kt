@@ -85,7 +85,7 @@ internal fun AppUpdateDialog(state: UpdateState, onDismiss: () -> Unit, onAction
     // Shown over the camera too, so the window turns with the phone like the camera's other windows.
     val rotation = LocalCameraWindowRotation.current
     Dialog(onDismiss, properties = DialogProperties(dismissOnBackPress = !downloading, dismissOnClickOutside = !downloading,
-        usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+        usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) { AppSizedWindow {
         CameraWindowBackdrop()
         Box(Modifier.fillMaxSize().safeDrawingPadding().padding(16.dp), contentAlignment = Alignment.Center) {
           CompositionLocalProvider(com.unspektrawesome.language.LocalOwnTextWidth provides true) {
@@ -144,7 +144,7 @@ internal fun AppUpdateDialog(state: UpdateState, onDismiss: () -> Unit, onAction
             }
           }
         }
-    }
+    }}
 }
 
 /** Release notes with their Added, Changed and Fixed headings set apart from the entries. */

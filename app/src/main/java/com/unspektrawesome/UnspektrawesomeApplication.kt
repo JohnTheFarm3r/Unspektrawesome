@@ -21,6 +21,7 @@ class UnspektrawesomeApplication : Application() {
         System.loadLibrary("unspektrawesome_vulkan")
         shaderWarmup.start()
         com.unspektrawesome.language.AppLanguage.initialize(this)
+        com.unspektrawesome.settings.AppDisplaySize.initialize(this)
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
             private fun log(activity: Activity, state: String) =
                 InternalLogRecorder.event("Lifecycle", "${activity.javaClass.simpleName} $state")

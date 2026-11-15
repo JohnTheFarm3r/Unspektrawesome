@@ -21,7 +21,7 @@ internal object BurstContainer {
     private const val MAX_RECORD = 300 * 1024 * 1024
 
     class Writer(private val context: Context, val capturedAt: Long) : AutoCloseable {
-        val uri: Uri = BurstMedia.create(context, "Unspektrawesome-$capturedAt.spektra")
+        val uri: Uri = BurstMedia.create(context, "Unspektrawesome-$capturedAt.unspektra")
         private val stream = try {
             ParcelFileDescriptor.AutoCloseOutputStream(requireNotNull(context.contentResolver.openFileDescriptor(uri, "rw")))
         } catch (error: Exception) { context.contentResolver.delete(uri, null, null); throw error }

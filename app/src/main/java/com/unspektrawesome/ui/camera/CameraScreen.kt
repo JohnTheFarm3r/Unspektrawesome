@@ -201,6 +201,8 @@ fun CameraScreen(
     onPreferencesChanged: (CameraPreferences) -> Unit,
     onShutter: () -> Unit,
     onLockedRecording: () -> Unit = {},
+    /** Starts a recording without ever stopping one; returns false when the microphone permission had to be requested. */
+    onStartRecording: () -> Boolean = { false },
     onOpenGallery: () -> Unit,
     onOpenGalleryOverview: () -> Unit = onOpenGallery,
     viewfinderAspectRatio: Float,
@@ -217,6 +219,7 @@ fun CameraScreen(
     lastPhotoUri: android.net.Uri?,
     tapMeteringStatus: TapMeteringStatus,
     exposureMeteringStatus: TapMeteringStatus = TapMeteringStatus(),
+    trackedFace: com.unspektrawesome.preview.TrackedFaceBox? = null,
     onExposurePointChanged: (Float, Float) -> Unit = { _, _ -> },
     onFocusPointChanged: (Float, Float) -> Unit = { _, _ -> },
     onClearExposurePoint: () -> Unit = {},
@@ -552,11 +555,29 @@ fun CameraScreen(
             if (!controlRecordingStarted) modeAfterControlRecording = null
         }
     }
+    val currentStartRecording by rememberUpdatedState(onStartRecording)
     LaunchedEffect(pendingControlCapture, captureMode, hardwareShutterReady, hardwareShutterActive, videoState.busy) {
         val target = pendingControlCapture ?: return@LaunchedEffect
-        val modeReady = if (target == com.unspektrawesome.controls.ControlAction.RECORD_VIDEO) captureMode == CaptureMode.VIDEO
-            else captureMode == CaptureMode.PHOTO
-        if (modeReady && hardwareShutterActive && hardwareShutterReady && !videoState.busy) {
+        if (target == com.unspektrawesome.controls.ControlAction.RECORD_VIDEO) {
+            if (videoState.busy) {
+                pendingControlCapture = null
+                return@LaunchedEffect
+            }
+            if (captureMode != CaptureMode.VIDEO || !hardwareShutterActive || !hardwareShutterReady) return@LaunchedEffect
+            spektraVisible = false
+            advancedSpektraVisible = false
+            activeCameraParameter = null
+            // Video mode can look ready while the camera is still switching over, which turns a start
+            // request away. Keep asking until the recording starts; a running recording is never stopped.
+            while (true) {
+                if (!currentStartRecording()) {
+                    pendingControlCapture = null
+                    return@LaunchedEffect
+                }
+                delay(400)
+            }
+        }
+        if (captureMode == CaptureMode.PHOTO && hardwareShutterActive && hardwareShutterReady && !videoState.busy) {
             pendingControlCapture = null
             currentShutter()
         }
@@ -998,6 +1019,15 @@ fun CameraScreen(
                         onResetFocus = { onAutoFocus() },
                         onResetExposure = onClearExposurePoint,
                     )
+                    val exposureFollowsFace = preferences.faceExposureActive() && exposureMeteringStatus.phase == TapMeteringPhase.IDLE &&
+                        (if (cameraControls.customAe) cameraControls.exposureMode != AeMode.MANUAL else cameraControls.autoExposure)
+                    val focusFollowsFace = preferences.faceFocusActive() && cameraControls.autoFocus &&
+                        tapMeteringStatus.phase == TapMeteringPhase.IDLE
+                    TrackedFaceOverlay(trackedFace.takeIf {
+                        (focusFollowsFace || exposureFollowsFace) && hasCameraPermission && !startupLoading &&
+                            !lensSwitching && !panoramaCapture && !actionsVisible
+                    }, horizontal, vertical)
+                    FaceDetectionDebugOverlay(horizontal, vertical)
                     if (loupeSelected && hasCameraPermission && !startupLoading && !lensSwitching && !panoramaCapture) {
                         FocusLoupeLayer(
                             manualActive = loupeManual,
@@ -2539,7 +2569,7 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawFocusMountain(
 internal fun isoStops(min: Int, max: Int): List<Int> {
     val standard = listOf(
         25, 50, 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000,
-        1250, 1600, 2000, 2500, 3200, 6400, 12800, 25600,
+        1250, 1600, 2000, 2500, 3200, 6400, 12800, 25600, 51200, 102400,
     )
     return (listOf(min) + standard.filter { it in min..max } + max).distinct().sorted()
 }
@@ -2703,10 +2733,38 @@ private fun formatValue(value: Float, suffix: String?): String {
     return if (suffix == null) number else "$number $suffix"
 }
 
+/** The app's interface size, which popups and dialogs need because their windows start at the phone's display size. */
+internal val LocalAppDensity = androidx.compose.runtime.staticCompositionLocalOf<androidx.compose.ui.unit.Density?> { null }
+
+/** Wraps the content of a popup or dialog so it uses the app's interface size like the rest of the app. */
+@Composable
+internal fun AppSizedWindow(content: @Composable () -> Unit) {
+    val density = LocalAppDensity.current ?: LocalDensity.current
+    CompositionLocalProvider(LocalDensity provides density, content = content)
+}
+
+/** Screen width and height in the app's interface size. The phone reports them in its own display size. */
+@Composable
+internal fun appScreenSize(): androidx.compose.ui.unit.DpSize {
+    val configuration = androidx.compose.ui.platform.LocalConfiguration.current
+    val scale = LocalContext.current.resources.displayMetrics.density / LocalDensity.current.density
+    return androidx.compose.ui.unit.DpSize((configuration.screenWidthDp * scale).dp, (configuration.screenHeightDp * scale).dp)
+}
+
 @OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
 fun UnspektrawesomeTheme(rotation: Float = 0f, content: @Composable () -> Unit) {
     val backdropWindows = remember { CameraBackdropWindows() }
+    val displaySize by com.unspektrawesome.settings.AppDisplaySize.state.collectAsState()
+    val context = LocalContext.current
+    val configuration = androidx.compose.ui.platform.LocalConfiguration.current
+    val systemDensity = LocalDensity.current
+    // The app keeps its own interface size unless Auto follows the phone's display size. Text keeps the phone's font size.
+    val density = remember(displaySize, configuration, systemDensity, context) {
+        if (displaySize.auto) systemDensity
+        else com.unspektrawesome.settings.AppDisplaySize.standardDensity(context)
+            ?.let { androidx.compose.ui.unit.Density(it * displaySize.percent / 100f, systemDensity.fontScale) } ?: systemDensity
+    }
     MaterialTheme(
         typography = CameraTypography.Body,
         colorScheme = androidx.compose.material3.darkColorScheme(
@@ -2726,7 +2784,7 @@ fun UnspektrawesomeTheme(rotation: Float = 0f, content: @Composable () -> Unit) 
         ),
         content = { CompositionLocalProvider(androidx.compose.foundation.LocalIndication provides CameraPressIndication,
             androidx.compose.material3.LocalRippleConfiguration provides null, LocalCameraBackdropWindows provides backdropWindows,
-            LocalCameraWindowRotation provides rotation) {
+            LocalCameraWindowRotation provides rotation, LocalDensity provides density, LocalAppDensity provides density) {
             com.unspektrawesome.language.LanguageRoot(content)
         } },
     )

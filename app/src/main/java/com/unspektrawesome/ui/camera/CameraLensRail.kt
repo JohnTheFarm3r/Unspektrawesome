@@ -24,6 +24,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
@@ -91,28 +93,42 @@ internal fun CameraLensRail(
             override val longPressTimeoutMillis: Long = 500L
         }
     }
+    val count = if (groups.isEmpty()) orderedCameras.size else groups.size
+    val activeIndex = if (groups.isEmpty()) orderedCameras.indexOfFirst { it.route.routeId == selected }
+        else groups.indexOfFirst { (sensorId, _) -> activeProfile?.focalGroup == sensorId }
     CompositionLocalProvider(LocalViewConfiguration provides holdConfiguration) {
+        BoxWithConstraints(modifier) {
+        // Buttons overlap like stacked coins: a little always, and more when needed for every lens to fit on one line.
+        // Scrolling is only a fallback when even the closest stacking does not fit.
+        val spacing = if (count < 2) 0.dp else ((maxWidth - LENS_BUTTON_SIZE * count) / (count - 1))
+            .coerceIn(-MAX_LENS_OVERLAP, -MIN_LENS_OVERLAP)
+        val fits = LENS_BUTTON_SIZE * count + spacing * (count - 1) <= maxWidth
         val scrollState = rememberScrollState()
-        Row(modifier.height(44.dp).graphicsLayer { alpha = opacity }
+        Row(Modifier.height(LENS_RAIL_HEIGHT).graphicsLayer { alpha = opacity }
             .traceLensInput("rail") { "enabled=$interactive scroll=${scrollState.isScrollInProgress} offset=${scrollState.value}/${scrollState.maxValue}" }
             .then(if (visible) Modifier else Modifier.clearAndSetSemantics {})
-            .horizontalScroll(scrollState, enabled = interactive && scrollState.maxValue > 0, overscrollEffect = null),
-            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            // Scrolling clips its content, which would cut off the enlarged selected button, so it is used only when needed.
+            .then(if (fits) Modifier else Modifier.horizontalScroll(scrollState, enabled = interactive && scrollState.maxValue > 0,
+                overscrollEffect = null)),
+            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(spacing)) {
+            fun stack(index: Int) = if (index == activeIndex) count + 1f
+                else count - abs(index - activeIndex.coerceAtLeast(0)).toFloat()
             if (groups.isEmpty()) {
-                orderedCameras.forEach { camera ->
+                orderedCameras.forEachIndexed { index, camera ->
                     key(camera.route.routeId) {
                         LensButton(camera, camera.route.routeId == selected, emptyList(), null, null,
-                            enabled = interactive, onDefaultProfile = {},
+                            enabled = interactive, onDefaultProfile = {}, stack = stack(index),
                             onSelect = { onSelect(camera.route.routeId) })
                     }
                 }
             } else {
-                groups.forEach { (sensorId, choices) ->
+                groups.forEachIndexed { index, (sensorId, choices) ->
                     key(sensorId) {
                         val profile = activeProfile?.takeIf { it.focalGroup == sensorId }
                             ?: choices.firstOrNull { it.id == lastUsed[memory(sensorId)] } ?: choices.first()
                         LensButton(byRoute.getValue(profile.routeId), activeProfile?.focalGroup == sensorId,
                             choices, profile.id, defaultProfile, enabled = interactive, onDefaultProfile = onDefaultProfile,
+                            stack = stack(index),
                             onSelect = { id ->
                                 val chosen = id ?: profile.id
                                 lastUsed = lastUsed + (memory(sensorId) to chosen)
@@ -122,13 +138,20 @@ internal fun CameraLensRail(
                 }
             }
         }
+        }
     }
 }
+
+private val LENS_BUTTON_SIZE = 44.dp
+private val LENS_RAIL_HEIGHT = 44.dp
+private val MIN_LENS_OVERLAP = 4.dp
+private val MAX_LENS_OVERLAP = 16.dp
+private const val ACTIVE_LENS_SCALE = 1.12f
 
 @Composable
 private fun LensButton(camera: CameraDescriptor, active: Boolean, profiles: List<LensProfile>,
     selectedProfile: String?, defaultProfile: String?, enabled: Boolean, onDefaultProfile: (String) -> Unit,
-    onSelect: (String?) -> Unit) {
+    stack: Float, onSelect: (String?) -> Unit) {
     val haptics = LocalHapticFeedback.current
     val rotation = LocalCameraRotation.current
     val zoom = profiles.firstOrNull { it.id == selectedProfile }?.focalLength?.label(camera) ?: LensButtonMapping.zoomLabel(camera)
@@ -145,11 +168,16 @@ private fun LensButton(camera: CameraDescriptor, active: Boolean, profiles: List
     var bounds by remember { mutableStateOf(IntRect.Zero) }
     // Reset the held gesture when the picker takes or releases touch focus.
     key(selectedProfile, expanded) {
-        Box(Modifier.size(44.dp).traceLensInput("button-${camera.route.routeId}") { "enabled=$enabled expanded=$expanded" }.onGloballyPositioned {
+        val scale by animateFloatAsState(if (active) ACTIVE_LENS_SCALE else 1f, tween(150), label = "Lens button scale")
+        // Overlapping buttons need a nearly solid face so the button underneath does not show through.
+        val face = LocalCameraControlBackground.current.let { it.copy(alpha = maxOf(it.alpha, .9f)) }
+        Box(Modifier.zIndex(stack).graphicsLayer { scaleX = scale; scaleY = scale }
+            .shadow(4.dp, CircleShape).size(LENS_BUTTON_SIZE).traceLensInput("button-${camera.route.routeId}") { "enabled=$enabled expanded=$expanded" }.onGloballyPositioned {
             val rect = it.boundsInWindow()
             bounds = IntRect(rect.left.roundToInt(), rect.top.roundToInt(), rect.right.roundToInt(), rect.bottom.roundToInt())
         }.clip(CircleShape)
-            .previewControlSurface(CircleShape, selected = active)
+            .background(face)
+            .border(1.dp, if (active) CameraColors.Accent else CameraColors.PreviewControlBorder, CircleShape)
             .combinedClickable(enabled = enabled, role = Role.RadioButton, onClick = {
                 if (BuildConfig.DEBUG) InternalLogRecorder.event("LensInput", "click route=${camera.route.routeId} profile=$selectedProfile")
                 haptics.performHapticFeedback(HapticFeedbackType.SegmentTick)
@@ -196,7 +224,7 @@ private fun LensProfilePicker(profiles: List<LensProfile>, selectedId: String?, 
             }
         }
     }
-    Popup(popupPositionProvider = position, onDismissRequest = onDismiss, properties = CameraPopupProperties) {
+    Popup(popupPositionProvider = position, onDismissRequest = onDismiss, properties = CameraPopupProperties) { AppSizedWindow {
         CameraWindowBackdrop()
         Layout(content = {
             val shape = CameraStyle.PanelShape
@@ -253,7 +281,7 @@ private fun LensProfilePicker(profiles: List<LensProfile>, selectedId: String?, 
                 }
             }
         }
-    }
+    }}
 }
 
 @Composable

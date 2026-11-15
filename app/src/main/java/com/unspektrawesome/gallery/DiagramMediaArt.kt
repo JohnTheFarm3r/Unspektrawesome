@@ -254,13 +254,6 @@ internal fun Modifier.dottedGrid(): Modifier = drawBehind {
 // Tile marks
 
 @Composable
-internal fun SpektrafilmBadge(modifier: Modifier = Modifier) {
-    Text("spektrafilm", color = CameraColors.Accent, fontSize = 10.sp, lineHeight = 13.sp, fontWeight = FontWeight.Medium,
-        modifier = modifier.background(MediaArt.TileShade, MediaArt.BadgeShape)
-            .border(1.dp, CameraColors.Accent.copy(alpha = .5f), MediaArt.BadgeShape).padding(horizontal = 6.dp, vertical = 1.dp))
-}
-
-@Composable
 internal fun VideoDurationBadge(durationMs: Long, modifier: Modifier = Modifier) {
     Row(modifier.background(MediaArt.TileShade, MediaArt.BadgeShape).padding(horizontal = 7.dp, vertical = 3.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {

@@ -237,17 +237,14 @@ internal fun BurstViewer(uri: Uri, onDismiss: () -> Unit, onExported: () -> Unit
                     }, contentScale = ContentScale.Fit)
                 }
             }
-                ?: Text(if (failed) "Unable to open BURST" else "Loading preview", color = if (failed) CameraColors.FocusFailed else Diagram.Hint,
-                    fontSize = 12.5.sp)
-        }
-        Column(Modifier.fillMaxWidth().heightIn(max = controlsHeight).verticalScroll(rememberScrollState())
-            .padding(top = 4.dp, bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            if (showTimeline) {
-                BurstTimelineArt(timestamps, prepared, selected, selecting, selectedFrames.toSet(), Modifier.padding(horizontal = 12.dp))
-                BurstTimelineLegend(selecting, Modifier.padding(horizontal = 16.dp))
-            }
+                ?: run {
+                    if (failed || !(nativeLoading || count > 0 && prepared < count))
+                        Text(if (failed) "Unable to open BURST" else "Loading preview", color = if (failed) CameraColors.FocusFailed else Diagram.Hint,
+                            fontSize = 12.5.sp)
+                }
+            // Shown over the preview so the controls below never move.
             if (nativeLoading || count > 0 && prepared < count) {
-                Row(Modifier.padding(horizontal = 12.dp).fillMaxWidth().heightIn(min = 34.dp).clip(Diagram.ControlShape)
+                Row(Modifier.align(Alignment.BottomCenter).padding(bottom = 12.dp).padding(horizontal = 12.dp).widthIn(max = 320.dp).fillMaxWidth().heightIn(min = 34.dp).clip(Diagram.ControlShape)
                     .background(Color.Black.copy(alpha = .7f)).border(1.dp, Diagram.Border, Diagram.ControlShape)
                     .padding(horizontal = 12.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -258,6 +255,13 @@ internal fun BurstViewer(uri: Uri, onDismiss: () -> Unit, onExported: () -> Unit
                     if (!nativeLoading) androidx.compose.material3.LinearProgressIndicator(progress = { prepared.toFloat() / count },
                         color = CameraColors.Accent, trackColor = Diagram.Border, modifier = Modifier.width(64.dp).height(1.dp))
                 }
+            }
+        }
+        Column(Modifier.fillMaxWidth().heightIn(max = controlsHeight).verticalScroll(rememberScrollState())
+            .padding(top = 4.dp, bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            if (showTimeline) {
+                BurstTimelineArt(timestamps, prepared, selected, selecting, selectedFrames.toSet(), Modifier.padding(horizontal = 12.dp))
+                BurstTimelineLegend(selecting, Modifier.padding(horizontal = 16.dp))
             }
             session?.let { current ->
                 BurstFilmstrip(current, dispatcher, prepared, selected, selecting, selectedFrames, !exporting, { frame ->
@@ -348,15 +352,6 @@ internal fun BurstViewer(uri: Uri, onDismiss: () -> Unit, onExported: () -> Unit
                         }
                     }
                 }
-            }
-            if (!selecting && count > 0 && prepared < count) Row(Modifier.padding(horizontal = 12.dp),
-                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                androidx.compose.foundation.Canvas(Modifier.size(18.dp, 7.dp)) {
-                    drawLine(CameraColors.Accent.copy(alpha = .7f), Offset(0f, center.y), Offset(size.width, center.y), 1.dp.toPx())
-                    drawCircle(CameraColors.Accent, 3.5.dp.toPx(), Offset(0f, center.y))
-                }
-                Text("Play starts once all {count} previews are ready", arguments = mapOf("count" to count), color = Diagram.Hint,
-                    fontSize = 10.5.sp, lineHeight = 14.sp)
             }
         }
         }

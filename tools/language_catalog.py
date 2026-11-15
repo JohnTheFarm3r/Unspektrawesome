@@ -114,7 +114,7 @@ def visible(value, source, start, path):
         return False
     if prefix.rstrip().endswith('['):
         return False
-    if any(mark in value for mark in ['\\p{', '\\s', 'CREATE TABLE', 'SELECT ', 'INSERT ', 'ALTER TABLE', 'UPDATE ', 'DELETE FROM ', 'PRAGMA ']):
+    if any(mark in value for mark in ['\\p{', '\\s', 'CREATE TABLE', 'SELECT ', 'INSERT ', 'ALTER TABLE', 'UPDATE ', 'DELETE FROM ', 'PRAGMA ', ' LIKE ?']):
         return False
     if re.match(r'^(?:[a-z]+://|image/|application/|text/|DCIM/|android\.|com\.|VK_|std::)', value):
         return False
@@ -122,7 +122,7 @@ def visible(value, source, start, path):
         return False
     if re.match(r'^\{(?:packageName|value1)}(?:\.|:gallery|-gallery)', value) or value.startswith('Unspektrawesome/'):
         return False
-    if '\u0000' in value or re.fullmatch(r'[\w%{}./\\-]+\.(?:json|zip|dcp|jpg|png|dng|raw|rgba|spektra|bin|tmp|spv|vert|comp|xml|log|shot|backup|apk|\{extension})', value, re.I):
+    if '\u0000' in value or re.fullmatch(r'[\w%{}./\\-]+\.(?:json|zip|dcp|jpg|png|dng|raw|rgba|spektra|unspektra|bin|tmp|spv|vert|comp|xml|log|shot|backup|apk|\{extension})', value, re.I):
         return False
     if path.name == 'PanoramaPng.kt' and value in {'IHDR', 'IDAT', 'IEND', 'sRGB'}:
         return False
@@ -153,7 +153,7 @@ LOWERCASE_LABELS = {'lens', 'lenses', 'profile', 'profiles', 'stream', 'streams'
 OMIT_FILES = {'ImageDiagnostics.kt', 'DiagnosticReport.kt', 'RollingLogStore.kt', 'PublicDiagnosticLogs.kt',
               'CaptureIdentity.kt', 'CaptureMetadata.kt', 'VideoMetadata.kt', 'Mp4Metadata.kt', 'SpektraStateJson.kt', 'LensDiscoveryStore.kt',
               'EmbeddedSettings.kt', 'JpegProfilePayload.kt',
-              'TelemetryCamera.kt', 'TelemetryGeometry.kt', 'TelemetryCalibration.kt', 'TelemetryCameraCompatibility.kt', 'TelemetryRecorder.kt', 'TelemetryMp4.kt', 'PcmAudioTrack.kt', 'TelemetryPackets.kt', 'StabilizationCapture.java',
+              'TelemetryCamera.kt', 'TelemetryGeometry.kt', 'TelemetryCalibration.kt', 'TelemetryCameraCompatibility.kt', 'TelemetryRecorder.kt', 'TelemetryMp4.kt', 'PcmAudioTrack.kt', 'TelemetryPackets.kt', 'StabilizationCapture.java', 'FaceDetectionDebug.kt', 'IsoRangeDebug.kt',
               'LanguageResetActivity.kt', 'LanguageRecovery.kt', 'LanguageText.kt', 'BuiltInLanguage.kt'}
 
 

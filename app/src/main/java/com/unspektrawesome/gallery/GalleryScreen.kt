@@ -1,5 +1,6 @@
 package com.unspektrawesome.gallery
 
+import com.unspektrawesome.ui.camera.AppSizedWindow
 import com.unspektrawesome.language.AppLanguage
 import android.content.Intent
 import android.database.ContentObserver
@@ -240,9 +241,9 @@ internal fun GalleryScreen(showProcessing: Boolean = false) {
             GalleryNavigation(tab, pendingCount, { tab = it }, ::guideTarget)
         }
         if (showStorageAccess) Dialog(onDismissRequest = { showStorageAccess = false; revision++ },
-            properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)) {
+            properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)) { AppSizedWindow {
             com.unspektrawesome.ui.onboarding.StorageAccessOnboarding { showStorageAccess = false; revision++ }
-        }
+        }}
         val visibleGuide = guideStep.takeIf { galleryGuideSteps.getOrNull(it)?.let { guide -> guidePrepared && guide.tab == tab && !loading && store != null &&
             viewerUri == null && rawDetails == null && notice == null } == true }
         GuideTransition(visibleGuide) { displayedStep ->
@@ -493,7 +494,7 @@ private fun ProcessingStatusPanel(status: ProcessingStatus, thermal: GalleryTher
         if (status.running) PanelProgress(status.completed.toFloat() / status.total.coerceAtLeast(1), Modifier.padding(vertical = 6.dp))
         when {
             // A short window, such as landscape, drops the chart so the heat notice and its buttons stay in view.
-            heat -> if (androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp >= 480)
+            heat -> if (com.unspektrawesome.ui.camera.appScreenSize().height >= 480.dp)
                 HeatPauseChart(status.completed, status.total, status.pauseRequested, Modifier.padding(top = 4.dp))
             status.running -> {
                 if (strip) ProcessingBatchStrip(status.total, status.completed, current, thermal.pauseWhenHot, Modifier.padding(top = 4.dp))

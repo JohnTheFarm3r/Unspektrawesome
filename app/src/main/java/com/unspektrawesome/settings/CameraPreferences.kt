@@ -106,6 +106,7 @@ data class CameraPreferences(
     val performanceOverlay: Boolean = false,
     val recordingBufferMb: Int = 512,
     val videoAudioFormat: VideoAudioFormat = VideoAudioFormat.AAC,
+    val microphoneProcessing: MicrophoneProcessing = MicrophoneProcessing.CAMCORDER,
     /** What holding the shutter in video mode locks for the recording it starts. */
     val recordingLock: com.unspektrawesome.video.RecordingLock = com.unspektrawesome.video.RecordingLock(),
     val burstPreShutterSeconds: Int = 1,
@@ -124,6 +125,10 @@ data class CameraPreferences(
     val loupePeaking: Boolean = true,
     /** Where the photographer moved the loupe, or null to place it automatically. */
     val loupePlacement: LoupePlacement? = null,
+    /** Lets focus and exposure follow faces on cameras that report them. */
+    val faceTracking: Boolean = true,
+    val faceFocus: Boolean = true,
+    val faceExposure: Boolean = true,
     val processPhotosLater: Boolean = false,
     val saveOriginalDng: Boolean = true,
     val volumeButtonsEnabled: Boolean = true,
@@ -151,6 +156,10 @@ data class CameraPreferences(
 
     /** Lens profiles of [mode] in their saved order. */
     fun lensProfiles(mode: LensProfileMode): List<LensProfile> = lensProfiles.filter { it.mode == mode }
+
+    fun faceFocusActive(): Boolean = faceTracking && faceFocus
+
+    fun faceExposureActive(): Boolean = faceTracking && faceExposure
 
     /** Viewfinder peaking; the loupe replaces it when selected. */
     fun peakingStrengthFor(autoFocus: Boolean): FocusPeakingStrength? = when {
@@ -260,6 +269,7 @@ class CameraPreferencesStore(context: Context) {
             videoAudioFormat = VideoAudioFormat.entries.firstOrNull {
                 it.name == preferences.getString("video_audio_format", null)
             } ?: VideoAudioFormat.AAC,
+            microphoneProcessing = MicrophoneProcessing.fromName(preferences.getString("microphone_processing", null)),
             recordingLock = com.unspektrawesome.video.RecordingLock(
                 shutter = preferences.getBoolean("recording_lock_shutter", true),
                 iso = preferences.getBoolean("recording_lock_iso", true),
@@ -286,6 +296,9 @@ class CameraPreferencesStore(context: Context) {
                 .getOrDefault(LoupeZoom.DOUBLE),
             loupeManualFocus = preferences.getBoolean("loupe_manual_focus", true),
             loupeOnTap = preferences.getBoolean("loupe_on_tap", true),
+            faceTracking = preferences.getBoolean("face_tracking", true),
+            faceFocus = preferences.getBoolean("face_focus", true),
+            faceExposure = preferences.getBoolean("face_exposure", true),
             loupePeaking = preferences.getBoolean("loupe_peaking", true),
             loupePlacement = if (preferences.contains("loupe_x") && preferences.contains("loupe_y"))
                 LoupePlacement(preferences.getFloat("loupe_x", .5f), preferences.getFloat("loupe_y", .5f)).takeIf { it.valid }
@@ -358,6 +371,7 @@ class CameraPreferencesStore(context: Context) {
             .putBoolean("performance_overlay", value.performanceOverlay)
             .putInt("recording_buffer_mb", value.recordingBufferMb.coerceIn(512, 4096))
             .putString("video_audio_format", value.videoAudioFormat.name)
+            .putString("microphone_processing", value.microphoneProcessing.name)
             .putBoolean("recording_lock_shutter", value.recordingLock.shutter)
             .putBoolean("recording_lock_iso", value.recordingLock.iso)
             .putBoolean("recording_lock_focus", value.recordingLock.focus)
@@ -375,6 +389,9 @@ class CameraPreferencesStore(context: Context) {
             .putString("loupe_zoom", value.loupeZoom.name)
             .putBoolean("loupe_manual_focus", value.loupeManualFocus)
             .putBoolean("loupe_on_tap", value.loupeOnTap)
+            .putBoolean("face_tracking", value.faceTracking)
+            .putBoolean("face_focus", value.faceFocus)
+            .putBoolean("face_exposure", value.faceExposure)
             .putBoolean("loupe_peaking", value.loupePeaking)
             .also { editor ->
                 val placement = value.loupePlacement?.takeIf { it.valid }

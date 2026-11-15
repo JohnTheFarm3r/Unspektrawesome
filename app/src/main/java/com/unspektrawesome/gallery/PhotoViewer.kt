@@ -70,7 +70,6 @@ internal fun PhotoViewer(photos: List<GalleryPhoto>, initialUri: String, jobs: L
         { index -> currentPhotos.getOrNull(index)?.uri?.toString() ?: index }
     }
     val photo = currentPhotos.getOrNull(pager.currentPage)
-    var inlineVideo by rememberSaveable(initialUri) { mutableStateOf(photos.firstOrNull { it.uri.toString() == initialUri }?.isVideo == true) }
     var nestedUri by rememberSaveable(initialUri) { mutableStateOf<String?>(null) }
     var lastPageUri by rememberSaveable(initialUri) { mutableStateOf<String?>(null) }
     val settled = currentPhotos.getOrNull(pager.settledPage)
@@ -78,12 +77,10 @@ internal fun PhotoViewer(photos: List<GalleryPhoto>, initialUri: String, jobs: L
         if (!pager.isScrollInProgress && settled != null) selectedMediaUri = settled.uri.toString()
         if (!pager.isScrollInProgress && settled != null && lastPageUri != settled.uri.toString()) {
             lastPageUri = settled.uri.toString()
-            if (!settled.isVideo) inlineVideo = false
-            if (settled.isVideo && !inlineVideo) nestedUri = settled.uri.toString()
         }
     }
     val nestedMedia = currentPhotos.firstOrNull { it.uri.toString() == nestedUri }
-    val videoPage = photo?.isVideo == true && inlineVideo
+    val videoPage = photo?.isVideo == true
     val shot = jobs.firstOrNull { it.id == photo?.shotId }
     var info by rememberSaveable { mutableStateOf(false) }
     var moreVisible by remember { mutableStateOf(false) }
@@ -161,7 +158,7 @@ internal fun PhotoViewer(photos: List<GalleryPhoto>, initialUri: String, jobs: L
                             onVideoPositionChanged = { saveVideoPosition(pagePhoto.uri.toString(), it) },
                             videoInfoVisible = info || moreVisible, onVideoControlsHidden = { info = false },
                             onVideoControlsHeightChanged = { videoControlsHeight = it },
-                            videoHeader = videoHeader, videoActions = viewerActions, inlineVideo = inlineVideo,
+                            videoHeader = videoHeader, videoActions = viewerActions,
                             onOpenMedia = { nestedUri = pagePhoto.uri.toString() },
                             onZoomChanged = { zoomed = it }, onTap = {
                             controlsVisible = !controlsVisible
@@ -195,7 +192,7 @@ internal fun PhotoViewer(photos: List<GalleryPhoto>, initialUri: String, jobs: L
             } else {
                 val informationHeight = (maxHeight * .44f).coerceAtMost(360.dp)
                 Column(Modifier.fillMaxSize()) {
-                    if (!videoPage) Box(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp)) {
+                    Box(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp)) {
                         videoHeader { }
                     }
                     Box(Modifier.weight(1f).fillMaxWidth().clipToBounds()) {
@@ -206,7 +203,6 @@ internal fun PhotoViewer(photos: List<GalleryPhoto>, initialUri: String, jobs: L
                                 onVideoPositionChanged = { saveVideoPosition(pagePhoto.uri.toString(), it) },
                                 videoInfoVisible = info || moreVisible, onVideoControlsHidden = { info = false },
                                 onVideoControlsHeightChanged = { videoControlsHeight = it },
-                                videoHeader = videoHeader, videoActions = viewerActions, inlineVideo = inlineVideo,
                                 onOpenMedia = { nestedUri = pagePhoto.uri.toString() },
                                 onZoomChanged = { zoomed = it })
                         }
@@ -221,11 +217,9 @@ internal fun PhotoViewer(photos: List<GalleryPhoto>, initialUri: String, jobs: L
                                 videoPosition = videoPositions[it.uri.toString()] ?: 0, onClose = { info = false }) }
                         }
                     }
-                    if (photo != null && !videoPage) {
+                    if (photo != null) {
                         PhotoFilmstrip(photos, pager.currentPage) { index ->
-                            val target = currentPhotos.getOrNull(index)
-                            if (index == pager.currentPage && target?.isVideo == true) nestedUri = target.uri.toString()
-                            else if (index != pager.currentPage) scope.launch { pager.animateScrollToPage(index) }
+                            if (index != pager.currentPage) scope.launch { pager.animateScrollToPage(index) }
                         }
                         viewerActions { }
                     }
@@ -267,15 +261,11 @@ private fun ViewerMedia(photo: GalleryPhoto, active: Boolean,
     onVideoControlsHeightChanged: (Dp) -> Unit = {},
     videoHeader: (@Composable (() -> Unit) -> Unit)? = null,
     videoActions: (@Composable (() -> Unit) -> Unit)? = null,
-    inlineVideo: Boolean = true, onOpenMedia: () -> Unit = {}) {
-    if (photo.isBurst || photo.isVideo && !inlineVideo) Box(Modifier.fillMaxSize().testTag("Media cover"), contentAlignment = Alignment.Center) {
-        PhotoImage(photo.uri, null, Modifier.fillMaxSize(), imageKey = photo.generation, isVideo = photo.isVideo,
-            contentScale = if (photo.isBurst) ContentScale.Fit else ContentScale.Crop)
-        if (photo.isBurst) BurstCoverButton(active, onOpenMedia)
-        else GalleryIconButton("Play", Modifier.size(64.dp).background(Diagram.Glass, CircleShape)
-            .border(1.dp, Diagram.Border, CircleShape), onClick = onOpenMedia) {
-            GallerySymbolIcon(GallerySymbol.PLAY, CameraColors.Text, Modifier.size(24.dp))
-        }
+    onOpenMedia: () -> Unit = {}) {
+    // Videos play in place like photos, so swiping moves straight on to the next item.
+    if (photo.isBurst) Box(Modifier.fillMaxSize().testTag("Media cover"), contentAlignment = Alignment.Center) {
+        PhotoImage(photo.uri, null, Modifier.fillMaxSize(), imageKey = photo.generation, contentScale = ContentScale.Fit)
+        BurstCoverButton(active, onOpenMedia)
     }
     else if (photo.isVideo) GalleryVideo(photo, active, videoPosition, onVideoPositionChanged,
         keepControlsVisible = videoInfoVisible, onControlsHidden = onVideoControlsHidden,
@@ -313,14 +303,14 @@ private fun PhotoFilmstrip(photos: List<GalleryPhoto>, selected: Int, onSelect: 
         items(photos.size, key = { photos[it].uri.toString() }) { index ->
             val item = photos[index]
             val current = index == selected
-            Box(Modifier.size(44.dp).clip(Diagram.ControlShape).clickable(role = Role.Button) { onSelect(index) }
+            Box(Modifier.size(64.dp, 56.dp).clip(Diagram.ControlShape).clickable(role = Role.Button) { onSelect(index) }
                 .languageSemantics { contentDescription = item.name; this.selected = current }, contentAlignment = Alignment.Center) {
-                Box(Modifier.size(42.dp, 32.dp).then(if (current) Modifier.border(1.5.dp, CameraColors.Accent, RoundedCornerShape(3.dp))
-                    .padding(2.5.dp) else Modifier.padding(1.dp)).clip(RoundedCornerShape(2.dp)).background(CameraColors.MenuCard)
+                Box(Modifier.size(62.dp, 48.dp).then(if (current) Modifier.border(1.5.dp, CameraColors.Accent, RoundedCornerShape(4.dp))
+                    .padding(3.dp) else Modifier.padding(1.dp)).clip(RoundedCornerShape(3.dp)).background(CameraColors.MenuCard)
                     .graphicsLayer { alpha = if (current) 1f else .55f }, contentAlignment = Alignment.Center) {
                     PhotoImage(item.uri, null, Modifier.fillMaxSize(), imageKey = item.generation, isVideo = item.isVideo)
-                    if (item.isVideo) GalleryIcon(4, CameraColors.Text, Modifier.size(10.dp))
-                    if (item.isBurst) GallerySymbolIcon(GallerySymbol.STACK, CameraColors.Text, Modifier.size(12.dp))
+                    if (item.isVideo) GalleryIcon(4, CameraColors.Text, Modifier.size(13.dp))
+                    if (item.isBurst) GallerySymbolIcon(GallerySymbol.STACK, CameraColors.Text, Modifier.size(16.dp))
                 }
             }
         }

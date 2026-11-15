@@ -35,6 +35,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.*
+import kotlin.math.roundToInt
 import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -42,6 +43,7 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.isSpecified
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
@@ -87,8 +89,10 @@ internal fun DiagramPage(
     modifier: Modifier = Modifier,
     content: @Composable ColumnScope.() -> Unit,
 ) {
+    // Fling speed is measured on the turned page, so fast swipes keep going when the page is shown sideways.
+    val fling = rememberPanelFlingBehavior()
     Box(modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
-        Column(Modifier.widthIn(max = 640.dp).fillMaxWidth().verticalScroll(scroll)
+        Column(Modifier.widthIn(max = 640.dp).fillMaxWidth().trackPanelFling(fling).verticalScroll(scroll, flingBehavior = fling)
             .padding(horizontal = 12.dp).padding(top = 8.dp, bottom = 28.dp), content = content)
     }
 }
@@ -112,7 +116,7 @@ internal fun DiagramHeader(title: String, subtitle: String? = null, modifier: Mo
 @Composable
 internal fun DiagramSection(label: String, modifier: Modifier = Modifier, trailing: (@Composable () -> Unit)? = null) {
     val renderer = LocalAppLanguage.current.renderer
-    Row(modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 16.dp, bottom = 4.dp),
+    Row(modifier.then(settingsSearchTarget(label, heading = true)).fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 16.dp, bottom = 4.dp),
         verticalAlignment = Alignment.CenterVertically) {
         Text(renderer.text(label).uppercase(), translate = false, color = Diagram.Hint, fontSize = 10.sp,
             lineHeight = 14.sp, letterSpacing = 1.4.sp, fontWeight = FontWeight.Medium,
@@ -120,6 +124,9 @@ internal fun DiagramSection(label: String, modifier: Modifier = Modifier, traili
         trailing?.invoke()
     }
 }
+
+/** The tallest a drawing may be shown, so wide landscape pages do not enlarge it past the visible height. */
+internal val LocalDiagramMaxStageHeight = compositionLocalOf { Dp.Unspecified }
 
 /**
  * The dotted panel that holds a drawing. [content] is laid out on a fixed [Diagram.ArtboardWidth]
@@ -147,7 +154,9 @@ internal fun DiagramStage(height: Dp, modifier: Modifier = Modifier, description
             contentDescription = language.text(description)
         } else Modifier)) {
         // Always fit the width exactly, so drawings grow and shrink with screen size and display density.
+        val heightLimit = LocalDiagramMaxStageHeight.current
         val scale = (maxWidth / Diagram.ArtboardWidth).coerceAtMost(1.6f)
+            .let { if (heightLimit.isSpecified) it.coerceAtMost(heightLimit / height) else it }
         Box(Modifier.fillMaxWidth().height(height * scale), contentAlignment = Alignment.TopCenter) {
             val density = LocalDensity.current
             CompositionLocalProvider(LocalDensity provides Density(density.density, fontScale = 1f),
@@ -397,7 +406,7 @@ internal fun DiagramRow(
     onClickLabel: String? = null,
     trailing: (@Composable () -> Unit)? = null,
 ) {
-    Row(modifier.fillMaxWidth().heightIn(min = 48.dp)
+    Row(modifier.then(settingsSearchTarget(title, translateTitle)).fillMaxWidth().heightIn(min = 48.dp)
         .then(if (onClick != null) Modifier.clickable(enabled = enabled, role = Role.Button, onClickLabel = onClickLabel, onClick = onClick) else Modifier)
         .then(if (divider) Modifier.diagramHairline() else Modifier)
         .padding(horizontal = 4.dp, vertical = 7.dp).alpha(if (enabled) 1f else .45f),
@@ -448,7 +457,7 @@ internal fun DiagramSwitchRow(
     divider: Boolean = true,
     onChange: (Boolean) -> Unit,
 ) {
-    Row(modifier.fillMaxWidth().heightIn(min = 48.dp)
+    Row(modifier.then(settingsSearchTarget(title)).fillMaxWidth().heightIn(min = 48.dp)
         .toggleable(checked, enabled = enabled, role = Role.Switch, onValueChange = onChange)
         .languageSemantics(mergeDescendants = true) { language -> contentDescription = language.text(toggleLabel) }
         .then(if (divider) Modifier.diagramHairline() else Modifier)
@@ -476,7 +485,7 @@ internal fun DiagramRadioRow(
     trailing: (@Composable () -> Unit)? = null,
     onClick: () -> Unit,
 ) {
-    Row(modifier.fillMaxWidth().heightIn(min = 48.dp)
+    Row(modifier.then(settingsSearchTarget(title, translateTitle)).fillMaxWidth().heightIn(min = 48.dp)
         .selectable(selected, enabled = enabled, role = Role.RadioButton, onClick = onClick)
         .then(if (divider) Modifier.diagramHairline() else Modifier)
         .padding(horizontal = 4.dp, vertical = 10.dp).alpha(if (enabled) 1f else .45f),
@@ -666,7 +675,7 @@ internal fun DiagramDropdownField(
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val focus = androidx.compose.ui.platform.LocalFocusManager.current
-    Column(modifier.fillMaxWidth().diagramHairline().padding(horizontal = 4.dp, vertical = 6.dp)) {
+    Column(modifier.then(settingsSearchTarget(label)).fillMaxWidth().diagramHairline().padding(horizontal = 4.dp, vertical = 6.dp)) {
         Row(Modifier.fillMaxWidth().heightIn(min = 48.dp)
             .clickable(enabled = enabled, role = Role.Button) { focus.clearFocus(); onExpand() }
             .languageSemantics { language -> contentDescription = language.text(label)
@@ -745,24 +754,49 @@ internal fun DiagramMenu(expanded: Boolean, onDismiss: () -> Unit, modifier: Mod
     if (!expanded) return
     val density = LocalDensity.current
     val margin = with(density) { 8.dp.roundToPx() }
-    val maximumHeight = (androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp.dp - 96.dp).coerceIn(120.dp, 440.dp)
-    Popup(popupPositionProvider = remember(margin) { AnchoredMenuPosition(margin) }, onDismissRequest = onDismiss,
-        properties = PopupProperties(focusable = true)) {
-        Column(modifier.widthIn(min = minWidth, max = 320.dp).heightIn(max = maximumHeight).width(IntrinsicSize.Max)
-            .clip(Diagram.ControlShape).background(Diagram.MenuGlass)
-            .border(1.dp, Diagram.Border, Diagram.ControlShape)
-            .verticalScroll(rememberScrollState()).padding(vertical = 4.dp), content = content)
-    }
+    // The menu opens in its own upright window, so it turns itself to match a page turned for landscape.
+    val rotation = LocalCameraWindowRotation.current
+    val screen = appScreenSize()
+    val pageHeight = if (kotlin.math.abs(rotation) == 90f) screen.width else screen.height
+    val maximumHeight = (pageHeight - 96.dp).coerceIn(120.dp, 440.dp)
+    Popup(popupPositionProvider = remember(margin, rotation) { AnchoredMenuPosition(margin, rotation) }, onDismissRequest = onDismiss,
+        properties = PopupProperties(focusable = true)) { AppSizedWindow {
+        RotatingCameraPanel(rotation, maxWidth = 320.dp) {
+            Column(modifier.widthIn(min = minWidth, max = 320.dp).heightIn(max = maximumHeight).width(IntrinsicSize.Max)
+                .clip(Diagram.ControlShape).background(Diagram.MenuGlass)
+                .border(1.dp, Diagram.Border, Diagram.ControlShape)
+                .verticalScroll(rememberScrollState()).padding(vertical = 4.dp), content = content)
+        }
+    }}
 }
 
-private class AnchoredMenuPosition(private val margin: Int) : PopupPositionProvider {
+/** Opens below the anchor and lines up with its end, as seen on a page turned by [rotation] degrees. */
+private class AnchoredMenuPosition(private val margin: Int, private val rotation: Float) : PopupPositionProvider {
     override fun calculatePosition(anchorBounds: IntRect, windowSize: IntSize, layoutDirection: LayoutDirection,
         popupContentSize: IntSize): IntOffset {
-        val x = (anchorBounds.right - popupContentSize.width).coerceIn(margin, (windowSize.width - popupContentSize.width - margin).coerceAtLeast(margin))
-        val below = anchorBounds.bottom + margin / 2
-        val y = if (below + popupContentSize.height <= windowSize.height - margin) below
-            else (anchorBounds.top - popupContentSize.height - margin / 2).coerceAtLeast(margin)
-        return IntOffset(x, y)
+        val width = popupContentSize.width
+        val height = popupContentSize.height
+        fun clampX(x: Int) = x.coerceIn(margin, (windowSize.width - width - margin).coerceAtLeast(margin))
+        fun clampY(y: Int) = y.coerceIn(margin, (windowSize.height - height - margin).coerceAtLeast(margin))
+        val gap = margin / 2
+        return when (rotation) {
+            // Turned clockwise: the page's bottom faces the screen's left and its end faces the bottom.
+            90f -> {
+                val left = anchorBounds.left - width - gap
+                IntOffset(if (left >= margin) left else clampX(anchorBounds.right + gap), clampY(anchorBounds.bottom - height))
+            }
+            // Turned counterclockwise: the page's bottom faces the screen's right and its end faces the top.
+            -90f -> {
+                val right = anchorBounds.right + gap
+                IntOffset(if (right + width <= windowSize.width - margin) right else clampX(anchorBounds.left - width - gap),
+                    clampY(anchorBounds.top))
+            }
+            else -> {
+                val below = anchorBounds.bottom + gap
+                IntOffset(clampX(anchorBounds.right - width),
+                    if (below + height <= windowSize.height - margin) below else (anchorBounds.top - height - gap).coerceAtLeast(margin))
+            }
+        }
     }
 }
 
@@ -815,6 +849,7 @@ internal fun DiagramSliderRow(
     valueArguments: Map<String, Any?>? = null,
     translateEnds: Boolean = true,
     onReset: (() -> Unit)? = null,
+    stepLabels: List<String>? = null,
 ) {
     Column(modifier.fillMaxWidth().diagramHairline().padding(horizontal = 4.dp, vertical = 6.dp)) {
         Row(Modifier.fillMaxWidth().heightIn(min = 28.dp), verticalAlignment = Alignment.CenterVertically,
@@ -824,13 +859,40 @@ internal fun DiagramSliderRow(
             DiagramValue(valueText, arguments = valueArguments, translate = valueArguments != null)
         }
         CameraCompactSlider(value, onChange, enabled = true, valueRange = range, valueStep = step, thumbSize = 14.dp,
-            requireThumb = false, onReset = onReset, minimumHeight = 40.dp,
+            requireThumb = false, onReset = onReset, minimumHeight = 40.dp, stepMarks = stepLabels != null,
             modifier = Modifier.fillMaxWidth().languageSemantics { language -> contentDescription = language.text(description) })
+        stepLabels?.let { DiagramStepLabels(it, (value - range.start) / (range.endInclusive - range.start)) }
         if (startLabel != null || endLabel != null) Row(Modifier.fillMaxWidth()) {
             Text(startLabel ?: "", translate = translateEnds && startLabel != null, color = Diagram.Hint, fontSize = 10.5.sp,
                 lineHeight = 14.sp, modifier = Modifier.weight(1f))
             Text(endLabel ?: "", translate = translateEnds && endLabel != null, color = Diagram.Hint, fontSize = 10.5.sp,
                 lineHeight = 14.sp, textAlign = TextAlign.End, modifier = Modifier.weight(1f))
+        }
+    }
+}
+
+/** Labels centred under the step marks of a slider with a 14 dp thumb. The label of the selected step is lime. */
+@Composable
+private fun DiagramStepLabels(labels: List<String>, selected: Float) {
+    val last = (labels.size - 1).coerceAtLeast(1)
+    val selectedIndex = (selected * last).roundToInt()
+    androidx.compose.ui.layout.Layout(content = {
+        labels.forEachIndexed { index, label ->
+            Text(label, translate = false, color = if (index == selectedIndex) CameraColors.Accent else Diagram.Hint,
+                fontSize = 10.5.sp, lineHeight = 14.sp, maxLines = 1, modifier = Modifier.clearAndSetSemantics { })
+        }
+    }, modifier = Modifier.fillMaxWidth()) { measurables, constraints ->
+        val placeables = measurables.map { it.measure(constraints.copy(minWidth = 0)) }
+        val radius = 7.dp.toPx()
+        val track = (constraints.maxWidth - 2 * radius).coerceAtLeast(1f)
+        val rtl = layoutDirection == androidx.compose.ui.unit.LayoutDirection.Rtl
+        layout(constraints.maxWidth, placeables.maxOfOrNull { it.height } ?: 0) {
+            placeables.forEachIndexed { index, placeable ->
+                val fraction = index.toFloat() / last
+                val center = radius + track * if (rtl) 1f - fraction else fraction
+                val x = (center - placeable.width / 2f).roundToInt().coerceIn(0, (constraints.maxWidth - placeable.width).coerceAtLeast(0))
+                placeable.place(x, 0)
+            }
         }
     }
 }
@@ -883,6 +945,28 @@ internal fun DiagramTabs(labels: List<String>, selected: Int, modifier: Modifier
     }
 }
 
+/** The tabs of [DiagramTabs] as a vertical list beside the page, for landscape layouts. */
+@Composable
+internal fun DiagramSideTabs(labels: List<String>, selected: Int, modifier: Modifier = Modifier,
+    tabModifier: (Int) -> Modifier = { Modifier }, onSelect: (Int) -> Unit) {
+    val fling = rememberPanelFlingBehavior()
+    Column(modifier.fillMaxHeight().trackPanelFling(fling).verticalScroll(rememberScrollState(), flingBehavior = fling)
+        .selectableGroup().padding(vertical = 4.dp)
+        .drawBehind {
+            drawLine(Diagram.Hairline, Offset(size.width - .5.dp.toPx(), 0f), Offset(size.width - .5.dp.toPx(), size.height), 1.dp.toPx())
+        }) {
+        labels.forEachIndexed { index, label ->
+            val on = index == selected
+            Box(tabModifier(index).fillMaxWidth().heightIn(min = 44.dp).selectable(on, role = Role.Tab) { onSelect(index) }
+                .drawBehind { if (on) drawRect(CameraColors.Accent, size = androidx.compose.ui.geometry.Size(2.dp.toPx(), size.height)) }
+                .padding(start = 14.dp, end = 10.dp, top = 6.dp, bottom = 6.dp), contentAlignment = Alignment.CenterStart) {
+                Text(label, color = if (on) CameraColors.Accent else Diagram.Hint, fontSize = 13.sp, lineHeight = 18.sp,
+                    fontWeight = if (on) FontWeight.SemiBold else FontWeight.Medium)
+            }
+        }
+    }
+}
+
 /** Centred window over a dimmed page: title, body, a small drawing, buttons on the right. */
 @Composable
 internal fun DiagramDialog(
@@ -894,11 +978,11 @@ internal fun DiagramDialog(
     buttons: @Composable FlowRowScope.() -> Unit,
     content: @Composable ColumnScope.() -> Unit,
 ) {
-    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) { AppSizedWindow {
         Box(Modifier.fillMaxSize().padding(20.dp), contentAlignment = Alignment.Center) {
             DiagramWindow(modifier, title, eyebrow, titleArguments, buttons, content)
         }
-    }
+    }}
 }
 
 /** The window body of [DiagramDialog], for overlays that are not separate dialogs. */

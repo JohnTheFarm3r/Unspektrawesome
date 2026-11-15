@@ -24,7 +24,7 @@ internal fun AboutScreen(onCheckForUpdates: (() -> Unit)? = null) {
     val uriHandler = LocalUriHandler.current
     DiagramPage {
         DiagnosticLogStage()
-        Row(Modifier.fillMaxWidth().heightIn(min = 52.dp).diagramHairline().padding(horizontal = 4.dp, vertical = 6.dp),
+        Row(settingsSearchTarget("Check for updates").fillMaxWidth().heightIn(min = 52.dp).diagramHairline().padding(horizontal = 4.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
                 Text("Unspektrawesome", translate = false, color = CameraColors.Text, fontSize = 14.sp, lineHeight = 19.sp,
@@ -64,7 +64,7 @@ private fun AboutTextRow(number: Int, text: String) {
 
 @Composable
 private fun AboutLink(label: String, number: Int? = null, onClick: () -> Unit) {
-    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).diagramHairline()
+    Row(settingsSearchTarget(label).fillMaxWidth().heightIn(min = 48.dp).diagramHairline()
         .clickable(role = Role.Button, onClick = onClick).padding(horizontal = 4.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         if (number != null) DiagramNumber(number) else Spacer(Modifier.width(18.dp))

@@ -168,6 +168,7 @@ class VideoRecording(private val context: Context) : AutoCloseable {
     @SuppressLint("MissingPermission")
     fun prepare(encoding: VideoEncoding, bitrate: Int, rotation: Int, configuration: org.json.JSONObject = org.json.JSONObject(),
         audioFormat: com.unspektrawesome.settings.VideoAudioFormat = com.unspektrawesome.settings.VideoAudioFormat.AAC,
+        microphoneProcessing: com.unspektrawesome.settings.MicrophoneProcessing = com.unspektrawesome.settings.MicrophoneProcessing.CAMCORDER,
         onError: () -> Unit) {
         check(video == null && worker == null)
         this.onError = onError
@@ -178,7 +179,7 @@ class VideoRecording(private val context: Context) : AutoCloseable {
         encoderInputCapacity = null
         metadata = VideoMetadata(configuration.put("width", encoding.size.width).put("height", encoding.size.height)
             .put("frameRate", encoding.frameRate).put("bitrate", bitrate).put("rotation", rotation)
-            .put("audioFormat", audioFormat.name))
+            .put("audioFormat", audioFormat.name).put("microphoneProcessing", microphoneProcessing.name))
         try {
             val name = com.unspektrawesome.capture.PhotoFileNames.baseName(System.currentTimeMillis(), null) +
                 if (pcm) QUICKTIME_FILE_EXTENSION else VIDEO_FILE_EXTENSION
@@ -220,11 +221,20 @@ class VideoRecording(private val context: Context) : AutoCloseable {
             val minimumBuffer = AudioRecord.getMinBufferSize(AUDIO_SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT)
             check(minimumBuffer > 0)
-            microphone = AudioRecord.Builder().setAudioSource(MediaRecorder.AudioSource.CAMCORDER)
+            fun openMicrophone(source: Int) = AudioRecord.Builder().setAudioSource(source)
                 .setAudioFormat(AudioFormat.Builder().setSampleRate(AUDIO_SAMPLE_RATE)
                     .setChannelMask(AudioFormat.CHANNEL_IN_MONO).setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
                 .setBufferSizeInBytes(maxOf(minimumBuffer * 2, AUDIO_BUFFER_BYTES * 8)).build()
-            check(microphone!!.state == AudioRecord.STATE_INITIALIZED)
+            microphone = runCatching { openMicrophone(microphoneProcessing.source) }.getOrNull()
+                ?.takeIf { it.state == AudioRecord.STATE_INITIALIZED || run { it.release(); false } }
+            if (microphone == null && microphoneProcessing.source != MediaRecorder.AudioSource.CAMCORDER) {
+                // A preset the phone stopped accepting must not cost the recording; Camcorder is the app's default.
+                InternalLogRecorder.event("VideoRecording", "microphone_fallback requested=${microphoneProcessing.name}")
+                metadata = VideoMetadata(configuration.put("microphoneProcessing", com.unspektrawesome.settings.MicrophoneProcessing.CAMCORDER.name)
+                    .put("requestedMicrophoneProcessing", microphoneProcessing.name))
+                microphone = openMicrophone(MediaRecorder.AudioSource.CAMCORDER)
+            }
+            check(microphone?.state == AudioRecord.STATE_INITIALIZED)
         } catch (error: Throwable) {
             close()
             throw error

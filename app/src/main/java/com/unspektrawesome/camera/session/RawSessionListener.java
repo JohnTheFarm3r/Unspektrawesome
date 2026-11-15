@@ -10,4 +10,6 @@ public interface RawSessionListener {
     }
     default void onExposureStateChanged(long generation, Camera2RawSession.MeteringState state) { }
     default void onControlsChanged(Camera2RawSession.ControlState state) { }
+    /** The face that focus and exposure follow, as active-array fractions (left, top, right, bottom), or null. */
+    default void onTrackedFaceChanged(float[] face) { }
 }

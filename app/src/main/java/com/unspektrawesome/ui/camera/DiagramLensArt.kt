@@ -39,7 +39,7 @@ import kotlin.math.ln
 @Composable
 internal fun LensSectionHeading(number: Int, title: String, modifier: Modifier = Modifier, tag: String? = null) {
     val renderer = LocalAppLanguage.current.renderer
-    Row(modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 16.dp, bottom = 4.dp)
+    Row(modifier.then(settingsSearchTarget(title, heading = true)).fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 16.dp, bottom = 4.dp)
         .semantics(mergeDescendants = true) { heading() },
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
         StageNumber(number)

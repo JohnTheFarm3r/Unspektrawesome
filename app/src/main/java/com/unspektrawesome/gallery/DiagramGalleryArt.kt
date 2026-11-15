@@ -84,7 +84,7 @@ internal fun DiagramArtboard(height: Dp, modifier: Modifier = Modifier, width: D
     content: @Composable BoxScope.() -> Unit) {
     // A wide but short window, such as landscape, would otherwise scale the drawing past the screen height
     // and push the panel's text and buttons out of view.
-    val screenHeight = androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp.dp
+    val screenHeight = com.unspektrawesome.ui.camera.appScreenSize().height
     BoxWithConstraints(modifier.fillMaxWidth()) {
         val scale = minOf(maxWidth / width, screenHeight * .35f / height).coerceIn(.75f, 1.6f)
         Box(Modifier.fillMaxWidth().height(height * scale), contentAlignment = Alignment.TopCenter) {

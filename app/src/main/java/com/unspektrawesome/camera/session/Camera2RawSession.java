@@ -14,6 +14,7 @@ import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.CaptureResult;
 import android.hardware.camera2.TotalCaptureResult;
 import android.hardware.camera2.params.ColorSpaceTransform;
+import android.hardware.camera2.params.Face;
 import android.hardware.camera2.params.OutputConfiguration;
 import android.hardware.camera2.params.TonemapCurve;
 import android.hardware.camera2.params.LensShadingMap;
@@ -126,6 +127,8 @@ public final class Camera2RawSession implements AutoCloseable {
         public final boolean manualExposureSupported;
         public final int isoMin;
         public final int isoMax;
+        /** Upper end of the advertised range; {@link #isoMax} can be higher once tested. */
+        public final int isoReportedMax;
         public final long exposureTimeMinNs;
         public final long exposureTimeMaxNs;
         public final boolean autoExposure;
@@ -156,8 +159,9 @@ public final class Camera2RawSession implements AutoCloseable {
                      Integer whiteBalanceTemperatureKelvin,
                      Float whiteBalanceRedGain, Float whiteBalanceGreenGain,
                      Float whiteBalanceBlueGain, boolean flashAvailable, FlashMode flashMode,
-                     boolean externalAutoExposure) {
+                     boolean externalAutoExposure, int isoReportedMax) {
             this.externalAutoExposure = externalAutoExposure;
+            this.isoReportedMax = isoReportedMax;
             this.flashAvailable = flashAvailable;
             this.flashMode = flashMode;
             this.exposureCompensationMin = exposureCompensationMin;
@@ -363,6 +367,9 @@ public final class Camera2RawSession implements AutoCloseable {
     private boolean exposurePointSet;
     private float exposurePointX;
     private float exposurePointY;
+    private boolean faceFocusEnabled;
+    private boolean faceExposureEnabled;
+    private final FaceTracker faceTracker = new FaceTracker();
     private long exposureRequestGeneration;
     private MeteringState exposureReportedState;
     private boolean aeLockAvailable;
@@ -375,6 +382,8 @@ public final class Camera2RawSession implements AutoCloseable {
     private boolean manualExposureSupported;
     private int isoMin = 100;
     private int isoMax = 100;
+    private int isoReportedMax = 100;
+    private IsoCeilingSource isoCeilingSource;
     private long exposureTimeMinNs = 1_000_000L;
     private long exposureTimeMaxNs = 10_000_000L;
     private long maximumFrameDurationNs = 1_000_000_000L;
@@ -482,6 +491,28 @@ public final class Camera2RawSession implements AutoCloseable {
         this.exposureCompensation = initialExposureCompensation;
     }
 
+    /** Supplies a tested ISO ceiling above the advertised range for a camera route. */
+    public interface IsoCeilingSource {
+        int isoCeiling(CameraRoute route, int reportedMax);
+    }
+
+    public synchronized void setIsoCeilingSource(IsoCeilingSource source) {
+        if (state != State.IDLE) throw new IllegalStateException("Camera has already started");
+        isoCeilingSource = source;
+    }
+
+    /** Raises or restores the usable ISO ceiling; it never drops below the advertised maximum. */
+    public synchronized boolean setIsoCeiling(int ceiling) {
+        Handler handler = cameraHandler;
+        return handler != null && handler.post(() -> {
+            int next = Math.max(isoReportedMax, ceiling);
+            if (next == isoMax) return;
+            isoMax = next;
+            iso = clamp(iso, isoMin, isoMax);
+            notifyControlsChanged(true);
+        });
+    }
+
     public State state() { return state; }
     public long droppedPendingFrames() { return pendingImage.dropped(); }
     public long metadataEvictions() { return metadata.evictions(); }
@@ -516,6 +547,23 @@ public final class Camera2RawSession implements AutoCloseable {
         return handler != null && handler.post(() -> {
             flashMode = mode;
             applyControlUpdate();
+        });
+    }
+
+    /** Lets focus and the camera's own exposure follow faces on cameras that report them. */
+    public synchronized boolean setFaceTracking(boolean focus, boolean exposure) {
+        if (state == State.IDLE) {
+            faceFocusEnabled = focus;
+            faceExposureEnabled = exposure;
+            return true;
+        }
+        Handler handler = cameraHandler;
+        return handler != null && handler.post(() -> {
+            if (faceFocusEnabled == focus && faceExposureEnabled == exposure) return;
+            faceFocusEnabled = focus;
+            faceExposureEnabled = exposure;
+            if (!focus && !exposure && faceTracker.reset()) notifyTrackedFace(null);
+            applyControlUpdate(false);
         });
     }
 
@@ -1969,6 +2017,7 @@ public final class Camera2RawSession implements AutoCloseable {
                                                TotalCaptureResult result) {
                     if (!acceptsPreviewFrames() || !isCurrentRequest(request)) return;
                     recordingFrameStarted(request);
+                    if (faceFocusEnabled || faceExposureEnabled || FaceDetectionDebug.getEnabled()) trackFaces(result);
                     updateMeteringState(request, result);
                     updateAutoControlValues(
                             sensorCaptureResult(result, physicalCameraId), result);
@@ -2567,7 +2616,14 @@ public final class Camera2RawSession implements AutoCloseable {
         if (externalAutoExposure) autoExposure = false;
         if (sensitivity != null) {
             isoMin = sensitivity.getLower();
-            isoMax = sensitivity.getUpper();
+            isoReportedMax = Math.max(isoMin, IsoRangeDebug.advertisedMax(sensitivity.getUpper()));
+            isoMax = isoReportedMax;
+            IsoCeilingSource source = isoCeilingSource;
+            if (source != null) {
+                try {
+                    isoMax = Math.max(isoReportedMax, source.isoCeiling(route, isoReportedMax));
+                } catch (RuntimeException ignored) { }
+            }
         }
         if (exposureLimits != null) {
             exposureTimeMinNs = exposureLimits.minimumNs;
@@ -2611,7 +2667,7 @@ public final class Camera2RawSession implements AutoCloseable {
     private void restoreInitialControls() {
         if (externalAutoExposure && initialAutoExposure != null) {
             ExposureBounds bounds = initialAeLimits.resolve(
-                    new ExposureBounds(isoMin, isoMax, exposureTimeMinNs, exposureTimeMaxNs));
+                    new ExposureBounds(isoMin, isoMax, exposureTimeMinNs, exposureTimeMaxNs, isoReportedMax));
             SensorExposure exposure = bounds.clamp(initialAutoExposure);
             iso = exposure.getIso();
             exposureTimeNs = exposure.getTimeNs();
@@ -2724,6 +2780,109 @@ public final class Camera2RawSession implements AutoCloseable {
             request.set(CaptureRequest.SENSOR_PIXEL_MODE,
                     CaptureRequest.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION);
         }
+        int faceMode = faceDetectionMode();
+        Integer currentFaceMode = request.get(CaptureRequest.STATISTICS_FACE_DETECT_MODE);
+        if (faceMode != CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF ||
+                currentFaceMode != null && currentFaceMode != CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF) {
+            request.set(CaptureRequest.STATISTICS_FACE_DETECT_MODE, faceMode);
+        }
+    }
+
+    /** Basic detection is enough for focus and exposure; debug builds can request the most detailed mode. */
+    private int faceDetectionMode() {
+        boolean debug = FaceDetectionDebug.getEnabled();
+        if (route == null || !debug && !faceFocusEnabled && !faceExposureEnabled) {
+            return CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF;
+        }
+        int[] modes = characteristic(characteristics(route.openCameraId),
+                CameraCharacteristics.STATISTICS_INFO_AVAILABLE_FACE_DETECT_MODES, null);
+        if (modes == null) return CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF;
+        if (debug) {
+            int best = CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF;
+            for (int mode : modes) best = Math.max(best, mode);
+            return best;
+        }
+        if (supportsMode(modes, CameraMetadata.STATISTICS_FACE_DETECT_MODE_SIMPLE)) {
+            return CameraMetadata.STATISTICS_FACE_DETECT_MODE_SIMPLE;
+        }
+        return supportsMode(modes, CameraMetadata.STATISTICS_FACE_DETECT_MODE_FULL)
+                ? CameraMetadata.STATISTICS_FACE_DETECT_MODE_FULL : CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF;
+    }
+
+    private void trackFaces(TotalCaptureResult result) {
+        CaptureResult source = sensorCaptureResult(result, physicalCameraId);
+        String arrayCameraId = route.characteristicsCameraId;
+        Face[] faces = source.get(CaptureResult.STATISTICS_FACES);
+        if ((faces == null || faces.length == 0) && source != result) {
+            Face[] logical = result.get(CaptureResult.STATISTICS_FACES);
+            if (logical != null && (faces == null || logical.length > 0)) {
+                faces = logical;
+                source = result;
+                arrayCameraId = route.openCameraId;
+            }
+        }
+        Rect activeArray = characteristic(characteristics(arrayCameraId),
+                CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE, null);
+        if (FaceDetectionDebug.getEnabled()) {
+            Integer mode = source.get(CaptureResult.STATISTICS_FACE_DETECT_MODE);
+            if (mode == null) mode = result.get(CaptureResult.STATISTICS_FACE_DETECT_MODE);
+            FaceDetectionDebug.publish(mode == null ? 0 : mode, faces, activeArray);
+        }
+        if (!faceFocusEnabled && !faceExposureEnabled) return;
+        long nowNs = SystemClock.elapsedRealtimeNanos();
+        int changes = faceTracker.update(FaceTracker.normalize(faces, activeArray), nowNs);
+        if (com.unspektrawesome.BuildConfig.DEBUG) recordFaceTiming(result, faces, changes, nowNs);
+        if ((changes & FaceTracker.FACE_CHANGED) != 0) notifyTrackedFace(faceTracker.getFace());
+        // Recording and long exposures pick up the new region with their next request.
+        if ((changes & FaceTracker.REGION_CHANGED) != 0 && !recordingRequests.active() && !usesLongPreview()) {
+            applyControlUpdate(false);
+        }
+    }
+
+    private long faceTimingStartNs;
+    private int faceTimingFrames;
+    private int faceTimingWithFaces;
+    private int faceTimingMoves;
+    private long faceTimingDelayNs;
+
+    /** Debug builds: logs how often faces arrive and move, and how old each result is. */
+    private void recordFaceTiming(TotalCaptureResult result, Face[] faces, int changes, long nowNs) {
+        if (faceTimingStartNs == 0L) faceTimingStartNs = nowNs;
+        faceTimingFrames++;
+        if (faces != null && faces.length > 0) faceTimingWithFaces++;
+        if ((changes & FaceTracker.FACE_CHANGED) != 0) faceTimingMoves++;
+        Long sensorNs = result.get(CaptureResult.SENSOR_TIMESTAMP);
+        if (sensorNs != null) faceTimingDelayNs += nowNs - sensorNs;
+        long elapsedNs = nowNs - faceTimingStartNs;
+        if (elapsedNs < 2_000_000_000L) return;
+        double seconds = elapsedNs / 1e9;
+        Log.d("FaceTiming", String.format(java.util.Locale.US,
+                "results=%.1f/s with_faces=%.1f/s box_moves=%.1f/s result_age_ms=%.1f",
+                faceTimingFrames / seconds, faceTimingWithFaces / seconds, faceTimingMoves / seconds,
+                faceTimingDelayNs / 1e6 / faceTimingFrames));
+        faceTimingStartNs = nowNs;
+        faceTimingFrames = 0;
+        faceTimingWithFaces = 0;
+        faceTimingMoves = 0;
+        faceTimingDelayNs = 0L;
+    }
+
+    private void notifyTrackedFace(float[] face) {
+        RawSessionListener current = listener;
+        if (current == null) return;
+        try { current.onTrackedFaceChanged(face == null ? null : face.clone()); }
+        catch (RuntimeException ignored) { }
+    }
+
+    private MeteringRectangle faceMeteringRectangle() {
+        float[] face = faceTracker.getRegion();
+        if (face == null) return null;
+        Rect active = activeArrayForOutput();
+        int left = clamp(active.left + Math.round(face[0] * active.width()), active.left, active.right - 1);
+        int top = clamp(active.top + Math.round(face[1] * active.height()), active.top, active.bottom - 1);
+        int right = clamp(active.left + Math.round(face[2] * active.width()), left + 1, active.right);
+        int bottom = clamp(active.top + Math.round(face[3] * active.height()), top + 1, active.bottom);
+        return new MeteringRectangle(new Rect(left, top, right, bottom), MeteringRectangle.METERING_WEIGHT_MAX);
     }
 
     /** Keep the ISP viewfinder stream close to the sensor: known tone curve, no sharpening, manual color when selected. */
@@ -2795,6 +2954,8 @@ public final class Camera2RawSession implements AutoCloseable {
     private void applyMeteringControls(CaptureRequest.Builder request) {
         MeteringRectangle region = exposurePointSet
                 ? meteringRectangle(exposurePointX, exposurePointY) : null;
+        // A tapped exposure point wins over a face until it is cleared.
+        if (region == null && faceExposureEnabled) region = faceMeteringRectangle();
         request.set(CaptureRequest.CONTROL_AE_REGIONS, region != null && tapAutoExposureEnabled()
                 ? new MeteringRectangle[]{region} : defaultMeteringRegions(maxAeRegions));
         if (!autoFocus) {
@@ -2810,7 +2971,11 @@ public final class Camera2RawSession implements AutoCloseable {
                     : autofocus ? CameraMetadata.CONTROL_AF_MODE_AUTO
                     : CameraMetadata.CONTROL_AF_MODE_OFF;
             request.set(CaptureRequest.CONTROL_AF_MODE, mode);
-            request.set(CaptureRequest.CONTROL_AF_REGIONS, defaultMeteringRegions(maxAfRegions));
+            // Continuous focus follows a face; a tapped focus point wins until it is reset.
+            MeteringRectangle face = faceFocusEnabled && maxAfRegions > 0
+                    && mode == CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE ? faceMeteringRectangle() : null;
+            request.set(CaptureRequest.CONTROL_AF_REGIONS, face != null
+                    ? new MeteringRectangle[]{face} : defaultMeteringRegions(maxAfRegions));
             return;
         }
         if (autofocus) {
@@ -3105,7 +3270,7 @@ public final class Camera2RawSession implements AutoCloseable {
                     autoFocus, focusDistance, manualWhiteBalanceSupported,
                     autoWhiteBalance, whiteBalanceTemperatureKelvin,
                     whiteBalanceRedGain, whiteBalanceGreenGain, whiteBalanceBlueGain, flashAvailable, flashMode,
-                    externalAutoExposure));
+                    externalAutoExposure, isoReportedMax));
         } catch (RuntimeException ignored) { }
     }
 
