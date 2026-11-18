@@ -361,7 +361,7 @@ private fun CameraAdjustmentRail(
 }
 
 @Composable
-internal fun CaptureActions(viewfinderSpektraEnabled: Boolean, busy: Boolean, lastPhoto: Uri?, onGallery: () -> Unit, onViewfinderSpektra: () -> Unit, onShutter: () -> Unit, onFlip: () -> Unit, canFlip: Boolean, onSettings: () -> Unit, modifier: Modifier = Modifier, vertical: Boolean = false,
+internal fun CaptureActions(viewfinderSpektraEnabled: Boolean, busy: Boolean, lastPhoto: Uri?, onGallery: () -> Unit, onViewfinderSpektra: () -> Unit, onShutter: () -> Unit, onFlip: () -> Unit, canFlip: Boolean, onSettings: () -> Unit, modifier: Modifier = Modifier, layout: CaptureActionsLayout = CaptureActionsLayout.ROW,
     shutterPulse: () -> Float = { 0f },
     exposureTimeNs: Long = 0L,
     exposureStartedAtMs: Long? = null,
@@ -398,7 +398,7 @@ internal fun CaptureActions(viewfinderSpektraEnabled: Boolean, busy: Boolean, la
         } }
     }
     BoxWithConstraints(modifier.fillMaxWidth()) {
-        val shutterSize = if (vertical) 76.dp else (maxWidth / 5).coerceIn(58.dp, 80.dp)
+        val shutterSize = if (layout == CaptureActionsLayout.SHUTTER_SIDE) 84.dp else (maxWidth / 5).coerceIn(58.dp, 80.dp)
         val smallActionSize = minOf((48f + (actionFontScale - 1f) * 16f).dp, ((maxWidth - 16.dp) / 5 - 4.dp).coerceAtLeast(48.dp))
         val gallery: @Composable () -> Unit = {
             GalleryThumbnailButton(onGallery, onGalleryHold, Modifier.size(48.dp)
@@ -425,7 +425,7 @@ internal fun CaptureActions(viewfinderSpektraEnabled: Boolean, busy: Boolean, la
             }
         }
         val viewfinderToggle: @Composable () -> Unit = {
-            val toggleWidth = (if (vertical) maxWidth - 16.dp else (maxWidth - 16.dp) / 5 - 4.dp)
+            val toggleWidth = (if (layout == CaptureActionsLayout.LENS_SIDE) (maxWidth - 16.dp) / 2 - 4.dp else (maxWidth - 16.dp) / 5 - 4.dp)
                 .coerceAtMost(if (actionFontScale > 1.3f) 84.dp else 64.dp).coerceAtLeast(smallActionSize)
             val density = LocalDensity.current
             val measurer = rememberTextMeasurer()
@@ -540,11 +540,16 @@ internal fun CaptureActions(viewfinderSpektraEnabled: Boolean, busy: Boolean, la
         }
         val settings: @Composable () -> Unit = { CameraRoundAction("Camera settings", CameraGlyph.Settings, onSettings,
             Modifier.onGloballyPositioned { onGuideTarget("settings", it.boundsInRoot()) }) }
-        if (vertical) {
-            Column(Modifier.fillMaxSize().padding(vertical = 12.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.SpaceEvenly) {
-                gallery(); viewfinderToggle(); shutter(); flip(); settings()
+        when (layout) {
+            CaptureActionsLayout.SHUTTER_SIDE -> Column(Modifier.fillMaxSize().padding(vertical = 12.dp),
+                horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.SpaceEvenly) {
+                flip(); shutter(); gallery()
             }
-        } else {
+            CaptureActionsLayout.LENS_SIDE -> Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+                horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
+                viewfinderToggle(); settings()
+            }
+            CaptureActionsLayout.ROW -> {
             Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.weight(1f), contentAlignment = Alignment.Center) { gallery() }
                 Box(Modifier.weight(1f).offset(x = (48.dp - shutterSize) / 4), contentAlignment = Alignment.Center) { viewfinderToggle() }
@@ -554,6 +559,16 @@ internal fun CaptureActions(viewfinderSpektraEnabled: Boolean, busy: Boolean, la
                 Box(Modifier.weight(1f), contentAlignment = Alignment.Center) { flip() }
                 Box(Modifier.weight(1f), contentAlignment = Alignment.Center) { settings() }
             }
+            }
         }
     }
+}
+
+/** How the shutter row is arranged: one row on phones, or split between both hands on large screens. */
+internal enum class CaptureActionsLayout {
+    ROW,
+    // Switch camera, shutter and gallery under the right thumb.
+    SHUTTER_SIDE,
+    // Viewfinder look and settings under the left thumb, below the lens buttons.
+    LENS_SIDE,
 }

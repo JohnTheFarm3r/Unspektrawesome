@@ -41,7 +41,7 @@ data class LensCaptureSettings(
 
     companion object {
         const val MERGE_FRAMES_MIN = 2
-        const val MERGE_FRAMES_MAX = 15
+        const val MERGE_FRAMES_MAX = 30
         const val MERGE_FRAMES_DEFAULT = 8
         const val MERGE_MOTION_DEFAULT = 0.5f
 

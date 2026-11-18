@@ -592,8 +592,11 @@ internal fun LensSwitcherStage(profiles: List<LensSwitcherEntry>) {
                         cornerRadius = CornerRadius(11.dp.toPx()), style = Stroke(1.dp.toPx(),
                             pathEffect = if (off) PathEffect.dashPathEffect(floatArrayOf(3.dp.toPx(), 2.dp.toPx())) else null))
                 }, contentAlignment = Alignment.Center) {
+                // Long custom labels shrink to fit the chip.
+                val labelSize = minOf(8.5f, (chip - 6f) / (.62f * entry.label.length.coerceAtLeast(1)))
                 Text(entry.label, translate = false, color = when { entry.current -> CameraColors.Accent; off -> Color(0xFF8C8C8C)
-                    else -> Diagram.Ink }, fontSize = 8.5.sp, lineHeight = 10.sp, fontFamily = Diagram.Mono, maxLines = 1,
+                    else -> Diagram.Ink }, fontSize = labelSize.sp, lineHeight = 10.sp, fontFamily = Diagram.Mono, maxLines = 1,
+                    softWrap = false, overflow = TextOverflow.Ellipsis,
                     textDecoration = if (!entry.enabled) androidx.compose.ui.text.style.TextDecoration.LineThrough else null)
             }
         }

@@ -326,6 +326,8 @@ class RawVulkanPreviewController(
     private var attachedSurfaceWidth = 0
     private var attachedSurfaceHeight = 0
     private var deviceOrientationDegrees = 0
+    // Clockwise rotation the system draws the viewfinder window at.
+    private var windowRotationDegrees = 0
     private var resumed = false
     private var closed = false
     private var blockedConfiguration: ConfigurationKey? = null
@@ -580,7 +582,7 @@ class RawVulkanPreviewController(
             val frameRate = delivered / capture.frameInterval
             state = state.copy(frameRate = frameRate)
             val output = configuredPreferences.rawLayoutOverride().output(plan.acquisitionOutput)
-            val transform = CaptureGeometry.transform(camera.sensorMetadata.orientationDegrees, 0, camera.facing)
+            val transform = CaptureGeometry.transform(camera.sensorMetadata.orientationDegrees, windowRotationDegrees, camera.facing)
             val native = checkNotNull(VideoFraming.source(camera.sensorMetadata, output, transform, PhotoCrop(),
                 edges = configuredPreferences.rawEdgeCrop()))
             val usable = com.unspektrawesome.camera.Size2d(native.cropPixels.width, native.cropPixels.height)
@@ -628,7 +630,9 @@ class RawVulkanPreviewController(
         if (!VideoFraming.fits(retained, encoding.size)) return@synchronized
         val recorded = VideoFraming.recording(retained, encoding.size, state.downscale)
         val portrait = recorded.cropAspect < 1f
-        val rotation = ((if (portrait) 90 else 0) + deviceOrientationDegrees) % 360
+        // Recorded frames are drawn upright for the window, so the device's turn is measured against it.
+        val rotation = ((if (portrait) 90 else 0) +
+            CameraOrientation.relativeToWindow(deviceOrientationDegrees, windowRotationDegrees)) % 360
         recordingGeometry = recorded
         recordingCrop = videoGeometry.crop
         if (lockControls) lockVideoControlsLocked(owner)
@@ -987,7 +991,7 @@ class RawVulkanPreviewController(
             if (closed || !resumed || !surfaceReady || request == null || owner == null || request.owner !== owner || target == null) null
             else {
                 val previewTransform = CaptureGeometry.transform(owner.camera.sensorMetadata.orientationDegrees,
-                    LOCKED_VIEWFINDER_ROTATION_DEGREES, owner.camera.facing)
+                    windowRotationDegrees, owner.camera.facing)
                 target to com.unspektrawesome.panorama.panoramaPreviewRotation(previewTransform, request.geometry.transform)
             }
         }
@@ -1721,7 +1725,9 @@ class RawVulkanPreviewController(
                 check(it.capacity() == outputBytes) { "RAW frame size changed during capture" }
             } ?: directBuffer(outputBytes)
             target.clear()
-            val effective = runCatching { mergeFrames(prepared, frames, request.merge.mergeMotion, target) }
+            val whites = FloatArray(4) { prepared.raw.getFloat(RawShaderParameters.WHITE_LEVEL_OFFSET + it * 4) }
+            val outputScale = com.unspektrawesome.burst.MultiFrameMerge.outputScale(whites.max())
+            val effective = runCatching { mergeFrames(prepared, frames, request.merge.mergeMotion, outputScale, target) }
                 .onFailure { InternalLogRecorder.error("MultiFrame", "merge_failed capturedAt=${request.capturedAtMillis}", it) }
                 .getOrDefault(0f)
             val merged = effective > 0f
@@ -1731,6 +1737,12 @@ class RawVulkanPreviewController(
             if (merged) {
                 capture.raw.putInt(RawShaderParameters.LAYOUT_INFO_OFFSET, width * 2)
                 capture.raw.putInt(RawShaderParameters.LAYOUT_INFO_OFFSET + 4, com.unspektrawesome.camera.RawFormat.RAW_SENSOR.ordinal)
+                // The merged frame is stored at a finer scale than the sensor, so its levels scale with it.
+                for (channel in 0 until 4) {
+                    val black = RawShaderParameters.BLACK_LEVEL_OFFSET + channel * 4
+                    capture.raw.putFloat(black, capture.raw.getFloat(black) * outputScale)
+                    capture.raw.putFloat(RawShaderParameters.WHITE_LEVEL_OFFSET + channel * 4, whites[channel] * outputScale)
+                }
                 // Averaging frames lowers the noise the chroma denoise should expect.
                 val color = capture.color
                 color.putFloat(RawColorShaderParameters.NOISE_PROFILE_S_OFFSET,
@@ -1784,7 +1796,8 @@ class RawVulkanPreviewController(
         }
     }
 
-    private fun mergeFrames(capture: PersistedCapture, frames: List<MultiFrameRing.Frame>, motion: Float, target: ByteBuffer): Float {
+    private fun mergeFrames(capture: PersistedCapture, frames: List<MultiFrameRing.Frame>, motion: Float,
+        outputScale: Int, target: ByteBuffer): Float {
         val raw = capture.raw
         val reference = frames[0]
         val candidates = frames.map { it.candidate() }
@@ -1800,7 +1813,7 @@ class RawVulkanPreviewController(
             raw.getInt(RawShaderParameters.REMOSAIC_OFFSET + 8), raw.getInt(RawShaderParameters.REMOSAIC_OFFSET + 12),
             black, raw.getFloat(RawShaderParameters.WHITE_LEVEL_OFFSET),
             noise[0], noise[1],
-            motion, target)
+            motion, outputScale.toFloat(), target)
     }
 
     private fun captureReadyLocked(owner: ActiveSession? = active): Boolean =
@@ -2132,6 +2145,18 @@ class RawVulkanPreviewController(
         configureGridPreviewLocked()
     }
 
+    fun updateWindowRotation(degrees: Int) { commands.submit { updateWindowRotationOnWorker(degrees) } }
+
+    private fun updateWindowRotationOnWorker(degrees: Int) = synchronized(lock) {
+        require(degrees == 0 || degrees == 90 || degrees == 180 || degrees == 270) {
+            "Display rotation must be 0, 90, 180, or 270 degrees"
+        }
+        if (degrees == windowRotationDegrees) return@synchronized
+        windowRotationDegrees = degrees
+        cropTransition.reset()
+        if (!mutableVideoState.value.busy) updateVideoOutputLocked()
+    }
+
     fun detachSurface(surface: Surface? = null) { commands.submit { detachSurfaceOnWorker(surface) } }
 
     private fun detachSurfaceOnWorker(surface: Surface?) = synchronized(lock) {
@@ -2161,6 +2186,7 @@ class RawVulkanPreviewController(
         lastCameraFrameAtMs = SystemClock.elapsedRealtime()
         lastRenderCompletedAtMs = lastCameraFrameAtMs
         diagnosticTask?.cancel(false)
+        var heartbeatChecks = 0
         diagnosticTask = diagnosticWorker.scheduleWithFixedDelay({
             val current = mutableStatus.value
             if (current.phase in setOf(RawPreviewPhase.PAUSED, RawPreviewPhase.CLOSED, RawPreviewPhase.IDLE))
@@ -2173,7 +2199,8 @@ class RawVulkanPreviewController(
                 "message=${current.message} diagnostic=${current.rendererDiagnostic}"
             if (now - lastRenderCompletedAtMs >= 10_000 && !mutableCaptureStatus.value.acquiringFrame)
                 InternalLogRecorder.warning("PreviewWatchdog", detail)
-            else InternalLogRecorder.event("PreviewHeartbeat", detail)
+            // The watchdog checks every 10 seconds; the routine heartbeat is written every 30.
+            else if (heartbeatChecks++ % 3 == 0) InternalLogRecorder.event("PreviewHeartbeat", detail)
         }, 10, 10, java.util.concurrent.TimeUnit.SECONDS)
         resumed = true
         panoramaRecorder.setForeground(true)
@@ -3354,7 +3381,7 @@ class RawVulkanPreviewController(
                             output,
                             CaptureGeometry.transform(
                                 owner.camera.sensorMetadata.orientationDegrees,
-                                LOCKED_VIEWFINDER_ROTATION_DEGREES,
+                                windowRotationDegrees,
                                 owner.camera.facing,
                             ),
                             crop,
@@ -3421,7 +3448,7 @@ class RawVulkanPreviewController(
                     }
                     raw.writeTo(rawParameterBuffer)
                     val sampleAt = SystemClock.elapsedRealtime()
-                    if (sampleAt - lastRawSampleAtMs >= 10_000) {
+                    if (sampleAt - lastRawSampleAtMs >= 30_000) {
                         lastRawSampleAtMs = sampleAt
                         if (pixels != null)
                             ImageDiagnostics.raw("preview-${owner.camera.route.routeId}-${metadata.frameNumber}", pixels, rawParameterBuffer)
@@ -4014,7 +4041,6 @@ class RawVulkanPreviewController(
     private companion object {
         const val STATUS_PUBLISH_INTERVAL_MS = 1_000L
         const val NANOSECONDS_TO_SECONDS = 1e-9
-        const val LOCKED_VIEWFINDER_ROTATION_DEGREES = 0
         const val MERGE_COPY_WAIT_MS = 120L
         const val STALE_MERGE_FRAME_MS = 1_000L
         const val ISP_FAILURE_LIMIT = 3

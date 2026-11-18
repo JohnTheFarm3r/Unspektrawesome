@@ -813,6 +813,7 @@ Result merge(const Layout& layout, const std::vector<Frame>& frames, uint16_t* o
                     jobs.push_back(job);
                 }
                 Push final = basePush(band);
+                final.scale[0] = layout.outputScale;
                 jobs.push_back({kFinalize, final, groups(layout.width / 2, 16), groups(band.height, 16)});
                 engine.run(jobs);
             }
@@ -882,11 +883,11 @@ namespace {
 
 jfloat Java_com_unspektrawesome_burst_MultiFrameMerge_merge(JNIEnv* env, jobject, jobjectArray frames, jfloatArray scales,
     jint width, jint height, jint rowBytes, jint format, jint blockSize, jint sourcePattern, jint phaseX, jint phaseY,
-    jfloatArray black, jfloat white, jfloat noiseS, jfloat noiseO, jfloat motion, jobject output) {
+    jfloatArray black, jfloat white, jfloat noiseS, jfloat noiseO, jfloat motion, jfloat outputScale, jobject output) {
     const jsize count = frames ? env->GetArrayLength(frames) : 0;
     if (count < 2 || count > 32 || !scales || env->GetArrayLength(scales) != count || !black || env->GetArrayLength(black) != 4 ||
         width < 64 || height < 64 || (width & 1) || rowBytes <= 0 || format < 0 || format > 2 || blockSize < 1 || blockSize > 4 ||
-        sourcePattern < 0 || sourcePattern > 3 || !output) {
+        sourcePattern < 0 || sourcePattern > 3 || !(outputScale >= 1.f) || !(white * outputScale <= 65535.f) || !output) {
         return 0.f;
     }
     const int64_t packedBytes = int64_t(rowBytes) * height;
@@ -907,6 +908,7 @@ jfloat Java_com_unspektrawesome_burst_MultiFrameMerge_merge(JNIEnv* env, jobject
     layout.noiseS = noiseS;
     layout.noiseO = noiseO;
     layout.motion = motion;
+    layout.outputScale = outputScale;
     std::vector<float> scaleValues(static_cast<size_t>(count));
     env->GetFloatArrayRegion(scales, 0, count, scaleValues.data());
     std::vector<multiframe::Frame> inputs;
@@ -930,7 +932,7 @@ jfloat Java_com_unspektrawesome_burst_MultiFrameMerge_merge(JNIEnv* env, jobject
 
 bool registerMultiFrameMerge(JNIEnv* env) {
     const JNINativeMethod methods[] = {
-        {"merge", "([Ljava/nio/ByteBuffer;[FIIIIIIII[FFFFFLjava/nio/ByteBuffer;)F", reinterpret_cast<void*>(Java_com_unspektrawesome_burst_MultiFrameMerge_merge)},
+        {"merge", "([Ljava/nio/ByteBuffer;[FIIIIIIII[FFFFFFLjava/nio/ByteBuffer;)F", reinterpret_cast<void*>(Java_com_unspektrawesome_burst_MultiFrameMerge_merge)},
     };
     return registerNativeMethods(env, "com/unspektrawesome/burst/MultiFrameMerge", methods);
 }

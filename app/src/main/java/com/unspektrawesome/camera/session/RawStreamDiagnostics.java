@@ -3,7 +3,9 @@ package com.unspektrawesome.camera.session;
 import java.util.Locale;
 
 final class RawStreamDiagnostics {
-    private static final long INTERVAL_NS = 5_000_000_000L;
+    // Each report summarizes this long, so the log stays readable while keeping every spike in the maxima.
+    private static final long DEFAULT_INTERVAL_NS = 15_000_000_000L;
+    private final long intervalNs;
     private long startNs;
     private long startFrame;
     private long startSensorNs;
@@ -22,6 +24,14 @@ final class RawStreamDiagnostics {
     private long requestUpdates;
     private long requestUpdateNs;
     private long requestUpdateMaxNs;
+
+    RawStreamDiagnostics() {
+        this(DEFAULT_INTERVAL_NS);
+    }
+
+    RawStreamDiagnostics(long intervalNs) {
+        this.intervalNs = intervalNs;
+    }
 
     void reset() {
         started = false;
@@ -60,7 +70,7 @@ final class RawStreamDiagnostics {
         }
         results++;
         long elapsedNs = nowNs - startNs;
-        if (elapsedNs < INTERVAL_NS) return null;
+        if (elapsedNs < intervalNs) return null;
         String detail = String.format(Locale.ROOT,
                 "window_ms=%.1f capture_fps=%.2f result_fps=%.2f raw_fps=%.2f companion_fps=%.2f "
                         + "results=%d raw_images=%d companion_images=%d deliveries=%d consumer_skips=%d "

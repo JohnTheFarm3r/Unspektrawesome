@@ -28,7 +28,7 @@
 //   4 spectrum      reference tile spectra, which seed the frequency accumulator
 //   5 merge         add one aligned alternate frame to the accumulator per coefficient
 //   6 inverse       transform the accumulated tiles back and overlap-add them
-//   7 finalize      write the spatial accumulator as 16-bit RAW
+//   7 finalize      write the spatial accumulator as 16-bit RAW, scaled up by the output scale
 //
 // Every stage is submitted in small pieces so the viewfinder keeps rendering
 // between them; the reference spectra are computed once per band, so each
@@ -684,8 +684,9 @@ layout(local_size_x = 16, local_size_y = 16) in;
 
 uint finalPixel(ivec2 p)
 {
-    float value = spatial.values[uint(p.y * pc.frame.x + p.x)] + blackOf(levelOf(p.x, p.y));
-    return uint(round(clamp(value, 0.0, pc.noise.x)));
+    // The output keeps the finer precision of the average by storing it at scale.x times the sensor range.
+    float value = (spatial.values[uint(p.y * pc.frame.x + p.x)] + blackOf(levelOf(p.x, p.y))) * pc.scale.x;
+    return uint(round(clamp(value, 0.0, min(pc.noise.x * pc.scale.x, 65535.0))));
 }
 
 void main()

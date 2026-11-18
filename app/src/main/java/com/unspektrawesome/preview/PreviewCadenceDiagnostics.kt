@@ -2,7 +2,8 @@ package com.unspektrawesome.preview
 
 import java.util.Locale
 
-internal class PreviewCadenceDiagnostics {
+// Each report summarizes [windowNs], so the log stays readable while keeping every spike in the maxima.
+internal class PreviewCadenceDiagnostics(private val windowNs: Long = 10_000_000_000L) {
     enum class Decision { ACCEPT, BUSY, PACED, INACTIVE }
 
     private var startedNs = Long.MIN_VALUE
@@ -29,7 +30,7 @@ internal class PreviewCadenceDiagnostics {
         previousSensorNs = sensorNs
         previousArrivalNs = nowNs
         val elapsedNs = nowNs - startedNs
-        if (elapsedNs < 2_000_000_000L) return null
+        if (elapsedNs < windowNs) return null
         val detail = String.format(Locale.ROOT,
             "window_ms=%.1f input_fps=%.2f rendered_fps=%.2f accepted=%d busy=%d paced=%d inactive=%d replaced=%d " +
                 "sensor_gap_ms=%s arrival_gap_ms=%s queue_ms=%s prepare_ms=%s render_ms=%s feedback_ms=%s",

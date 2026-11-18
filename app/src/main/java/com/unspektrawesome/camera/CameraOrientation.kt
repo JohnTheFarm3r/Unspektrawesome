@@ -57,6 +57,20 @@ object CameraOrientation {
     fun fromDisplayRotation(surfaceRotation: Int): Int =
         if (surfaceRotation in 0..3) (360 - surfaceRotation * 90) % 360 else 0
 
+    /** Clockwise degrees the system draws the window at, from Surface.ROTATION_0 to ROTATION_270. */
+    fun windowRotation(surfaceRotation: Int): Int =
+        if (surfaceRotation in 0..3) surfaceRotation * 90 else 0
+
+    /**
+     * Device orientation measured against the window instead of the device's natural orientation.
+     * Large screens turn the window with the device, so it is not always drawn at rotation 0.
+     */
+    fun relativeToWindow(deviceDegrees: Int, windowRotationDegrees: Int): Int {
+        require(deviceDegrees in VALID_ORIENTATIONS) { "Device orientation must be 0, 90, 180, or 270 degrees" }
+        require(windowRotationDegrees in VALID_ORIENTATIONS) { "Display rotation must be 0, 90, 180, or 270 degrees" }
+        return (deviceDegrees + windowRotationDegrees) % 360
+    }
+
     fun nearestEquivalentRotation(currentDegrees: Float, targetDegrees: Float): Float {
         require(currentDegrees.isFinite() && targetDegrees.isFinite()) {
             "Rotation values must be finite"

@@ -19,10 +19,13 @@ data class ImportedLensProfile(val profile: LensProfile, val startup: Boolean = 
 data class LensProfileBackup(val profiles: List<ImportedLensProfile>, val dcps: Map<String, ByteArray>)
 
 data class LensProfileDevice(val manufacturer: String, val model: String, val device: String) {
-    private val identity get() = listOf(manufacturer, model, device).map { it.trim().lowercase(Locale.ROOT) }
+    private val fields get() = listOf(manufacturer, model, device).map { it.trim().lowercase(Locale.ROOT) }
+    // Regional versions of a phone share the maker and device name but each region has its own model code,
+    // so the model code is recorded for display and not compared.
+    private val hardware get() = listOf(manufacturer, device).map { it.trim().lowercase(Locale.ROOT) }
     val label get() = "${manufacturer.trim()} ${model.trim()} (${device.trim()})"
-    internal val isKnown get() = identity.all { it.isNotBlank() && it.length <= 128 && it != "unknown" }
-    internal fun matches(other: LensProfileDevice) = isKnown && other.isKnown && identity == other.identity
+    internal val isKnown get() = fields.all { it.isNotBlank() && it.length <= 128 && it != "unknown" }
+    internal fun matches(other: LensProfileDevice) = isKnown && other.isKnown && hardware == other.hardware
     internal fun toJson() = JSONObject().put("manufacturer", manufacturer.trim()).put("model", model.trim()).put("device", device.trim())
 
     companion object {

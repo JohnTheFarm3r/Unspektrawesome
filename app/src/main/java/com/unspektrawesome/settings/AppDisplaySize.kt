@@ -11,12 +11,20 @@ import kotlin.math.roundToInt
 /**
  * Size of the app's interface, independent of the phone's display size setting.
  * At 100% the narrow side of the screen is [STANDARD_WIDTH_DP] wide on every phone, so layouts look the same everywhere.
- * Auto follows the phone's display size instead. Text still follows the phone's font size in both cases.
+ * Large screens, such as tablets and unfolded foldables, start from their own display size instead, because stretching
+ * a phone width across them makes every control oversized. Auto follows the device's display size on every screen.
+ * Text still follows the device's font size in all cases.
  */
 object AppDisplaySize {
     data class State(val auto: Boolean = false, val percent: Int = 100)
 
     const val STANDARD_WIDTH_DP = 411f
+
+    /** Smallest screen width at which Android treats a screen as a tablet or an unfolded foldable. */
+    const val LARGE_SCREEN_SMALLEST_WIDTH_DP = 600
+
+    fun isLargeScreen(configuration: android.content.res.Configuration): Boolean =
+        configuration.smallestScreenWidthDp >= LARGE_SCREEN_SMALLEST_WIDTH_DP
     val STEPS = listOf(80, 90, 100, 110, 120)
 
     private const val FILE = "app_display_size"
@@ -41,6 +49,7 @@ object AppDisplaySize {
 
     /** Pixels per layout unit at 100%, or null when the screen size is unavailable. */
     fun standardDensity(context: Context): Float? = runCatching {
+        if (isLargeScreen(context.resources.configuration)) return@runCatching context.resources.displayMetrics.density
         val bounds = context.getSystemService(WindowManager::class.java).maximumWindowMetrics.bounds
         min(bounds.width(), bounds.height()).takeIf { it > 0 }?.let { it / STANDARD_WIDTH_DP }
     }.getOrNull()

@@ -1610,12 +1610,13 @@ public:
                 }
             }
             timing.presentMs = timing.since(presentStarted);
-            const bool stablePresentation =
-                presented == VK_SUCCESS && acquire == VK_SUCCESS;
-            if (presented == VK_ERROR_OUT_OF_DATE_KHR ||
-                presented == VK_SUBOPTIMAL_KHR || acquire == VK_SUBOPTIMAL_KHR) {
+            const bool recreate = swapchainNeedsRecreation(presented, acquire);
+            const bool stablePresentation = !recreate &&
+                (presented == VK_SUCCESS || presented == VK_SUBOPTIMAL_KHR) &&
+                (acquire == VK_SUCCESS || acquire == VK_SUBOPTIMAL_KHR);
+            if (recreate) {
                 recreateSwapchain();
-            } else if (presented != VK_SUCCESS) {
+            } else if (presented != VK_SUCCESS && presented != VK_SUBOPTIMAL_KHR) {
                 require(presented, "vkQueuePresentKHR");
             }
             if (stablePresentation)
@@ -1771,11 +1772,10 @@ public:
                 std::lock_guard<std::recursive_mutex> queueLock(queueMutex_);
                 presented = presentWithTiming(present);
             }
-            if (presented == VK_ERROR_OUT_OF_DATE_KHR ||
-                presented == VK_SUBOPTIMAL_KHR || acquire == VK_SUBOPTIMAL_KHR) {
+            if (swapchainNeedsRecreation(presented, acquire)) {
                 recreateSwapchain();
                 return false;
-            } else if (presented != VK_SUCCESS) {
+            } else if (presented != VK_SUCCESS && presented != VK_SUBOPTIMAL_KHR) {
                 require(presented, "vkQueuePresentKHR for lens switch");
             }
             VkResult queueIdle;
@@ -6158,6 +6158,21 @@ private:
             writes.data(), 0, nullptr);
     }
 
+    // A swapchain the compositor turns is always reported as suboptimal. Rebuild it only when the
+    // panel angle or surface size actually changed, not on every frame.
+    bool swapchainNeedsRecreation(VkResult presented, VkResult acquire)
+    {
+        if (presented == VK_ERROR_OUT_OF_DATE_KHR) return true;
+        if (presented != VK_SUBOPTIMAL_KHR && acquire != VK_SUBOPTIMAL_KHR) return false;
+        if (!compositorTurnsSwapchain_) return true;
+        VkSurfaceCapabilitiesKHR capabilities{};
+        if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice_, surface_, &capabilities) != VK_SUCCESS)
+            return true;
+        return capabilities.currentTransform != swapchainSurfaceTransform_ ||
+            capabilities.currentExtent.width != swapchainSurfaceExtent_.width ||
+            capabilities.currentExtent.height != swapchainSurfaceExtent_.height;
+    }
+
     void createSwapchain()
     {
         VkSurfaceCapabilitiesKHR capabilities{};
@@ -6184,6 +6199,16 @@ private:
             }
         }
         swapchainFormat_ = selected.format;
+        // The renderer draws upright for the window at the window's size. When the panel is mounted at
+        // another angle, as on the inner screen of some foldables and some tablets, the compositor turns
+        // the image for the panel instead.
+        swapchainSurfaceTransform_ = capabilities.currentTransform;
+        swapchainSurfaceExtent_ = capabilities.currentExtent;
+        const bool identitySupported =
+            (capabilities.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) != 0;
+        const VkSurfaceTransformFlagBitsKHR preTransform = identitySupported
+            ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR : capabilities.currentTransform;
+        compositorTurnsSwapchain_ = preTransform != capabilities.currentTransform;
         swapchainExtent_ = capabilities.currentExtent;
         if (swapchainExtent_.width == std::numeric_limits<uint32_t>::max()) {
             uint32_t width = static_cast<uint32_t>(
@@ -6236,7 +6261,7 @@ private:
         if (presentSamplesSupported_) info.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 #endif
         info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        info.preTransform = capabilities.currentTransform;
+        info.preTransform = preTransform;
         info.compositeAlpha = chooseCompositeAlpha(capabilities);
         info.presentMode = presentMode;
         info.clipped = VK_TRUE;
@@ -9356,6 +9381,9 @@ private:
     uint64_t presentSampleSequence_ = 0;
 #endif
     VkExtent2D swapchainExtent_{};
+    VkExtent2D swapchainSurfaceExtent_{};
+    VkSurfaceTransformFlagBitsKHR swapchainSurfaceTransform_ = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    bool compositorTurnsSwapchain_ = false;
     std::vector<VkImage> swapchainImages_;
     std::vector<VkImageView> swapchainViews_;
     VkRenderPass renderPass_ = VK_NULL_HANDLE;

@@ -4,9 +4,10 @@ import com.unspektrawesome.camera.CameraDescriptor
 import com.unspektrawesome.settings.CameraPreferences
 import com.unspektrawesome.settings.LensButtonMapping
 import com.unspektrawesome.settings.LensProfiles
+import com.unspektrawesome.settings.LensRail
 
 /**
- * The lens a button step moves to, in the lens rail's order, as the id to select and its label.
+ * The lens button a button step moves to, in the lens rail's order, as the id to select and its label.
  * Returns null at either end of the rail.
  */
 internal fun lensStepTarget(cameras: List<CameraDescriptor>, preferences: CameraPreferences,
@@ -20,15 +21,11 @@ internal fun lensStepTarget(cameras: List<CameraDescriptor>, preferences: Camera
         val target = ordered.getOrNull(if (index < 0) 0 else index + step.coerceIn(-1, 1)) ?: return null
         return target.route.routeId.takeIf { it != selectedRouteId }?.let { it to LensButtonMapping.zoomLabel(target) }
     }
-    val routeOrder = ordered.mapIndexed { index, camera -> camera.route.routeId to index }.toMap()
-    val groups = profiles.groupBy { it.focalGroup }.values.sortedWith(compareBy(
-        { choices -> byRoute.getValue(choices.first().routeId).facing.ordinal },
-        { choices -> choices.minOf { it.focalLength.equivalent(byRoute.getValue(it.routeId)) ?: Float.MAX_VALUE } },
-        { choices -> choices.minOf { routeOrder.getValue(it.routeId) } }))
-    val active = profiles.firstOrNull { it.id == preferences.activeLensProfileId }
-    val index = groups.indexOfFirst { group -> group.any { it.id == active?.id } }
-    val target = groups.getOrNull(if (index < 0) 0 else index + step.coerceIn(-1, 1)) ?: return null
-    if (index >= 0 && target === groups[index]) return null
-    val profile = target.firstOrNull { it.id == preferences.defaultLensProfileId(preferences.lensProfileMode) } ?: target.first()
-    return profile.id to profile.focalLength.label(byRoute.getValue(profile.routeId))
+    val slots = LensRail.slots(profiles, cameras)
+    val index = slots.indexOfFirst { it.contains(preferences.activeLensProfileId) }
+    val target = slots.getOrNull(if (index < 0) 0 else index + step.coerceIn(-1, 1)) ?: return null
+    if (index >= 0 && target === slots[index]) return null
+    val choices = target.choices
+    val profile = choices.firstOrNull { it.id == preferences.defaultLensProfileId(preferences.lensProfileMode) } ?: choices.first()
+    return profile.id to (profile.button.customLabel ?: profile.focalLength.label(byRoute.getValue(profile.routeId)))
 }

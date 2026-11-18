@@ -181,7 +181,7 @@ open class MainActivity : ComponentActivity() {
                 val resolved = CameraOrientation.resolve(orientation, deviceOrientationDegrees)
                 if (resolved == deviceOrientationDegrees) return
                 deviceOrientationDegrees = resolved
-                landscapeSideDegrees = CameraOrientation.landscapeSide(resolved, landscapeSideDegrees)
+                landscapeSideDegrees = CameraOrientation.landscapeSide(windowDegrees(resolved), landscapeSideDegrees)
                 previewController.updateDeviceOrientation(resolved)
             }
         }
@@ -193,17 +193,48 @@ open class MainActivity : ComponentActivity() {
         object : android.database.ContentObserver(android.os.Handler(android.os.Looper.getMainLooper())) {
             override fun onChange(selfChange: Boolean) = readSystemRotation()
         }
-    // Text and buttons follow the chosen setting. Capture always follows deviceOrientationDegrees.
+    // Clockwise rotation the system draws this window at. Large screens turn the window with the device.
+    private var windowRotationDegrees by mutableIntStateOf(0)
+    private val displayListener = object : android.hardware.display.DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) = Unit
+        override fun onDisplayRemoved(displayId: Int) = Unit
+        override fun onDisplayChanged(displayId: Int) {
+            if (displayId == display?.displayId) readWindowRotation()
+        }
+    }
+    // Text and buttons follow the chosen setting, measured against the window. Capture always follows
+    // deviceOrientationDegrees, which is measured against the device's natural orientation.
     private val uiOrientationDegrees: Int
-        get() = CameraOrientation.uiOrientation(cameraPreferences.uiOrientation, deviceOrientationDegrees,
-            landscapeSideDegrees, systemLockedOrientationDegrees)
+        get() = CameraOrientation.uiOrientation(cameraPreferences.uiOrientation, windowDegrees(deviceOrientationDegrees),
+            landscapeSideDegrees, systemLockedOrientationDegrees?.let(::windowDegrees))
+
+    private fun windowDegrees(deviceDegrees: Int): Int =
+        CameraOrientation.relativeToWindow(deviceDegrees, windowRotationDegrees)
+
+    private fun readWindowRotation() {
+        val rotation = CameraOrientation.windowRotation(display?.rotation ?: android.view.Surface.ROTATION_0)
+        if (rotation == windowRotationDegrees) return
+        windowRotationDegrees = rotation
+        if (cameraStarted) previewController.updateWindowRotation(rotation)
+    }
+
+    // Phones keep the camera upright in portrait. Large screens, such as tablets and unfolded foldables,
+    // turn with the device and use the split camera layout instead.
+    private fun applyScreenOrientationPolicy() {
+        val wanted = if (com.unspektrawesome.settings.AppDisplaySize.isLargeScreen(resources.configuration))
+            android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_USER
+            else android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        if (requestedOrientation != wanted) requestedOrientation = wanted
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        applyScreenOrientationPolicy()
         window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         enableEdgeToEdge()
         hideStatusBar()
         cameraPreferences = loadCameraPreferences()
+        windowRotationDegrees = CameraOrientation.windowRotation(display?.rotation ?: android.view.Surface.ROTATION_0)
         ControlBindings.initialize(this, cameraPreferences)
         com.unspektrawesome.controls.DirectUsbControls.initialize(this)
         discoveryScope.launch {
@@ -339,7 +370,7 @@ open class MainActivity : ComponentActivity() {
                         )
                         val transform = CaptureGeometry.transform(
                             camera.sensorMetadata.orientationDegrees,
-                            LOCKED_VIEWFINDER_ROTATION_DEGREES,
+                            windowRotationDegrees,
                             camera.facing,
                         )
                         val oriented = FrameGeometrySnapshot.createForPhotoCrop(camera.sensorMetadata,
@@ -550,7 +581,7 @@ open class MainActivity : ComponentActivity() {
                     readPreviewPerformance = previewController::samplePreviewPerformance,
                     readHistogram = { _, cropAspect -> previewController.sampleHistogram(cropAspect) },
                     controlRotationDegrees = CameraOrientation.controlRotation(uiOrientationDegrees),
-                    deviceRotationDegrees = CameraOrientation.controlRotation(deviceOrientationDegrees),
+                    deviceRotationDegrees = CameraOrientation.controlRotation(windowDegrees(deviceOrientationDegrees)),
                     lensSwitching = previewStatus.lensSwitching || (hasCameraPermission() && previewStatus.phase in setOf(
                         RawPreviewPhase.IDLE, RawPreviewPhase.PAUSED, RawPreviewPhase.WAITING_FOR_SURFACE, RawPreviewPhase.OPENING)),
                     startupLoading = hasCameraPermission() && !previewStatus.viewfinderReady &&
@@ -616,6 +647,9 @@ open class MainActivity : ComponentActivity() {
         cameraPreferences = loadCameraPreferences()
         hideStatusBar()
         readSystemRotation()
+        readWindowRotation()
+        getSystemService(android.hardware.display.DisplayManager::class.java)
+            .registerDisplayListener(displayListener, android.os.Handler(android.os.Looper.getMainLooper()))
         for (setting in listOf(android.provider.Settings.System.ACCELEROMETER_ROTATION, android.provider.Settings.System.USER_ROTATION))
             contentResolver.registerContentObserver(android.provider.Settings.System.getUriFor(setting), false, systemRotationObserver)
         cameraLocation.configure(cameraPreferences.saveLocation, cameraToolsVisible)
@@ -626,6 +660,7 @@ open class MainActivity : ComponentActivity() {
             if (cameraStarted) {
                 if (!lockedSession()) previewController.refreshLastPhoto()
                 previewController.updateDeviceOrientation(deviceOrientationDegrees)
+                previewController.updateWindowRotation(windowRotationDegrees)
                 if (orientationListener.canDetectOrientation()) orientationListener.enable()
             }
         }
@@ -654,6 +689,7 @@ open class MainActivity : ComponentActivity() {
         spektraAeFeedbackId = 0
         if (cameraStarted) orientationListener.disable()
         contentResolver.unregisterContentObserver(systemRotationObserver)
+        getSystemService(android.hardware.display.DisplayManager::class.java).unregisterDisplayListener(displayListener)
         super.onPause()
     }
 
@@ -726,6 +762,7 @@ open class MainActivity : ComponentActivity() {
         // Above the lock screen only photos taken in this session are shown.
         if (!lockedSession()) previewController.refreshLastPhoto()
         previewController.updateDeviceOrientation(deviceOrientationDegrees)
+        previewController.updateWindowRotation(windowRotationDegrees)
         if (orientationListener.canDetectOrientation()) orientationListener.enable()
     }
 
@@ -954,6 +991,5 @@ open class MainActivity : ComponentActivity() {
 
     private companion object {
         const val DEFAULT_VIEWFINDER_ASPECT_RATIO = 3f / 4f
-        const val LOCKED_VIEWFINDER_ROTATION_DEGREES = 0
     }
 }

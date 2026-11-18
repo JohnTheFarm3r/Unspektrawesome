@@ -3,6 +3,7 @@ package com.unspektrawesome.ui.camera
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -29,7 +30,7 @@ import kotlin.math.roundToInt
 internal typealias LensFrameRateCheck = suspend (CameraDescriptor, LensProfile) -> RawFrameRateReport
 
 @Composable
-internal fun LensCaptureControls(camera: CameraDescriptor, profile: LensProfile,
+internal fun LensCaptureControls(camera: CameraDescriptor, profile: LensProfile, rail: LensRailPreview,
     onCheck: LensFrameRateCheck?, isActive: Boolean = true, onChange: (LensProfile) -> Unit) {
     val context = LocalContext.current
     val store = remember(context) { RawFrameRateStore(context) }
@@ -165,8 +166,24 @@ internal fun LensCaptureControls(camera: CameraDescriptor, profile: LensProfile,
             onChange(profile.copy(capture = capture.copy(mergeMotion = value.coerceIn(0f, 1f))))
         }
 
+        // The look controls sit right under the drawing, one at a time, so the drawing stays in view while they change.
+        var lookTab by rememberSaveable(profile.id) { mutableIntStateOf(0) }
+        val search = LocalSettingsSearch.current
+        LaunchedEffect(search?.pending?.title) {
+            LENS_BUTTON_LOOK_TERMS.indexOf(search?.pending?.title).takeIf { it >= 0 }?.let { lookTab = it }
+        }
         LensSectionHeading(6, "Lens button")
-        LensButtonStage(camera, profile.focalLength)
+        // Search brings the drawing and the controls into view together.
+        Column(LENS_BUTTON_LOOK_TERMS.fold(Modifier.fillMaxWidth() as Modifier) { modifier, term ->
+            modifier.then(settingsSearchTarget(term))
+        }) {
+            LensButtonStage(profile, camera, rail, focus = LENS_BUTTON_LOOK_NUMBERS[lookTab])
+            LensButtonLookPanel(profile, camera, lookTab, { lookTab = it }, onChange)
+        }
+        DiagramSwitchRow("Separate lens button", profile.button.ownButton, number = 3,
+            detail = "Adds a button for this profile next to its lens. Holding either button still lists every profile of the lens.") {
+            onChange(profile.copy(button = profile.button.copy(ownButton = it)))
+        }
         ProfileNumberField("Focal length factor", profile.focalLength.factor.toString(), !checking, Modifier.fillMaxWidth(),
             number = 1, valid = { it.toFloatOrNull()?.let { factor -> factor.isFinite() && factor in .1f..20f } == true }) { value ->
             onChange(profile.copy(focalLength = profile.focalLength.copy(factor = value.toFloat())))
@@ -176,6 +193,78 @@ internal fun LensCaptureControls(camera: CameraDescriptor, profile: LensProfile,
             LensFocalLengthLabel.entries.forEach { label ->
                 DiagramMenuItem(label.label, selected = label == profile.focalLength.label) {
                     onChange(profile.copy(focalLength = profile.focalLength.copy(label = label))); labelExpanded = false
+                }
+            }
+        }
+        DiagramButtonRow {
+            DiagramButton("Reset button look", enabled = profile.button.customLook, symbol = SettingsSymbol.Reset) {
+                onChange(profile.copy(button = LensButtonStyle(ownButton = profile.button.ownButton)))
+            }
+        }
+    }
+}
+
+/** Settings search terms of the look choices, in their order, which lead search to the matching choice. */
+private val LENS_BUTTON_LOOK_TERMS = listOf("Button label", "Text size", "Button size", "Shape", "Spacing")
+
+/** Number of each look choice in the lens button drawing. */
+private val LENS_BUTTON_LOOK_NUMBERS = listOf(4, 5, 6, 7, 8)
+
+/**
+ * Label, text size, button size, shape and spacing of the lens button. A row of choices picks the one control
+ * shown, which keeps the panel short enough to use with the drawing above it in view.
+ */
+@Composable
+private fun LensButtonLookPanel(profile: LensProfile, camera: CameraDescriptor, tab: Int, onTab: (Int) -> Unit,
+    onChange: (LensProfile) -> Unit) {
+    val renderer = LocalAppLanguage.current.renderer
+    val style = profile.button
+    fun change(next: LensButtonStyle) { if (next != style) onChange(profile.copy(button = next)) }
+    DiagramSegmented(listOf("Label", "Text", "Size", "Shape", "Spacing"), tab, Modifier.testTag("Lens button look"),
+        onSelect = onTab)
+    Column(Modifier.fillMaxWidth().heightIn(min = 112.dp)) {
+        when (tab) {
+            0 -> {
+                var label by remember(profile.id) { mutableStateOf(style.label) }
+                LaunchedEffect(style.label) { if (label.trim() != style.label.trim()) label = style.label }
+                SensorArtField(label, { value ->
+                    label = LensButtonStyle.cleanLabel(value)
+                    change(style.copy(label = label))
+                }, "Button label", Modifier.testTag("Lens button label"), number = 4, mono = false,
+                    placeholder = renderer.text(profile.focalLength.label(camera)))
+                DiagramHint("Replaces the whole label. Leave it empty to show the focal length.")
+            }
+            1 -> {
+                DiagramSliderRow("Text size", style.textSize, "${style.textSize.roundToInt()}", { value ->
+                    change(style.copy(textSize = value.roundToInt().toFloat()
+                        .coerceIn(LensButtonStyle.MIN_TEXT_SIZE, LensButtonStyle.MAX_TEXT_SIZE)))
+                }, range = LensButtonStyle.MIN_TEXT_SIZE..LensButtonStyle.MAX_TEXT_SIZE, step = 1f, number = 5,
+                    onReset = { change(style.copy(textSize = LensButtonStyle.DEFAULT_TEXT_SIZE)) })
+                DiagramHint("Long labels shrink to fit the button.")
+            }
+            2 -> DiagramSliderRow("Button size", style.size, "${style.size.roundToInt()}", { value ->
+                change(style.copy(size = ((value / 2f).roundToInt() * 2f)
+                    .coerceIn(LensButtonStyle.MIN_SIZE, LensButtonStyle.MAX_SIZE)))
+            }, range = LensButtonStyle.MIN_SIZE..LensButtonStyle.MAX_SIZE, step = 2f, number = 6,
+                onReset = { change(style.copy(size = LensButtonStyle.DEFAULT_SIZE)) })
+            3 -> {
+                DiagramSegmented(LensButtonShape.entries.map { it.label }, style.shape.ordinal) {
+                    change(style.copy(shape = LensButtonShape.entries[it]))
+                }
+                DiagramHint("A pill grows wider to fit its label.")
+            }
+            else -> {
+                DiagramSwitchRow("Automatic spacing", style.spacing == null, number = 8,
+                    detail = "Buttons overlap slightly and move closer when the row is full.") { automatic ->
+                    change(style.copy(spacing = if (automatic) null else 0f))
+                }
+                style.spacing?.let { spacing ->
+                    DiagramSliderRow("Spacing", spacing, spacingText(spacing), { value ->
+                        change(style.copy(spacing = value.roundToInt().toFloat()
+                            .coerceIn(LensButtonStyle.MIN_SPACING, LensButtonStyle.MAX_SPACING)))
+                    }, range = LensButtonStyle.MIN_SPACING..LensButtonStyle.MAX_SPACING, step = 1f,
+                        startLabel = "Overlap", endLabel = "Apart", onReset = { change(style.copy(spacing = 0f)) })
+                    DiagramHint("Two neighbouring buttons use the larger of their spacings.")
                 }
             }
         }
@@ -362,41 +451,6 @@ private fun MergeStage(capture: LensCaptureSettings) {
         }
         DiagramText("Lower noise", Modifier.at(206.dp, 80.dp), size = 8.5f, maxWidth = 58.dp)
         DiagramText("Less ghosting", Modifier.at(266.dp, 80.dp).width(58.dp), size = 8.5f, maxWidth = 58.dp, align = TextAlign.End)
-    }
-}
-
-/** The two looks of the lens button, with the chosen one in lime. */
-@Composable
-private fun LensButtonStage(camera: CameraDescriptor, focal: LensFocalLengthSettings) {
-    val zoom = focal.copy(label = LensFocalLengthLabel.ZOOM).label(camera)
-    val equivalent = focal.copy(label = LensFocalLengthLabel.EQUIVALENT).label(camera)
-    val zoomOn = focal.label == LensFocalLengthLabel.ZOOM
-    SensorArtStage(96.dp, "Lens button") {
-        DiagramDrawing {
-            circle(30.dp, 50.dp, 16.dp, if (zoomOn) CameraColors.Accent else SensorArt.Dim, dashed = !zoomOn)
-            circle(118.dp, 50.dp, 16.dp, if (!zoomOn) CameraColors.Accent else SensorArt.Dim, dashed = zoomOn)
-            line(170.dp, 26.dp, 170.dp, 88.dp, Diagram.Border, 1.dp, dashed = true)
-        }
-        DiagramLabel("Lens button", modifier = Modifier.at(12.dp, 9.dp), maxWidth = 120.dp)
-        LensButtonFace(zoom, zoomOn, 30)
-        LensButtonFace(equivalent, !zoomOn, 118)
-        DiagramText("Zoom ratio", Modifier.at(0.dp, 72.dp).width(60.dp), color = if (zoomOn) CameraColors.Accent else Diagram.Hint,
-            size = 8.5f, maxWidth = 60.dp, align = TextAlign.Center)
-        DiagramText("35 mm equivalent", Modifier.at(78.dp, 72.dp).width(80.dp), color = if (!zoomOn) CameraColors.Accent else Diagram.Hint,
-            size = 8.5f, maxWidth = 80.dp, align = TextAlign.Center)
-        SensorArtMarker(2, 140.dp, 26.dp)
-        Row(Modifier.at(184.dp, 32.dp).width(144.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            DiagramNumber(1)
-            DiagramLabel("Focal length factor", "${focal.factor}×", maxWidth = 120.dp, valueTranslate = false)
-        }
-    }
-}
-
-@Composable
-private fun LensButtonFace(text: String, active: Boolean, center: Int) {
-    Box(Modifier.at((center - 16).dp, 34.dp).size(32.dp), contentAlignment = Alignment.Center) {
-        Text(text, translate = text == "Lens", color = if (active) CameraColors.Accent else SensorArt.Soft,
-            fontSize = if (text.length > 4) 8.sp else 9.sp, lineHeight = 10.sp, fontFamily = Diagram.Mono, maxLines = 1)
     }
 }
 

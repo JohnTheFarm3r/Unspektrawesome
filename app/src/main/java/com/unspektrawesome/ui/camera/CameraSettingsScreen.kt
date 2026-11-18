@@ -74,7 +74,8 @@ private enum class CameraSettingsTab(val label: String) {
 /** Settings inside a lens profile. Search opens the profile in use to show them. */
 private val LENS_PROFILE_SEARCH_TERMS = listOf("Sensor input", "CAMERA ID", "RAW STREAM", "Capture", "Photo OIS", "OIS",
     "Capture gyro data", "Live gyro stabilization", "Frame rate", "RAW FRAME RATE", "ISP COMPANION SURFACE", "Frame averaging",
-    "Multi-frame merge", "Lens button", "LENS BUTTON LABEL", "Preview", "Auto exposure", "MINIMUM ISO", "MAXIMUM ISO",
+    "Multi-frame merge", "Lens button", "LENS BUTTON LABEL", "Separate lens button", "Button label", "Text size",
+    "Button size", "Shape", "Spacing", "Automatic spacing", "Preview", "Auto exposure", "MINIMUM ISO", "MAXIMUM ISO",
     "FASTEST SHUTTER", "SLOWEST SHUTTER", "RAW adjustments", "SENSOR CROP",
     "CFA / REMOSAIC", "CFA COLOR ORDER", "Color calibration", "BLACK / WHITE LEVELS", "Lens shading")
 

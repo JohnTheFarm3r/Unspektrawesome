@@ -897,6 +897,14 @@ fun CameraScreen(
                 .onGloballyPositioned { guideOrigin = it.positionInRoot() }.testTag("Camera content area")) {
                 val chromeWidth = maxWidth
                 val chromeHeight = maxHeight
+                // Tablets and unfolded foldables split the controls between both hands: lenses on the left and
+                // the shutter on the right. Near-square screens keep the viewfinder above the controls. Wide
+                // screens put it between two full-height control columns.
+                val splitLayout = com.unspektrawesome.settings.AppDisplaySize.isLargeScreen(
+                    androidx.compose.ui.platform.LocalConfiguration.current)
+                val wideSplit = splitLayout && maxWidth > maxHeight * 1.3f
+                val splitSideWidth = if (splitLayout) (maxWidth * (if (wideSplit) .14f else .24f)).coerceIn(160.dp, if (wideSplit) 220.dp else 260.dp) else 0.dp
+                var splitLensActionsHeight by remember { mutableStateOf(64.dp) }
                 val animatedAspectRatio by animateFloatAsState(viewfinderAspectRatio,
                     tween(300, easing = FastOutSlowInEasing), label = "Photo crop framing")
                 val cropFramingSettled = animatedAspectRatio == viewfinderAspectRatio
@@ -922,7 +930,7 @@ fun CameraScreen(
                 var lastManualParameter by remember { mutableStateOf(CameraParameter.ISO) }
                 LaunchedEffect(activeCameraParameter) { activeCameraParameter?.let { lastManualParameter = it } }
                 val manualCardHeight = manualCameraCardHeight(fontScale)
-                val manualRows = if (maxWidth - 24.dp < 300.dp * fontScale) 2 else 1
+                val manualRows = if ((if (splitLayout) maxWidth - splitSideWidth * 2 else maxWidth) - 24.dp < 300.dp * fontScale) 2 else 1
                 val manualBaseHeight = 6.dp + manualCardHeight * manualRows + 6.dp * (manualRows - 1)
                 var manualRulerHeight by remember { mutableStateOf(74.dp) }
                 val manualSliderHeight = manualRulerHeight + 16.dp
@@ -934,7 +942,7 @@ fun CameraScreen(
                 var modeRailHeight by remember { mutableStateOf(44.dp) }
                 var measuredSelectorHeight by remember(maxWidth, fontScale, controlRotationDegrees) { mutableStateOf(160.dp) }
                 var measuredEditorHeight by remember(maxWidth, fontScale, controlRotationDegrees) { mutableStateOf(268.dp) }
-                val actionsHeight = measuredActionsHeight
+                val actionsHeight = if (splitLayout) 0.dp else measuredActionsHeight
                 var feedbackHeight by remember(density) { mutableStateOf(maxOf(48.dp, with(density) { 32.sp.toDp() } + 16.dp)) }
                 val showLongShutterNotice = (!cameraControls.autoExposure && cameraControls.selectedExposureTimeNs > 1_000_000_000L ||
                     captureExposureTimeNs > 1_000_000_000L) && hasCameraPermission && !startupLoading && !lensSwitching &&
@@ -942,7 +950,14 @@ fun CameraScreen(
                 val showFocusPeaking = focusPeakingActive && hasCameraPermission && !startupLoading &&
                     !lensSwitching && !actionsVisible && !compositionToolsOpen
                 val captureLift = 8.dp
-                val panelCapacity = CameraLayout.panelCapacity(maxWidth.value, maxHeight.value,
+                // Height of the side control columns. Wide screens give them the height below the top toolbar.
+                val splitColumnHeight = when {
+                    !splitLayout -> 0.dp
+                    wideSplit -> (maxHeight - captureLift - SPLIT_TOOLBAR_HEIGHT).coerceAtLeast(0.dp)
+                    else -> (maxHeight * .3f).coerceIn(minOf(240.dp, maxHeight * .5f), maxHeight * .5f)
+                }
+                val panelCapacity = if (splitLayout) (maxHeight * .55f - modeRailHeight - 8.dp).coerceAtLeast(0.dp)
+                    else CameraLayout.panelCapacity(maxWidth.value, maxHeight.value,
                     animatedAspectRatio, (actionsHeight + modeRailHeight).value, captureLift.value).dp
                 val panoramaAnimation = rememberPanoramaCaptureAnimation(panoramaState)
                 val panoramaCapture = panoramaAnimation.visible
@@ -952,31 +967,50 @@ fun CameraScreen(
                 val panoramaDockHeight = if (panoramaDock && !landscape) panoramaPreviewSize * panoramaAnimation.progress else 0.dp
                 val manualPanelHeight = minOf(manualHeight, panelCapacity)
                 val visibleManualHeight = manualPanelHeight * (1f - filmExpansion) * (1f - panoramaAnimation.progress)
-                val dockWidth = maxWidth
+                val dockWidth = if (splitLayout) maxWidth - splitSideWidth * 2 else maxWidth
                 val editorHeight = minOf(if (landscape) 268.dp * fontScale.coerceAtMost(1.4f) else measuredEditorHeight, panelCapacity)
                 val selectorHeight = minOf(measuredSelectorHeight, panelCapacity)
                 val animatedFilmHeight by animateDpAsState(
                     if (showEditorPage) editorHeight else selectorHeight,
                     tween(280, easing = FastOutSlowInEasing), label = "Profile editor height")
                 val filmHeight = minOf(animatedFilmHeight, panelCapacity)
-                val dockHeight = actionsHeight + modeRailHeight + visibleManualHeight + filmHeight * filmExpansion + panoramaDockHeight
+                val dockContentHeight = actionsHeight + modeRailHeight + visibleManualHeight + filmHeight * filmExpansion + panoramaDockHeight
+                val stackedSplit = splitLayout && !wideSplit
+                // Room below a near-square screen's viewfinder for the row of exposure and tone dials.
+                val splitRailRow = if (stackedSplit) 52.dp * fontScale.coerceAtMost(1.4f) + 8.dp else 0.dp
+                val dockHeight = when {
+                    !splitLayout -> dockContentHeight
+                    wideSplit -> dockContentHeight + 8.dp
+                    else -> maxOf(splitColumnHeight + splitRailRow, dockContentHeight + 8.dp)
+                }
                 val freeHeight = maxHeight - dockHeight - captureLift
                 val collapsedPreviewHeight = maxHeight - actionsHeight - modeRailHeight - minOf(manualBaseHeight, panelCapacity) - captureLift
-                val previewBehindControls by animateFloatAsState(if (preferences.extendTallCropPreview && !panoramaState.busy) 1f else 0f,
+                val previewBehindControls by animateFloatAsState(if (!splitLayout && preferences.extendTallCropPreview && !panoramaState.busy) 1f else 0f,
                     tween(PANORAMA_TRANSITION_MILLIS, easing = FastOutSlowInEasing), label = "Preview behind controls")
-                val extendPreview = !panoramaState.busy && preferences.extendTallCropPreview && maxWidth / viewfinderAspectRatio > collapsedPreviewHeight + .5.dp
+                val extendPreview = !splitLayout && !panoramaState.busy && preferences.extendTallCropPreview &&
+                    maxWidth / viewfinderAspectRatio > collapsedPreviewHeight + .5.dp
                 val previewExtension by animateFloatAsState(if (extendPreview) 1f else 0f,
                     tween(PANORAMA_TRANSITION_MILLIS, easing = FastOutSlowInEasing), label = "Crop behind controls")
                 val direction = androidx.compose.ui.platform.LocalLayoutDirection.current
-                val previewLeft = with(density) { -cameraInsets.getLeft(this, direction).toDp() } * previewExtension
-                val previewTop = with(density) { -cameraInsets.getTop(this).toDp() } * previewExtension
-                val previewWidth = maxWidth + (screenWidth - maxWidth) * previewExtension
-                val previewHeight = freeHeight + (collapsedPreviewHeight - freeHeight) * previewBehindControls +
+                val splitPreviewInset = if (wideSplit) splitSideWidth else 0.dp
+                val previewLeft = with(density) { -cameraInsets.getLeft(this, direction).toDp() } * previewExtension + splitPreviewInset
+                // On large screens the viewfinder sits below the top toolbar instead of under it.
+                val splitPreviewTop = if (splitLayout) SPLIT_TOOLBAR_HEIGHT else 0.dp
+                val previewTop = with(density) { -cameraInsets.getTop(this).toDp() } * previewExtension + splitPreviewTop
+                val previewWidth = maxWidth - splitPreviewInset * 2 + (screenWidth - maxWidth) * previewExtension
+                val previewHeight = freeHeight - splitPreviewTop + (collapsedPreviewHeight - freeHeight) * previewBehindControls +
                     (screenHeight - collapsedPreviewHeight) * previewExtension
                 val panoramaSideSpace = if (panoramaSidePreview) (panoramaPreviewSize + 8.dp) * panoramaAnimation.progress else 0.dp
                 val viewport = CameraLayout.fittedViewfinder(CameraArea(
                     (previewLeft + if (panoramaSidePreview && controlRotationDegrees == 90f) panoramaSideSpace else 0.dp).value, previewTop.value,
                     (previewWidth - panoramaSideSpace).coerceAtLeast(1.dp).value, previewHeight.value), animatedAspectRatio)
+                    // A near-square screen keeps the picture at the top and gives the space below it to the controls.
+                    .let { if (stackedSplit) it.copy(top = previewTop.value) else it }
+                val splitPanelTop = if (stackedSplit) (viewport.top + viewport.height).dp + 8.dp else freeHeight
+                val viewfinderBottom = splitPanelTop
+                val sideColumnTop = if (stackedSplit) splitPanelTop + splitRailRow else maxHeight - captureLift - splitColumnHeight
+                val sideColumnHeight = (maxHeight - captureLift - sideColumnTop).coerceAtLeast(0.dp)
+                val drawnDockHeight = if (stackedSplit) (maxHeight - captureLift - splitPanelTop).coerceAtLeast(0.dp) else dockHeight
                 val dockOverlap by animateFloatAsState(
                     if (viewport.top + viewport.height > freeHeight.value + .5f) 1f else 0f,
                     tween(220, easing = LinearOutSlowInEasing), label = "Preview dock transparency")
@@ -1083,8 +1117,8 @@ fun CameraScreen(
                         }
                     }
                 }
-                val railHeight = minOf((freeHeight - 146.dp).coerceIn(120.dp, 360.dp) * .6f,
-                    (freeHeight - 76.dp).coerceAtLeast(0.dp))
+                val railHeight = minOf((viewfinderBottom - 146.dp).coerceIn(120.dp, 360.dp) * .6f,
+                    (viewfinderBottom - 76.dp).coerceAtLeast(0.dp))
                 val rearCameras = enabledCameras.filter { it.facing != LensFacing.FRONT }
                 val frontCamera = enabledCameras.firstOrNull { it.facing == LensFacing.FRONT }
                 val selectedFront = enabledCameras.firstOrNull { it.route.routeId == selectedLensId }?.facing == LensFacing.FRONT
@@ -1093,11 +1127,19 @@ fun CameraScreen(
                     { it.relativeZoom?.let { zoom -> abs(zoom - 1f) } ?: Float.MAX_VALUE },
                 )) else frontCamera
                 CameraDock(
-                    Modifier.align(Alignment.BottomCenter).offset(y = -captureLift).width(dockWidth).height(dockHeight).testTag("Camera dock")
+                    Modifier.align(Alignment.BottomCenter).offset(y = -captureLift).width(dockWidth).height(drawnDockHeight).testTag("Camera dock")
                         .clip(androidx.compose.ui.graphics.RectangleShape)
                         .background(remember(dockOverlap) { CameraColors.viewfinderDockBackground(dockOverlap) })
                         .pointerInput(Unit) { detectTapGestures(onTap = {}) },
                 ) {
+                    // The free space shows the last photo, and makes way while looks and processing are open.
+                    if (stackedSplit) LastPhotoPreview(lastPhotoUri, {
+                        if (processingGuideActive && processingGuideStep == 3) openGalleryGuide()
+                        else onOpenGallery()
+                    }, onOpenGalleryOverview, interactive = filmExpansion == 0f,
+                        modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)
+                            .graphicsLayer { alpha = 1f - filmExpansion })
+                    else if (splitLayout) Spacer(Modifier.weight(1f))
                     if (panoramaDock && !landscape) PanoramaPreviewDock(panoramaAnimation.state, controlRotationDegrees,
                         Modifier.fillMaxWidth().height(panoramaDockHeight).graphicsLayer {
                             alpha = panoramaAnimation.progress
@@ -1184,6 +1226,7 @@ fun CameraScreen(
                     // What a held shutter locks on the camera in use.
                     val recordingLock = preferences.recordingLock.resolve(cameraControls.manualExposureSupported,
                         cameraControls.customAe)
+                    val captureActions: @Composable (CaptureActionsLayout, Modifier) -> Unit = { actionsLayout, actionsModifier ->
                     CaptureActions(viewfinderSpektraEnabled, !hardwareShutterReady, lastPhotoUri, {
                         if (processingGuideActive && processingGuideStep == 3) openGalleryGuide()
                         else onOpenGallery()
@@ -1199,9 +1242,8 @@ fun CameraScreen(
                                 onProcessingGuideStepChanged(1)
                             settingsVisible = true
                         },
-                        Modifier.align(Alignment.BottomCenter).offset(y = -captureLift).fillMaxWidth()
-                            .wrapContentHeight(Alignment.Bottom, unbounded = true)
-                            .onSizeChanged { measuredActionsHeight = with(density) { it.height.toDp() } },
+                        actionsModifier,
+                        layout = actionsLayout,
                         shutterPulse = { shutterFlash.value },
                         exposureTimeNs = captureExposureTimeNs,
                         exposureStartedAtMs = captureExposureStartedAtMs,
@@ -1225,9 +1267,20 @@ fun CameraScreen(
                         }) else null,
                         recordingLock = recordingLock,
                         onGuideTarget = { name, bounds -> guideTargets[name] = bounds })
-                val bannerTop = minOf(64.dp, (freeHeight - feedbackHeight - 8.dp).coerceAtLeast(0.dp))
+                    }
+                    if (splitLayout) {
+                        captureActions(CaptureActionsLayout.SHUTTER_SIDE, Modifier.align(Alignment.BottomEnd)
+                            .offset(y = -captureLift).width(splitSideWidth).height(sideColumnHeight))
+                        captureActions(CaptureActionsLayout.LENS_SIDE, Modifier.align(Alignment.BottomStart)
+                            .offset(y = -captureLift).width(splitSideWidth).padding(bottom = 12.dp)
+                            .onSizeChanged { splitLensActionsHeight = with(density) { it.height.toDp() } })
+                    } else captureActions(CaptureActionsLayout.ROW, Modifier.align(Alignment.BottomCenter)
+                        .offset(y = -captureLift).fillMaxWidth()
+                        .wrapContentHeight(Alignment.Bottom, unbounded = true)
+                        .onSizeChanged { measuredActionsHeight = with(density) { it.height.toDp() } })
+                val bannerTop = minOf(64.dp, (viewfinderBottom - feedbackHeight - 8.dp).coerceAtLeast(0.dp))
                 Box(Modifier.align(Alignment.TopCenter).offset(y = bannerTop)
-                    .fillMaxWidth().heightIn(max = freeHeight.coerceAtLeast(48.dp)).padding(horizontal = 16.dp)) {
+                    .fillMaxWidth().heightIn(max = viewfinderBottom.coerceAtLeast(48.dp)).padding(horizontal = 16.dp)) {
                     AnimatedVisibility(visible = bannerFeedback != null,
                         modifier = Modifier.align(Alignment.TopCenter).widthIn(max = 400.dp).fillMaxWidth(),
                         enter = fadeIn(tween(180)), exit = fadeOut(tween(180))) {
@@ -1244,7 +1297,11 @@ fun CameraScreen(
                         }
                     }
                 }
-                CameraPreviewOverlays(viewport, freeHeight, controlRotationDegrees, railHeight,
+                CameraPreviewOverlays(viewport, viewfinderBottom, controlRotationDegrees, railHeight,
+                    lensArea = if (splitLayout) CameraArea(0f, sideColumnTop.value,
+                        splitSideWidth.value, (sideColumnHeight - splitLensActionsHeight - 12.dp).coerceAtLeast(0.dp).value) else null,
+                    railRowTop = if (stackedSplit) splitPanelTop.value else null,
+                    sideInset = splitPreviewInset,
                     controlsAlpha = quickMenuControlsAlpha,
                     loupe = loupeBounds,
                     videoControls = recordingInProgress,
@@ -1364,7 +1421,7 @@ fun CameraScreen(
                             translationX = 12.dp.toPx() * (1f - panoramaAnimation.progress) * if (controlRotationDegrees == 90f) -1f else 1f
                         }.background(CameraColors.MenuBackground))
                 val menuBottom = actionsHeight + captureLift + 16.dp
-                val quickMenuBottom = maxOf(dockHeight + captureLift + 16.dp,
+                val quickMenuBottom = maxOf(drawnDockHeight + captureLift + 16.dp,
                     lensControlsTop?.let { chromeHeight - it + 8.dp } ?: 0.dp)
                 val menuTop = if (landscape) 16.dp else if (videoState.busy && controlRotationDegrees == 0f)
                     maxOf(56.dp, viewport.top.dp) + videoOutputHeight + 16.dp else 64.dp
@@ -1484,7 +1541,7 @@ fun CameraScreen(
                 GuideTransition(visibleCameraGuide) { (displayedGuide, displayedMenuOpen) ->
                     CameraGuideOverlay(
                         step = displayedGuide,
-                        dockHeight = dockHeight,
+                        dockHeight = drawnDockHeight,
                         captureLift = captureLift,
                         actionsHeight = actionsHeight,
                         targetBounds = guideTargets[when (displayedGuide) {
@@ -2789,3 +2846,6 @@ fun UnspektrawesomeTheme(rotation: Float = 0f, content: @Composable () -> Unit) 
         } },
     )
 }
+
+// Space the top toolbar keeps free above the side control columns of a wide screen.
+private val SPLIT_TOOLBAR_HEIGHT = 64.dp

@@ -20,6 +20,7 @@ struct Layout {
     float noiseS = 0.f;
     float noiseO = 0.f;
     float motion = .5f;    // 0 tolerant, 1 strict
+    float outputScale = 1.f; // the output stores levels at this multiple of the input range
 };
 
 struct Frame {

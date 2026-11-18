@@ -53,6 +53,13 @@ internal fun CameraPreviewOverlays(
     rotation: Float,
     railHeight: Dp,
     lenses: @Composable () -> Unit,
+    // Where the lens buttons go when they sit outside the viewfinder, as in the split layout.
+    lensArea: CameraArea? = null,
+    // Width of the control columns on both sides of the viewfinder, kept free of the side rails.
+    sideInset: Dp = 0.dp,
+    // Top of a row below the viewfinder where the dials sit side by side: EV and AE balance on the left,
+    // shadows and highlight compression on the right. Null keeps them stacked at the viewfinder's edges.
+    railRowTop: Float? = null,
     exposure: (@Composable () -> Unit)?,
     highlights: (@Composable () -> Unit)?,
     banner: CameraArea?,
@@ -141,6 +148,8 @@ internal fun CameraPreviewOverlays(
             if (area.width > 0f && area.height > 0f) obstacles += area
         }
         val controls = measurables.associateBy { it.layoutId }
+        val inset = sideInset.toPx()
+        val innerWidth = (width - inset * 2).roundToInt().coerceAtLeast(0)
         val previewLeft = maxOf(0f, viewport.left.dp.toPx()) + 10.dp.toPx()
         val previewRight = minOf(width.toFloat(), (viewport.left + viewport.width).dp.toPx()) - 10.dp.toPx()
         val previewTop = maxOf(56.dp.toPx(), viewport.top.dp.toPx()) + gap
@@ -191,7 +200,7 @@ internal fun CameraPreviewOverlays(
         val centerWidth = (width - 144.dp.roundToPx()).coerceAtLeast(48.dp.roundToPx())
         val shutter = controls["shutter"]?.measure(Constraints(
             maxWidth = (if (landscape) centerWidth - 48.dp.roundToPx() - gap.roundToInt()
-                else width - 24.dp.roundToPx()).coerceAtLeast(0),
+                else innerWidth - 24.dp.roundToPx()).coerceAtLeast(0),
             maxHeight = (if (landscape) controlHeight else controlHeight - 48.dp.roundToPx() - gap.roundToInt()).coerceAtLeast(0)))
         val shutterGap = (gap * shutterSpacing).roundToInt()
         val belowLenses = if (!landscape && shutter != null) shutter.height + shutterGap else 0
@@ -200,7 +209,9 @@ internal fun CameraPreviewOverlays(
         val betweenRails = width - railEdge * 2
         val lensWidth = if (landscape) minOf(centerWidth,
             (betweenRails - besideLenses - 6.dp.toPx() * shutterSpacing).roundToInt().coerceAtLeast(0)) else centerWidth
-        val lensControls = controls.getValue("lenses").measure(Constraints(
+        val lensControls = controls.getValue("lenses").measure(if (lensArea != null) Constraints(
+            maxWidth = lensArea.width.dp.roundToPx().coerceAtLeast(0),
+            maxHeight = lensArea.height.dp.roundToPx().coerceAtLeast(0)) else Constraints(
             maxWidth = lensWidth,
             maxHeight = (controlHeight - belowLenses).coerceAtLeast(0)))
         val centeredLensLeft = (width - lensControls.width) / 2f
@@ -211,11 +222,14 @@ internal fun CameraPreviewOverlays(
             else minOf(gap * shutterSpacing, (besideSpace - besideLenses).coerceAtLeast(0f) / 2)
         val lensLeft = if (landscape && shutter != null) maxOf(centeredLensLeft, railEdge + besideLenses + sideGap * 2)
             else centeredLensLeft
-        placeControl(lensControls, lensLeft, controlBottom - belowLenses)
+        if (lensArea != null) placeControl(lensControls,
+            lensArea.left.dp.toPx() + (lensArea.width.dp.toPx() - lensControls.width) / 2,
+            lensArea.top.dp.toPx() + (lensArea.height.dp.toPx() + lensControls.height) / 2)
+        else placeControl(lensControls, lensLeft, controlBottom - belowLenses)
         // In landscape the panel sits beside the lens buttons. While they are hidden, it moves next to the
         // side rails at the screen edge that is the bottom of the turned phone.
         placeControl(shutter, when {
-            landscape && lensControls.width > 0 -> lensLeft - besideLenses - sideGap
+            landscape && lensControls.width > 0 && lensArea == null -> lensLeft - besideLenses - sideGap
             landscape && rotation == 90f -> railEdge + gap
             landscape -> width - railEdge - gap - (shutter?.width ?: 0)
             else -> (width - (shutter?.width ?: 0)) / 2f
@@ -230,7 +244,7 @@ internal fun CameraPreviewOverlays(
         if (videoControls) {
             var railBottom = controlBottom - belowLenses
             if (lensControls.height > 0) railBottom -= lensControls.height + gap
-            val availableWidth = (width - 24.dp.roundToPx()).coerceAtLeast(0)
+            val availableWidth = (innerWidth - 24.dp.roundToPx()).coerceAtLeast(0)
             for (row in recordingRows.asReversed()) {
                 val bothExpanded = row.size == 2 && row.all { controls.containsKey(it.first) && it.second in expandedSliders }
                 for ((index, entry) in row.withIndex()) {
@@ -245,10 +259,28 @@ internal fun CameraPreviewOverlays(
                     val rail = measurable.measure(Constraints(
                         maxWidth = minOf(railHeight.roundToPx(), availableLength), maxHeight = 42.dp.roundToPx()))
                     val atLeft = if (landscape) rotation == 90f else index == 0
-                    placeControl(rail, if (atLeft) 12.dp.toPx() else width - 12.dp.toPx() - rail.width, railBottom)
+                    placeControl(rail, if (atLeft) inset + 12.dp.toPx() else width - inset - 12.dp.toPx() - rail.width, railBottom)
                 }
                 railBottom -= 42.dp.toPx() + gap
             }
+        } else if (railRowTop != null) {
+            val rowConstraints = Constraints(maxWidth = (innerWidth / 4).coerceAtLeast(0), maxHeight = railHeight.roundToPx())
+            val rails = listOf("exposure" to PreviewSlider.EXPOSURE, "aeBalance" to PreviewSlider.AE_BALANCE,
+                "highlights" to PreviewSlider.HIGHLIGHTS, "shadows" to PreviewSlider.SHADOWS)
+                .associate { (name, slider) -> name to controls[name]?.measure(rowConstraints)?.let { it to slider } }
+            // Opened dials grow upward from the row, over the viewfinder.
+            val rowHeight = rails.values.filterNotNull().filter { it.second !in expandedSliders }
+                .minOfOrNull { it.first.height } ?: 48.dp.roundToPx()
+            val rowBottom = railRowTop.dp.toPx() + rowHeight
+            val exposureRail = rails["exposure"]?.first
+            val highlightRail = rails["highlights"]?.first
+            val left = inset + 12.dp.toPx()
+            val right = width - inset - 12.dp.toPx()
+            placeControl(exposureRail, left, rowBottom)
+            placeControl(rails["aeBalance"]?.first, left + (exposureRail?.width ?: 0) + gap, rowBottom)
+            placeControl(highlightRail, right - (highlightRail?.width ?: 0), rowBottom)
+            val shadowRail = rails["shadows"]?.first
+            placeControl(shadowRail, right - (highlightRail?.width ?: 0) - gap - (shadowRail?.width ?: 0), rowBottom)
         } else {
             val exposureConstraints = railConstraints(rotation == 0f || rotation == -90f, controls.containsKey("aeBalance"))
             val exposureRail = controls["exposure"]?.measure(exposureConstraints)
@@ -256,10 +288,10 @@ internal fun CameraPreviewOverlays(
             val toneConstraints = railConstraints(rotation == 0f || rotation == 90f, controls.containsKey("shadows"))
             val highlightRail = controls["highlights"]?.measure(toneConstraints)
             val shadowRail = controls["shadows"]?.measure(toneConstraints)
-            placeControl(exposureRail, 12.dp.toPx(), controlBottom - belowLenses)
-            placeControl(balanceRail, 12.dp.toPx(), controlBottom - belowLenses - (exposureRail?.height ?: 0) - gap)
-            placeControl(highlightRail, width - 12.dp.toPx() - (highlightRail?.width ?: 0), controlBottom - belowLenses)
-            placeControl(shadowRail, width - 12.dp.toPx() - (shadowRail?.width ?: 0),
+            placeControl(exposureRail, inset + 12.dp.toPx(), controlBottom - belowLenses)
+            placeControl(balanceRail, inset + 12.dp.toPx(), controlBottom - belowLenses - (exposureRail?.height ?: 0) - gap)
+            placeControl(highlightRail, width - inset - 12.dp.toPx() - (highlightRail?.width ?: 0), controlBottom - belowLenses)
+            placeControl(shadowRail, width - inset - 12.dp.toPx() - (shadowRail?.width ?: 0),
                 controlBottom - belowLenses - (highlightRail?.height ?: 0) - gap)
         }
         if (statusAboveControls && videoArea != null) {

@@ -109,7 +109,8 @@ private fun LensProfileSettingsContent(
     CameraPageTransition(editingId, Modifier.fillMaxSize(), order = { if (it == null) 0 else 1 }) { targetId ->
     val editing = preferences.lensProfiles.firstOrNull { it.id == targetId }
     if (editing != null && sensors[editing.sensorId] != null) {
-        LensProfileEditor(editing, sensors.getValue(editing.sensorId).profile, rawImportCapabilities,
+        val rail = lensRailPreview(preferences, editing, profiles.flatMap { it.profile.paths }, phoneLensRailWidth(), renderer::text)
+        LensProfileEditor(editing, sensors.getValue(editing.sensorId).profile, rawImportCapabilities, rail,
             isActive = isActive && editingId == targetId, onCheckLensFrameRates = onCheckLensFrameRates,
             onClose = { editingId = null }, onChange = { updated ->
                 val next = currentPreferences.copy(lensProfiles = currentPreferences.lensProfiles.map {
@@ -132,7 +133,7 @@ private fun LensProfileSettingsContent(
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     LensSwitcherStage(orderedProfiles.map { profile ->
                         LensSwitcherEntry(profile.displayName,
-                            renderer.text(pathOf(profile)?.let(profile.focalLength::label) ?: "Lens"), profile.enabled,
+                            profile.button.customLabel ?: renderer.text(pathOf(profile)?.let(profile.focalLength::label) ?: "Lens"), profile.enabled,
                             LensProfiles.available(profile, allPaths), preferences.activeLensProfileId == profile.id,
                             preferences.defaultLensProfileId(mode) == profile.id)
                     })
@@ -299,6 +300,7 @@ private fun LensProfileEditor(
     profile: LensProfile,
     sensor: PhysicalSensorProfile,
     capabilities: Map<RawImportStreamKey, RawImportCapability>,
+    rail: LensRailPreview,
     onClose: () -> Unit,
     onChange: (LensProfile) -> Unit,
     isActive: Boolean = true,
@@ -427,7 +429,7 @@ private fun LensProfileEditor(
         } else VideoStabilizationControls(profile.videoStabilization, photoOisSupported) { stabilization ->
             update { it.copy(videoStabilization = stabilization) }
         }
-        LensCaptureControls(camera, profile, onCheckLensFrameRates, isActive = isActive) { updated -> update { updated } }
+        LensCaptureControls(camera, profile, rail, onCheckLensFrameRates, isActive = isActive) { updated -> update { updated } }
         LensSectionHeading(7, "Preview")
         val decodedStream = profile.rawLayoutOverride.stream(stream)
         ViewfinderResolutionField(decodedStream,

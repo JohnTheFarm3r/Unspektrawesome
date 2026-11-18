@@ -5,7 +5,6 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioFormat
-import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 
@@ -27,16 +26,16 @@ enum class MicrophoneProcessing(val label: String, val detail: String, val sourc
         /**
          * The choices this phone accepts for 48 kHz mono recording, or null without microphone access.
          * Android only reports whether a source opens; some phones apply the same processing to several of them.
+         * Unprocessed is offered whenever it opens: custom system builds often leave the system's unprocessed
+         * support flag off even though the phone's audio drivers provide an unprocessed recording path.
          */
         @SuppressLint("MissingPermission")
         fun available(context: Context): Set<MicrophoneProcessing>? {
             if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return null
-            val unprocessed = context.getSystemService(AudioManager::class.java)
-                ?.getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED) == "true"
             val minimum = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
             if (minimum <= 0) return emptySet()
             return entries.filterTo(linkedSetOf()) { choice ->
-                (choice != UNPROCESSED || unprocessed) && runCatching {
+                runCatching {
                     val record = AudioRecord.Builder().setAudioSource(choice.source)
                         .setAudioFormat(AudioFormat.Builder().setSampleRate(SAMPLE_RATE)
                             .setChannelMask(AudioFormat.CHANNEL_IN_MONO).setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())

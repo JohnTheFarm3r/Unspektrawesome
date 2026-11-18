@@ -45,6 +45,7 @@ data class LensProfile(
     val rawSession: com.unspektrawesome.camera.session.RawSessionConfiguration? = null,
     val mode: LensProfileMode = LensProfileMode.PHOTO,
     val videoStabilization: VideoStabilization = VideoStabilization(),
+    val button: LensButtonStyle = LensButtonStyle(),
 ) {
     val focalGroup: String get() = "$sensorId:${focalLength.factor}"
     val managedByDiscovery: Boolean get() = autoManaged && verification != null
@@ -230,7 +231,9 @@ object LensProfiles {
         var name = "${original.name} copy"
         var index = 2
         while (name in names) name = "${original.name} copy ${index++}"
-        val copy = original.copy(id = UUID.randomUUID().toString(), name = name, verification = null, autoManaged = false)
+        // The copy keeps the lens scan results, such as the measured ISO ceiling and the camera session that was
+        // verified for this stream, but becomes a user profile that a later scan does not replace.
+        val copy = original.copy(id = UUID.randomUUID().toString(), name = name, autoManaged = false)
         val profiles = preferences.lensProfiles.toMutableList()
         profiles.add(profiles.indexOf(original) + 1, copy)
         return preferences.copy(lensProfiles = profiles)
@@ -286,6 +289,7 @@ object LensProfiles {
             put("focalLength", p.focalLength.toJson())
             put("photoOisEnabled", p.photoOisEnabled)
             put("videoStabilization", p.videoStabilization.toJson())
+            put("button", p.button.toJson())
             put("aeBalance", AeBalance.normalize(p.aeBalance))
             put("vendorOverrides", p.vendorOverrides.toJson())
             put("rawSession", p.rawSession?.let(RawSessionSettings::encode))
@@ -333,6 +337,7 @@ object LensProfiles {
                 focalLength = LensFocalLengthSettings.fromJson(p.optJSONObject("focalLength")),
                 photoOisEnabled = p.optBoolean("photoOisEnabled", true),
                 videoStabilization = VideoStabilization.fromJson(p.optJSONObject("videoStabilization")),
+                button = LensButtonStyle.fromJson(p.optJSONObject("button")),
                 rawSession = RawSessionSettings.decode(p.optJSONObject("rawSession")),
                 mode = LensProfileMode.entries.firstOrNull { it.name == p.optString("mode") } ?: LensProfileMode.PHOTO)
         }.getOrNull() }.filter { it.id.isNotBlank() && it.sensorId.isNotBlank() && it.name.isNotBlank() }.distinctBy { it.id }

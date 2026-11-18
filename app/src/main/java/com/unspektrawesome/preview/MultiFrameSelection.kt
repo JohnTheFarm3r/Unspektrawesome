@@ -6,7 +6,7 @@ import kotlin.math.ln
 /** Chooses which buffered frames can be merged with the newest one. */
 internal object MultiFrameSelection {
     const val MIN_FRAMES = 2
-    const val MAX_FRAMES = 15
+    const val MAX_FRAMES = 30
     const val DEFAULT_FRAMES = 8
 
     data class Candidate(
