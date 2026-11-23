@@ -97,8 +97,8 @@ android {
         applicationId = "com.unspektrawesome"
         minSdk = 30
         targetSdk = 37
-        versionCode = 34
-        versionName = "1.3.3"
+        versionCode = 35
+        versionName = "1.3.4"
         buildConfigField("boolean", "UPDATES_ENABLED", "false")
         buildConfigField("boolean", "VULKAN_VALIDATION", "false")
         manifestPlaceholders["distributionChannel"] = "development"

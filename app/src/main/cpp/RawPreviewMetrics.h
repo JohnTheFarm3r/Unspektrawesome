@@ -99,7 +99,7 @@ public:
                 mask_ = bits >= 64 ? UINT64_MAX : (uint64_t{1} << bits) - 1;
                 VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
                 info.queryType = VK_QUERY_TYPE_TIMESTAMP;
-                info.queryCount = 6;
+                info.queryCount = kQueries;
                 if (vkCreateQueryPool(device, &info, nullptr, &pool_) != VK_SUCCESS)
                     pool_ = VK_NULL_HANDLE;
             }
@@ -113,7 +113,7 @@ public:
     void beginGpu(VkCommandBuffer command)
     {
         if (active_ && pool_ != VK_NULL_HANDLE) {
-            vkCmdResetQueryPool(command, pool_, 0, 6);
+            vkCmdResetQueryPool(command, pool_, 0, kQueries);
             vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pool_, 0);
         }
     }
@@ -123,6 +123,12 @@ public:
     void endRawGpu(VkCommandBuffer command) { timestamp(command, 2); }
     void endChromaGpu(VkCommandBuffer command) { timestamp(command, 5); }
     void endFrameGpu(VkCommandBuffer command) { timestamp(command, 3); }
+    void beginPresentGpu(VkCommandBuffer command)
+    {
+        if (active_ && pool_ != VK_NULL_HANDLE)
+            vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pool_, 6);
+    }
+    void endPresentGpu(VkCommandBuffer command) { timestamp(command, 7); }
 
     void submitted(VkDevice device, const RawPreviewCpuTiming& cpu)
     {
@@ -168,11 +174,14 @@ private:
     {
         if (!pending_) return -1.0;
         pending_ = false;
-        std::array<uint64_t, 12> queries{};
-        const bool available = pool_ != VK_NULL_HANDLE &&
-            vkGetQueryPoolResults(device, pool_, 0, 6, sizeof(queries), queries.data(),
-                2 * sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) == VK_SUCCESS &&
+        std::array<uint64_t, kQueries * 2> queries{};
+        VkResult queried = pool_ != VK_NULL_HANDLE ?
+            vkGetQueryPoolResults(device, pool_, 0, kQueries, sizeof(queries), queries.data(),
+                2 * sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) : VK_ERROR_UNKNOWN;
+        // The presentation stamps are missing on frames that only accumulate RAW data.
+        const bool available = (queried == VK_SUCCESS || queried == VK_NOT_READY) &&
             queries[1] && queries[3] && queries[5] && queries[7] && queries[9] && queries[11];
+        const bool presentAvailable = available && queries[13] && queries[15];
         const double hostElapsedMs = std::chrono::duration<double, std::milli>(
             RawPreviewCpuTiming::Clock::now() - cpu_.started).count();
         const auto elapsed = [&](size_t end) {
@@ -185,18 +194,26 @@ private:
         const double rawMs = elapsed(4) >= 0 && cpu_.cameraGpuMs >= 0 ? elapsed(4) + cpu_.cameraGpuMs : -1.0;
         const double spanMs = elapsed(6) >= 0 && cpu_.cameraGpuMs >= 0 ? elapsed(6) + cpu_.cameraGpuMs : -1.0;
         const double chromaMs = elapsed(10) >= 0 && elapsed(4) >= 0 ? elapsed(10) - elapsed(4) : -1.0;
+        const double presentStartMs = presentAvailable ? elapsed(12) : -1.0;
+        const double presentEndMs = presentAvailable ? elapsed(14) : -1.0;
+        const double processingMs = elapsed(4) >= 0 && elapsed(8) >= 0 ? elapsed(4) - elapsed(8) : -1.0;
+        const double gapMs = presentStartMs >= 0 && elapsed(10) >= 0 ? presentStartMs - elapsed(10) : -1.0;
+        const double presentMs = presentEndMs >= 0 && presentStartMs >= 0 ? presentEndMs - presentStartMs : -1.0;
+        const double videoMs = presentEndMs >= 0 && elapsed(6) >= 0 ? elapsed(6) - presentEndMs : -1.0;
         if (logging_) log(
             "frame reuse=%d tiled=%d spektra=%d raster=%d texture=%d unpack=%d prefilter=%d raw_w=%d raw_h=%d width=%d height=%d format=%d cfa=%d map_w=%u map_h=%u remosaic_w=%u remosaic_h=%u "
-            "gpu_available=%d clock_disjoint=%d remosaic_gpu_ms=%.6f raw_gpu_ms=%.6f gpu_span_ms=%.6f prepare_gpu_ms=%.6f cpu_wall_ms=%.3f fence_ms=%.3f upload_ms=%.3f acquire_ms=%.3f spektra_cpu_ms=%.3f present_cpu_ms=%.3f camera_gpu_ms=%.6f chroma=%d chroma_gpu_ms=%.6f",
+            "gpu_available=%d clock_disjoint=%d remosaic_gpu_ms=%.6f raw_gpu_ms=%.6f gpu_span_ms=%.6f prepare_gpu_ms=%.6f cpu_wall_ms=%.3f fence_ms=%.3f upload_ms=%.3f acquire_ms=%.3f spektra_cpu_ms=%.3f present_cpu_ms=%.3f camera_gpu_ms=%.6f chroma=%d chroma_gpu_ms=%.6f "
+            "processing_gpu_ms=%.6f raw_to_present_gap_ms=%.6f present_gpu_ms=%.6f video_gpu_ms=%.6f",
             reuse_, tiled_, spektra_, raster_, texture_, unpack_, prefilter_, dimensions_[0], dimensions_[1], dimensions_[2], dimensions_[3],
             format_, cfa_, mapWidth_, mapHeight_, remosaicWidth_, remosaicHeight_,
             available, available && (rawMs < 0 || spanMs < 0), remosaicMs, rawMs, spanMs,
             prepareMs >= 0 && remosaicMs >= 0 ? prepareMs - remosaicMs : -1.0,
             cpu_.wallMs, cpu_.fenceMs, cpu_.uploadMs, cpu_.acquireMs, cpu_.spektraMs, cpu_.presentMs, cpu_.cameraGpuMs,
-            chroma_, chromaMs);
+            chroma_, chromaMs, processingMs, gapMs, presentMs, videoMs);
         return rawMs >= 0 ? spanMs : -1.0;
     }
 
+    static constexpr uint32_t kQueries = 8;
     VkQueryPool pool_ = VK_NULL_HANDLE;
     bool attempted_ = false;
     bool active_ = false;

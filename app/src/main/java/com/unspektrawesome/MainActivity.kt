@@ -313,6 +313,13 @@ open class MainActivity : ComponentActivity() {
             val captureStatus by previewController.captureStatus.collectAsState()
             val videoState by previewController.videoState.collectAsState()
             LaunchedEffect(videoState.enabled) { showLensProfiles(videoState.enabled) }
+            val recordingFrameRate = videoState.frameRate.takeIf {
+                videoState.phase == com.unspektrawesome.video.VideoPhase.STARTING ||
+                    videoState.phase == com.unspektrawesome.video.VideoPhase.RECORDING
+            }
+            LaunchedEffect(recordingFrameRate) {
+                com.unspektrawesome.video.RecordingDisplayRate.apply(window, recordingFrameRate)
+            }
             val burstState by previewController.burstStatus.collectAsState()
             val panoramaState by previewController.panoramaState.collectAsState()
             val panoramaExport by previewController.panoramaExportRequest.collectAsState()

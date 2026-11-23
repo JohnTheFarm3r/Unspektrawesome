@@ -23,6 +23,9 @@ private open class AndroidRenderHintSession(protected val session: PerformanceHi
     override fun updateTarget(durationNs: Long) = session.updateTargetWorkDuration(durationNs)
     override fun reportCpu(durationNs: Long) = session.reportActualWorkDuration(durationNs)
     override fun reportGpu(startedNs: Long, durationNs: Long) = Unit
+    override fun preferPowerEfficiency(enabled: Boolean) {
+        if (Build.VERSION.SDK_INT >= 35) session.setPreferPowerEfficiency(enabled)
+    }
     override fun close() = session.close()
 
     companion object {

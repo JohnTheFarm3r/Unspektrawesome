@@ -65,8 +65,13 @@ internal class TelemetryGeometry(
     fun rawNormalizedIntrinsics(k: FloatArray): DoubleArray {
         require(k.size == 5 && k.all(Float::isFinite) && k[0] > 0 && k[1] > 0)
         val (left, top, width, height) = rawSensorCrop
-        return doubleArrayOf(k[0] / width, k[4] / width, (preCorrection[0] + k[2] - left) / width,
-            0.0, k[1] / height, (preCorrection[1] + k[3] - top) / height, 0.0, 0.0, 1.0)
+        // No lens has its optical center on the array's corner. Some cameras report (0, 0) when
+        // they have no calibrated center, so use the middle of the pre-correction array instead.
+        val missingCenter = k[2] == 0f && k[3] == 0f
+        val centerX = if (missingCenter) (preCorrection[2] - preCorrection[0]) * .5f else k[2]
+        val centerY = if (missingCenter) (preCorrection[3] - preCorrection[1]) * .5f else k[3]
+        return doubleArrayOf(k[0] / width, k[4] / width, (preCorrection[0] + centerX - left) / width,
+            0.0, k[1] / height, (preCorrection[1] + centerY - top) / height, 0.0, 0.0, 1.0)
     }
 
     val rawReadoutStart get() = (active[1] - rawSensorCrop[1]) / rawSensorCrop[3]

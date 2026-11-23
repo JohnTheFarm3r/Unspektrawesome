@@ -17,6 +17,27 @@ layout(std430, binding = SPEKTRA_FOUR_STAGE_LUT_BINDING) buffer FourStageLut { v
 layout(std430, binding = SPEKTRA_FOUR_STAGE_LUT_BINDING) readonly buffer FourStageLut { vec4 fourStageLutData[]; };
 #endif
 
+// The first table entries hold per-frame constants. Shaders that read them for every pixel can
+// define SPEKTRA_FOUR_STAGE_HEADER_SHARED and call loadFourStageShared() once in uniform control
+// flow before any early return. Repeated buffer reads are slow on some GPUs.
+const uint kFourStageHeaderCount = 8u;
+#if defined(SPEKTRA_FOUR_STAGE_HEADER_SHARED)
+shared vec4 fourStageHeaderShared[kFourStageHeaderCount];
+#define fourStageHeader(index) fourStageHeaderShared[index]
+#else
+#define fourStageHeader(index) fourStageLutData[index]
+#endif
+#define fourStageCurve(index) fourStageLutData[SPEKTRA_FOUR_STAGE_DIR_CURVE_OFFSET + (index)]
+
+#if defined(SPEKTRA_FOUR_STAGE_HEADER_SHARED)
+void loadFourStageShared() {
+  if (gl_LocalInvocationIndex < kFourStageHeaderCount) {
+    fourStageHeaderShared[gl_LocalInvocationIndex] = fourStageLutData[gl_LocalInvocationIndex];
+  }
+  barrier();
+}
+#endif
+
 // ACEScct transports the camera's linear RGB into the input cube's bounded domain.
 vec3 fourStageEncodeInput(vec3 linearRgb) {
   const vec3 logarithmic = (log2(max(linearRgb, vec3(0.0078125))) + 9.72) / 17.52;
@@ -30,7 +51,7 @@ vec3 fourStageDecodeInput(vec3 code) {
 }
 
 vec2 fourStageLogRange(uint stage) {
-  return stage == 0u ? fourStageLutData[0].xy : fourStageLutData[0].zw;
+  return stage == 0u ? fourStageHeader(0).xy : fourStageHeader(0).zw;
 }
 
 vec3 fourStageEncodeLog(vec3 logExposure, uint stage) {
@@ -44,35 +65,34 @@ vec3 fourStageDecodeLog(vec3 code, uint stage) {
 }
 
 vec3 fourStageEncodeDensity(vec3 density) {
-  const vec3 minimum = fourStageLutData[1].xyz;
-  return clamp((density - minimum) / (fourStageLutData[2].xyz - minimum), vec3(0.0), vec3(1.0));
+  const vec3 minimum = fourStageHeader(1).xyz;
+  return clamp((density - minimum) / (fourStageHeader(2).xyz - minimum), vec3(0.0), vec3(1.0));
 }
 
 vec3 fourStageDecodeDensity(vec3 code) {
-  const vec3 minimum = fourStageLutData[1].xyz;
-  return code * (fourStageLutData[2].xyz - minimum) + minimum;
+  const vec3 minimum = fourStageHeader(1).xyz;
+  return code * (fourStageHeader(2).xyz - minimum) + minimum;
 }
 
 #if !defined(SPEKTRA_FOUR_STAGE_LUT_BUILD)
 float fourStageDirCurve(float logRaw, uint channel) {
-  const vec4 domain = fourStageLutData[3];
+  const vec4 domain = fourStageHeader(3);
   const uint count = uint(domain.x);
-  const uint base = SPEKTRA_FOUR_STAGE_DIR_CURVE_OFFSET;
   const float lookupRaw = logRaw * max(domain.w, 1.0e-6);
-  if (lookupRaw <= domain.y) return fourStageLutData[base][channel + 1u];
-  if (lookupRaw >= domain.z) return fourStageLutData[base + count - 1u][channel + 1u];
+  if (lookupRaw <= domain.y) return fourStageCurve(0u)[channel + 1u];
+  if (lookupRaw >= domain.z) return fourStageCurve(count - 1u)[channel + 1u];
   uint lo = min(uint((lookupRaw - domain.y) / (domain.z - domain.y) * float(count - 1u)), count - 2u);
   uint hi = lo + 1u;
-  if (fourStageLutData[base + lo].x > lookupRaw || fourStageLutData[base + hi].x < lookupRaw) {
+  if (fourStageCurve(lo).x > lookupRaw || fourStageCurve(hi).x < lookupRaw) {
     lo = 0u;
     hi = count - 1u;
     while (hi - lo > 1u) {
       const uint mid = (lo + hi) >> 1u;
-      if (fourStageLutData[base + mid].x <= lookupRaw) lo = mid;
+      if (fourStageCurve(mid).x <= lookupRaw) lo = mid;
       else hi = mid;
     }
   }
-  const vec4 a = fourStageLutData[base + lo], b = fourStageLutData[base + hi];
+  const vec4 a = fourStageCurve(lo), b = fourStageCurve(hi);
   const float t = clamp((lookupRaw - a.x) / (b.x - a.x), 0.0, 1.0);
   return mix(a[channel + 1u], b[channel + 1u], t);
 }
@@ -84,16 +104,16 @@ vec3 fourStageDirRegions(float logRaw) {
 }
 
 vec3 applyFourStageCouplers(vec3 logRaw, vec3 density) {
-  if (fourStageLutData[3].x == 0.0) return density;
-  const vec3 silver = fourStageLutData[4].w != 0.0
-    ? max(fourStageLutData[7].xyz - density, vec3(0.0)) : max(density, vec3(0.0));
-  vec3 corrected = logRaw - vec3(dot(silver, fourStageLutData[4].xyz),
-    dot(silver, fourStageLutData[5].xyz), dot(silver, fourStageLutData[6].xyz));
-  const bool experimental = fourStageLutData[7].w == 1.0;
-  const float activity = fourStageLutData[5].w;
+  if (fourStageHeader(3).x == 0.0) return density;
+  const vec3 silver = fourStageHeader(4).w != 0.0
+    ? max(fourStageHeader(7).xyz - density, vec3(0.0)) : max(density, vec3(0.0));
+  vec3 corrected = logRaw - vec3(dot(silver, fourStageHeader(4).xyz),
+    dot(silver, fourStageHeader(5).xyz), dot(silver, fourStageHeader(6).xyz));
+  const bool experimental = fourStageHeader(7).w == 1.0;
+  const float activity = fourStageHeader(5).w;
   const float squared = activity * abs(activity);
   if (experimental) {
-    corrected -= vec3(fourStageLutData[6].w);
+    corrected -= vec3(fourStageHeader(6).w);
     const float meanRaw = (corrected.r + corrected.g + corrected.b) / 3.0;
     const mat3 coupling = mat3(vec3(0.0, -0.015, 0.015), vec3(0.015, 0.0, -0.015), vec3(-0.015, 0.015, 0.0));
     corrected += activity * (coupling * (corrected - vec3(meanRaw)));

@@ -8,11 +8,44 @@
 layout(local_size_x = 16, local_size_y = 8) in;
 layout(set = 0, binding = 9, r16) uniform writeonly image2D unpackedRaw;
 
+void storeSample(ivec2 position, uint value, ivec2 end)
+{
+    ivec2 boundsEnd = frameGeometry.rawBounds.xy + frameGeometry.rawBounds.zw;
+    if (position.x < end.x && all(greaterThanEqual(position, frameGeometry.rawBounds.xy)) &&
+        all(lessThan(position, boundsEnd)))
+        imageStore(unpackedRaw, position, vec4(float(value) / 65535.0));
+}
+
 void main()
 {
-    ivec2 position = ivec2(gl_GlobalInvocationID.xy);
-    if (any(greaterThanEqual(position, rawParams.dimensions.xy))) return;
-    if (any(lessThan(position, frameGeometry.rawBounds.xy)) ||
-        any(greaterThanEqual(position, frameGeometry.rawBounds.xy + frameGeometry.rawBounds.zw))) return;
-    imageStore(unpackedRaw, position, vec4(float(rawIntegerAt(position)) / 65535.0));
+    // Only the sampled region plus a border is unpacked. The border covers the demosaic, the
+    // interpolation between sensor positions and the widest reduction filter. Each invocation
+    // handles four adjacent samples, which share their bytes in RAW10.
+    ivec2 dimensions = rawParams.dimensions.xy;
+    vec4 crop = frameGeometry.stabilization.x > 0.5 ? frameGeometry.stabilizationBounds : frameGeometry.sourceCrop;
+    vec2 outputSize = vec2((frameGeometry.transform.x & 1) != 0 ? rawParams.dimensions.wz : rawParams.dimensions.zw);
+    vec2 footprint = frameGeometry.sourceCrop.zw * vec2(dimensions) / max(outputSize, vec2(1.0));
+    int border = 4 + 2 * int(ceil(max(max(footprint.x, footprint.y), 1.0)));
+    ivec2 first = max(ivec2(floor(crop.xy * vec2(dimensions))) - border, ivec2(0)) & ~ivec2(3, 1);
+    ivec2 end = min(ivec2(ceil((crop.xy + crop.zw) * vec2(dimensions))) + border, dimensions);
+    ivec2 position = first + ivec2(int(gl_GlobalInvocationID.x) * 4, int(gl_GlobalInvocationID.y));
+    if (any(greaterThanEqual(position, end))) return;
+    if (UNSPEKTRA_INPUT_FORMAT == RAW_FORMAT_10) {
+        uint offset = uint(position.y * rawParams.layoutInfo.x) + uint(position.x >> 2) * 5u;
+        uint low = rawInput.words[offset >> 2u];
+        uint high = rawInput.words[(offset >> 2u) + 1u];
+        uint shift = (offset & 3u) * 8u;
+        // Five bytes: four high parts, then the packed low bits.
+        uint bytes = shift == 0u ? low : (low >> shift) | (high << (32u - shift));
+        uint lowBits = (high >> shift) & 255u;
+        for (int index = 0; index < 4; ++index) {
+            uint value = ((bytes >> uint(index * 8)) & 255u) * 4u + ((lowBits >> uint(index * 2)) & 3u);
+            storeSample(position + ivec2(index, 0), value, end);
+        }
+        return;
+    }
+    for (int index = 0; index < 4; ++index) {
+        ivec2 site = position + ivec2(index, 0);
+        if (site.x < end.x) storeSample(site, rawIntegerAt(site), end);
+    }
 }

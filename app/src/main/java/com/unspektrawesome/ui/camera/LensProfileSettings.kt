@@ -1,8 +1,10 @@
 package com.unspektrawesome.ui.camera
 
+import com.unspektrawesome.camera.session.OpticalStabilizationSupport
 import com.unspektrawesome.language.languageSemantics
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -112,6 +114,7 @@ private fun LensProfileSettingsContent(
         val rail = lensRailPreview(preferences, editing, profiles.flatMap { it.profile.paths }, phoneLensRailWidth(), renderer::text)
         LensProfileEditor(editing, sensors.getValue(editing.sensorId).profile, rawImportCapabilities, rail,
             isActive = isActive && editingId == targetId, onCheckLensFrameRates = onCheckLensFrameRates,
+            measuredIso = preferences.measuredIsoMax,
             onClose = { editingId = null }, onChange = { updated ->
                 val next = currentPreferences.copy(lensProfiles = currentPreferences.lensProfiles.map {
                     if (it.id == updated.id) updated else it
@@ -305,6 +308,7 @@ private fun LensProfileEditor(
     onChange: (LensProfile) -> Unit,
     isActive: Boolean = true,
     onCheckLensFrameRates: LensFrameRateCheck? = null,
+    measuredIso: Map<String, Int> = emptyMap(),
 ) {
     var name by rememberSaveable(profile.id) { mutableStateOf(profile.name) }
     var route by rememberSaveable(profile.id) { mutableStateOf(profile.routeId) }
@@ -318,15 +322,17 @@ private fun LensProfileEditor(
     val camera = sensor.paths.firstOrNull { it.route.routeId == route } ?: sensor.primary
     val context = LocalContext.current
     val renderer = LocalAppLanguage.current.renderer
-    val exposureBounds = remember(camera, profile.verification) { readExposureBounds(context, camera, profile) }
+    val exposureBounds = remember(camera, measuredIso, profile.verification) {
+        readExposureBounds(context, camera, maxOf(measuredIso[camera.route.routeId] ?: 0,
+            profile.verification?.takeIf { it.configuration.routeId == camera.route.routeId }?.isoMax ?: 0))
+    }
     val photoOisSupported = remember(context, camera) {
         runCatching {
             val manager = context.getSystemService(CameraManager::class.java)
             val selected = manager.getCameraCharacteristics(camera.route.characteristicsCameraId)
-            val modes = selected.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
-                ?: manager.getCameraCharacteristics(camera.route.openCameraId)
-                    .get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
-            modes?.contains(CameraCharacteristics.LENS_OPTICAL_STABILIZATION_MODE_ON) == true
+            val opened = if (camera.route.openCameraId == camera.route.characteristicsCameraId) selected
+                else manager.getCameraCharacteristics(camera.route.openCameraId)
+            OpticalStabilizationSupport.available(selected, opened, Build.MANUFACTURER)
         }.getOrDefault(false)
     }
     val outputs = (camera.rawOutputs + listOfNotNull(LensProfiles.resolveRawOutput(stream, camera, profile.rawSession))).distinct()

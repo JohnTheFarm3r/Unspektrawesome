@@ -19,6 +19,8 @@ internal object BurstContainer {
     private const val MAGIC = 0x5350454b54524133L
     private const val VERSION = 1
     private const val MAX_RECORD = 300 * 1024 * 1024
+    private const val COMPRESSION = "unspektra-raw"
+    private val SIGNATURE = byteArrayOf(83, 80, 82, 65, 87, 48, 48, 50)
 
     class Writer(private val context: Context, val capturedAt: Long) : AutoCloseable {
         val uri: Uri = BurstMedia.create(context, "Unspektrawesome-$capturedAt.unspektra")
@@ -50,7 +52,7 @@ internal object BurstContainer {
         fun finish(thumbnail: ByteArray, width: Int, height: Int): Uri {
             check(!complete && frames.length() > 0)
             val thumbnailOffset = record(ByteBuffer.wrap(thumbnail))
-            val index = JSONObject().put("compression", "blosc-zstd-bitshuffle").put("frames", frames).put("capturedAt", capturedAt)
+            val index = JSONObject().put("compression", COMPRESSION).put("frames", frames).put("capturedAt", capturedAt)
                 .put("width", width).put("height", height).put("thumbnail", thumbnailOffset)
             val offset = record(ByteBuffer.wrap(index.toString().toByteArray(Charsets.UTF_8)))
             channel.position(12)
@@ -96,7 +98,7 @@ internal object BurstContainer {
                 require(limit in 20..channel.size() - 12)
                 index = JSONObject(record(limit, 1024 * 1024, channel.size()).toString(Charsets.UTF_8))
                 require(limit + 12 + bytes(limit, 4).int == channel.size())
-                require(index.getString("compression") == "blosc-zstd-bitshuffle")
+                require(index.getString("compression") == COMPRESSION)
                 frames = index.getJSONArray("frames")
                 require(count in 1..BurstMemoryPlan.MAX_FRAMES)
                 var next = 20L
@@ -178,7 +180,7 @@ internal object BurstContainer {
     fun dimensions(encoded: ByteArray): Pair<Int, Int> {
         require(encoded.size >= 56)
         val bytes = ByteBuffer.wrap(encoded).order(ByteOrder.LITTLE_ENDIAN)
-        require(encoded.copyOfRange(0, 8).contentEquals(byteArrayOf(83, 80, 82, 65, 87, 48, 48, 49)))
+        require(encoded.copyOfRange(0, 8).contentEquals(SIGNATURE))
         val width = bytes.getInt(8); val height = bytes.getInt(12)
         require(width in 2..16384 && height in 2..16384 && width % 2 == 0 && height % 2 == 0 &&
             width.toLong() * height <= 128 * 1024 * 1024)

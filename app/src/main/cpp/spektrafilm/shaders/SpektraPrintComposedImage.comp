@@ -1,9 +1,10 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 #include "SpektraStorageBuffer.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+#define SPEKTRA_FOUR_STAGE_HEADER_SHARED 1
 #include "SpektraFourStageLut.glsl"
 
-layout(local_size_x = 8, local_size_y = 8) in;
 SPEKTRA_READ_BUFFER(0, vec4, 16u, filmDensity)
 layout(binding = SPEKTRA_COMPOSED_LUT_TEXTURE_BINDING) uniform sampler3D composedLutTexture;
 layout(push_constant) uniform CoreParams {
@@ -37,6 +38,7 @@ layout(push_constant) uniform CoreParams {
 #include "SpektraPreviewImageOutput.glsl"
 
 void main() {
+  loadFourStageShared();
   const uvec2 activeGid = gl_GlobalInvocationID.xy;
   if (any(greaterThanEqual(activeGid, uvec2(params.activeWidth, params.activeHeight)))) return;
   const uvec2 gid = activeGid + uvec2(params.activeOriginX, params.activeOriginY);

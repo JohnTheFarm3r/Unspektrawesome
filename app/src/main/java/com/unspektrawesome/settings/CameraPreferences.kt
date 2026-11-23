@@ -149,7 +149,13 @@ data class CameraPreferences(
     val defaultVideoLensProfileId: String? = null,
     /** Profile last used in the capture mode that is not in use. */
     val idleLensProfileId: String? = null,
+    /** Highest ISO the lens scan measured for each camera ID, kept apart from profiles so editing one cannot lose it. */
+    val measuredIsoMax: Map<String, Int> = emptyMap(),
 ) {
+    /** Highest measured ISO for [routeId], from the lens scan or from [profile]'s own scan result. */
+    fun measuredIsoMax(routeId: String, profile: LensProfile? = null): Int = maxOf(measuredIsoMax[routeId] ?: 0,
+        profile?.verification?.takeIf { it.configuration.routeId == routeId }?.isoMax ?: 0)
+
     /** Profile that [mode] starts with. */
     fun defaultLensProfileId(mode: LensProfileMode): String? =
         if (mode == LensProfileMode.VIDEO) defaultVideoLensProfileId else defaultLensProfileId
@@ -176,6 +182,10 @@ data class CameraPreferences(
         else -> VolumeButtonAction.SYSTEM_VOLUME
     }
 }
+
+/** Adds [measured] camera ID and ISO pairs to [saved], keeping the highest ISO per camera ID. */
+internal fun mergeMeasuredIso(saved: Map<String, Int>, measured: List<Pair<String, Int>>): Map<String, Int> =
+    measured.fold(saved) { map, (route, iso) -> if (iso > (map[route] ?: 0)) map + (route to iso) else map }
 
 data class RawStreamSelection(
     val format: RawFormat,
@@ -325,7 +335,8 @@ class CameraPreferencesStore(context: Context) {
             rawPreviewStreams = decodeRawStreams(
                 preferences.getString(KEY_RAW_PREVIEW_STREAMS, null),
             ),
-        )
+        ).let { it.copy(measuredIsoMax = mergeMeasuredIso(decodeMeasuredIso(preferences.getString(KEY_MEASURED_ISO_MAX, null)),
+            it.lensProfiles.mapNotNull { profile -> profile.verification?.let { proof -> proof.isoMax?.let { iso -> proof.configuration.routeId to iso } } })) }
         val resolved = value.copy(aeEngine = value.selectedAeEngine())
         if (preferences.getBoolean(KEY_MEDIAN_AE_DEFAULT_APPLIED, false)) return resolved
         val migrated = if (resolved.aeEngine == AeEngine.SPEKTRA && resolved.aeMeter == AeMeter.CENTER_WEIGHTED)
@@ -415,8 +426,14 @@ class CameraPreferencesStore(context: Context) {
             .putString(KEY_LENS_BUTTON_ROUTES, encodeLensButtons(value.lensButtonRouteIds))
             .putBoolean(KEY_LENS_BUTTON_MAPPING_CONFIGURED, value.lensButtonMappingConfigured)
             .putString(KEY_RAW_PREVIEW_STREAMS, encodeRawStreams(value.rawPreviewStreams))
+            .putString(KEY_MEASURED_ISO_MAX, JSONObject().apply { value.measuredIsoMax.forEach { (route, iso) -> put(route, iso) } }.toString())
             .apply()
     }
+
+    private fun decodeMeasuredIso(value: String?): Map<String, Int> = runCatching {
+        val root = JSONObject(value ?: return emptyMap())
+        buildMap { root.keys().forEach { route -> root.optInt(route).takeIf { route.isNotBlank() && it > 0 }?.let { put(route, it) } } }
+    }.getOrDefault(emptyMap())
 
     private fun loadVolumeAction(key: String, up: Boolean): VolumeButtonAction {
         val saved = preferences.getString(key, null)
@@ -500,6 +517,7 @@ class CameraPreferencesStore(context: Context) {
         const val KEY_LENS_BUTTON_ROUTES = "lens_button_route_ids"
         const val KEY_LENS_BUTTON_MAPPING_CONFIGURED = "lens_button_mapping_configured"
         const val KEY_RAW_PREVIEW_STREAMS = "raw_preview_streams"
+        const val KEY_MEASURED_ISO_MAX = "measured_iso_max"
         const val JSON_FORMAT = "format"
         const val JSON_WIDTH = "width"
         const val JSON_HEIGHT = "height"

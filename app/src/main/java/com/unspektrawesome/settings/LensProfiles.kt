@@ -121,6 +121,13 @@ object LensProfiles {
         return normalize(legacy.copy(lensProfiles = profiles, activeLensProfileId = active), cameras)
     }
 
+    /** Gives every camera ID of a lens the highest ISO measured through any of its IDs, since they share one sensor. */
+    fun shareMeasuredIso(measured: Map<String, Int>, lenses: List<Collection<String>>): Map<String, Int> =
+        lenses.fold(measured) { map, routes ->
+            val best = routes.maxOfOrNull { map[it] ?: 0 } ?: 0
+            if (best > 0) map + routes.associateWith { best } else map
+        }
+
     fun normalize(preferences: CameraPreferences, cameras: List<CameraDescriptor>): CameraPreferences {
         if (preferences.lensProfiles.isEmpty()) return preferences
         val groups = SensorProfileCatalog.group(cameras)
@@ -133,7 +140,8 @@ object LensProfiles {
             val camera = sensor.paths.firstOrNull { it.route.routeId == profile.routeId } ?: sensor.primary
             regrouped.copy(routeId = camera.route.routeId)
         }
-        val regrouped = preferences.copy(lensProfiles = profiles)
+        val regrouped = preferences.copy(lensProfiles = profiles,
+            measuredIsoMax = shareMeasuredIso(preferences.measuredIsoMax, groups.map { it.routeIds }))
         val mode = preferences.lensProfileMode
         val available = visible(regrouped, cameras, mode)
         val photoAvailable = if (mode == LensProfileMode.PHOTO) available else visible(regrouped, cameras, LensProfileMode.PHOTO)

@@ -25,6 +25,18 @@ internal object TelemetryCameraCompatibility {
             return TelemetryCalibration.Pose(floatArrayOf(c, -c, 0f, 0f),
                 selected.provenance + ":raw-axis-basis-correction")
         }
+        val identity = floatArrayOf(0f, 0f, 0f, 1f)
+        if (reference == 0 && lensFacing == 1 && sensorOrientation != null && sensorOrientation % 90 == 0 &&
+            characteristics != null && TelemetryCalibration.sameRotation(characteristics, identity) &&
+            selected.rotation != null && TelemetryCalibration.sameRotation(selected.rotation, identity)) {
+            // A rear camera can never share the gyro's axes: its optical axis faces away from the screen.
+            // An identity pose relative to the primary camera therefore carries no gyro relation, so use
+            // the standard rear mounting: a half turn about X, then the RAW sensor's own quarter turns.
+            // For a 90 degree sensor this equals the verified rear-camera correction above.
+            val half = Math.toRadians(-sensorOrientation.toDouble()) / 2
+            return TelemetryCalibration.Pose(floatArrayOf(kotlin.math.cos(half).toFloat(),
+                kotlin.math.sin(half).toFloat(), 0f, 0f), selected.provenance + ":rear-mounting-from-orientation")
+        }
         return selected
     }
 }

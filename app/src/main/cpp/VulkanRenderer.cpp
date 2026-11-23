@@ -58,6 +58,8 @@
 #include "preview_hr_apply_compute_spv.h"
 #include "post_chroma_denoise_compute_spv.h"
 #include "video_chroma_compute_spv.h"
+#include "stabilized_warp_compute_spv.h"
+#include "stabilized_warp_grid_compute_spv.h"
 #include "raw_hot_pixels_compute_spv.h"
 #include "raw_hot_pixels_image_compute_spv.h"
 #include "focus_peaking_compute_spv.h"
@@ -130,12 +132,36 @@
 #include "recording_native_input_1_0_compute_spv.h"
 #include "recording_native_input_1_1_compute_spv.h"
 #include "recording_native_input_1_2_compute_spv.h"
+#include "recording_native_compact_0_0_compute_spv.h"
+#include "recording_native_compact_0_1_compute_spv.h"
+#include "recording_native_compact_0_2_compute_spv.h"
+#include "recording_native_compact_1_0_compute_spv.h"
+#include "recording_native_compact_1_1_compute_spv.h"
+#include "recording_native_compact_1_2_compute_spv.h"
 #include "recording_native_compat_0_0_fixed_compute_spv.h"
 #include "recording_native_compat_0_1_fixed_compute_spv.h"
 #include "recording_native_compat_0_2_fixed_compute_spv.h"
 #include "recording_native_compat_1_0_fixed_compute_spv.h"
 #include "recording_native_compat_1_1_fixed_compute_spv.h"
 #include "recording_native_compat_1_2_fixed_compute_spv.h"
+#include "recording_native_compat_nodcp_0_0_fixed_compute_spv.h"
+#include "recording_native_compat_nodcp_0_1_fixed_compute_spv.h"
+#include "recording_native_compat_nodcp_0_2_fixed_compute_spv.h"
+#include "recording_native_compat_nodcp_1_0_fixed_compute_spv.h"
+#include "recording_native_compat_nodcp_1_1_fixed_compute_spv.h"
+#include "recording_native_compat_nodcp_1_2_fixed_compute_spv.h"
+#include "recording_native_compat_compact_0_0_fixed_compute_spv.h"
+#include "recording_native_compat_compact_0_1_fixed_compute_spv.h"
+#include "recording_native_compat_compact_0_2_fixed_compute_spv.h"
+#include "recording_native_compat_compact_1_0_fixed_compute_spv.h"
+#include "recording_native_compat_compact_1_1_fixed_compute_spv.h"
+#include "recording_native_compat_compact_1_2_fixed_compute_spv.h"
+#include "recording_native_compat_compact_nodcp_0_0_fixed_compute_spv.h"
+#include "recording_native_compat_compact_nodcp_0_1_fixed_compute_spv.h"
+#include "recording_native_compat_compact_nodcp_0_2_fixed_compute_spv.h"
+#include "recording_native_compat_compact_nodcp_1_0_fixed_compute_spv.h"
+#include "recording_native_compat_compact_nodcp_1_1_fixed_compute_spv.h"
+#include "recording_native_compat_compact_nodcp_1_2_fixed_compute_spv.h"
 #include "preview_bilinear_recording_meter_compute_spv.h"
 #include "preview_bilinear_light_0_0_compute_spv.h"
 #include "preview_bilinear_light_0_1_compute_spv.h"
@@ -1089,15 +1115,28 @@ public:
             const bool downsamplingRaw =
                 previewGeometry.sourceCrop[2] * rawParameters.dimensions[0] > sourceWidth * 1.0001f ||
                 previewGeometry.sourceCrop[3] * rawParameters.dimensions[1] > sourceHeight * 1.0001f;
-            const bool recordingDownsample = videoOutput_ && downsamplingRaw;
-            const bool recordingNative = videoOutput_ && !downsamplingRaw && !stabilized;
+            // The viewfinder uses the recording programs and film step at every size.
+            const bool recordingProcessing = true;
+            // On the lightweight path, live stabilization colours the sensor area it needs with the same
+            // recording programs, then moves the finished picture by the gyro correction. The filtered
+            // path's single-step warp with its prefiltered input measured faster than the extra picture.
+            bool stabilizedTwoStage = recordingProcessing && stabilized && !ispInput && lightweightRawPreview();
+#if !defined(NDEBUG)
+            char warpOverride[PROP_VALUE_MAX]{};
+            __system_property_get("debug.unspektra.stabilized_warp", warpOverride);
+            if (warpOverride[0] == '0') stabilizedTwoStage = false;
+#endif
+            const float footprint = std::max(
+                previewGeometry.sourceCrop[2] * rawParameters.dimensions[0] / sourceWidth,
+                previewGeometry.sourceCrop[3] * rawParameters.dimensions[1] / sourceHeight);
+            const bool recordingDownsample = recordingProcessing && downsamplingRaw;
+            const bool recordingNative = recordingProcessing && !downsamplingRaw && (!stabilized || stabilizedTwoStage);
+            frame.computeDescriptorsDirty |= frame.stabilizedStage.active != stabilizedTwoStage;
+            frame.stabilizedStage.active = stabilizedTwoStage;
             bool recordingTile = false;
             if (recordingDownsample) {
-                const float footprint = std::max(
-                    previewGeometry.sourceCrop[2] * rawParameters.dimensions[0] / sourceWidth,
-                    previewGeometry.sourceCrop[3] * rawParameters.dimensions[1] / sourceHeight);
                 // The shared-row tile holds every reduction up to 4x and avoids rereading sensor rows per pixel.
-                recordingTile = !stabilized && footprint <= 4.0f && recordingTileSupported();
+                recordingTile = (!stabilized || stabilizedTwoStage) && footprint <= 4.0f && recordingTileSupported();
 #if !defined(NDEBUG)
                 char recordingOverride[PROP_VALUE_MAX]{};
                 __system_property_get("debug.unspektra.recording_filter", recordingOverride);
@@ -1114,7 +1153,7 @@ public:
                 std::abs(previewGeometry.sourceCrop[2] * rawParameters.dimensions[0] - sourceWidth) < 0.01f &&
                 std::abs(previewGeometry.sourceCrop[3] * rawParameters.dimensions[1] - sourceHeight) < 0.01f;
             frame.reusePreviewShading = optimizedRawPreview() && !ispInput;
-            const bool stabilizationPrefilter = stabilized && videoOutput_ && !downsamplingRaw &&
+            const bool stabilizationPrefilter = stabilized && !stabilizedTwoStage && videoOutput_ && !downsamplingRaw &&
                 !lightweightRawPreview() && frame.reusePreviewShading;
 
             shadingBytes = calibrationTableBytes(spektraParameters, shadingTexels, shadingAddress, shadingCapacity);
@@ -1258,7 +1297,8 @@ public:
             timing.uploadMs = timing.since(uploadStarted);
             float dcpTableOffset = 0.0f;
             std::memcpy(&dcpTableOffset, spektraParameters.data() + 96, sizeof(float));
-            frame.rasterRaw = (!recordingNative || lightweightPreview) && frame.processingFramebuffer != VK_NULL_HANDLE &&
+            // Native recording uses the tiled compute program on every device.
+            frame.rasterRaw = !recordingNative && !stabilizedTwoStage && frame.processingFramebuffer != VK_NULL_HANDLE &&
                 frame.reusePreviewShading && processedRawKind(frame) == RawImportKind::Buffer &&
                 dcpTableOffset == 0.0f;
 #if !defined(NDEBUG)
@@ -1274,7 +1314,13 @@ public:
                 mhcDemosaic = demosaicOverride[0] == '1';
 #endif
             // Area filtering revisits a RAW neighborhood even at small output sizes.
-            frame.unpackRaw = (stabilizationPrefilter || (!videoOutput_ && !bayerCellRawPreview())) && frame.reusePreviewShading && unpackSupported_ && !frame.remosaic.previewSized &&
+            // The recording programs read the RAW frame directly, before and during recording alike.
+            // A gyro warp samples several sensor positions per pixel, so stabilized recording reads a
+            // decoded copy on every device; only the faster devices also prefilter it.
+            const bool stabilizedRecording = stabilized && !stabilizedTwoStage && videoOutput_ && !downsamplingRaw;
+            frame.unpackRaw = (stabilizationPrefilter || stabilizedRecording ||
+                (!videoOutput_ && !bayerCellRawPreview() && !recordingNative && !recordingDownsample)) &&
+                frame.reusePreviewShading && unpackSupported_ && !frame.remosaic.previewSized &&
                 processedRawKind(frame) == RawImportKind::Buffer &&
                 ((downsamplingRaw && !lightweightPreview) || static_cast<uint64_t>(processingWidth) * processingHeight * 4 >=
                     static_cast<uint64_t>(rawParameters.dimensions[0]) * rawParameters.dimensions[1]);
@@ -1381,11 +1427,12 @@ public:
             }
             if (recordingNative) {
                 frame.previewPipeline = nativeRecordingPipeline(processedRawKind(frame), rawParameters.layoutInfo[1],
-                    rawParameters.layoutInfo[2], frame.rasterRaw, frame.textureShading, !lightweightPreview, frame.bayerCells);
+                    rawParameters.layoutInfo[2], frame.rasterRaw, frame.textureShading, !lightweightPreview, frame.bayerCells,
+                    dcpTableOffset != 0.0f);
             } else if (recordingDownsample) {
                 frame.previewPipeline = recordingPipeline(processedRawKind(frame), rawParameters.layoutInfo[1],
                     rawParameters.layoutInfo[2], frame.rasterRaw, frame.textureShading, frame.recordingTile,
-                    !lightweightPreview, frame.bayerCells);
+                    !lightweightPreview, frame.bayerCells, dcpTableOffset != 0.0f);
             } else if (!frame.nativeRawQuad) {
                 frame.previewPipeline = previewPipeline(
                     processedRawKind(frame), frame.useSharedRawTile, frame.reusePreviewShading,
@@ -1435,7 +1482,27 @@ public:
             std::memcpy(static_cast<uint8_t*>(frame.spektraMapped) + 128, &previewRecovery, sizeof(float));
             std::memcpy(frame.geometryMapped, &previewGeometry,
                         static_cast<size_t>(kGeometryParametersSize));
+            if (frame.stabilizedStage.active)
+                prepareStabilizedStage(frame, previewGeometry, rawParameters, std::max(footprint, 1.0f), frame.recordingNative);
+            {
+                float directSdrValue = 0.0f;
+                std::memcpy(&directSdrValue, spektraParameters.data() + 64, sizeof(float));
+                float dcpOffset = 0.0f;
+                std::memcpy(&dcpOffset, spektraParameters.data() + 96, sizeof(float));
+                // The display-referred recording image is only read by the viewfinder and the video pass.
+                const bool compactEligible = videoOutput_ && !ispInput && frame.recordingNative && !frame.rasterRaw &&
+                    !frame.stabilizedStage.active &&
+                    averageCount <= 1 && directSdrValue > 0.5f && !frame.useSpektraOutput &&
+                    frame.videoChromaStrength <= 0.001f && frame.shadowStrength <= 0.001f &&
+                    !frame.previewHighlightRecovery && frame.focusStrength <= 0.5f;
+                const VkPipeline compact = compactEligible ? compactRecordingPipeline(processedRawKind(frame),
+                    rawParameters.layoutInfo[1], rawParameters.layoutInfo[2], frame.textureShading, !lightweightRawPreview(),
+                    frame.bayerCells, dcpOffset != 0.0f) : VK_NULL_HANDLE;
+                useCompactProcessing(frame, compact != VK_NULL_HANDLE);
+                if (compact != VK_NULL_HANDLE) frame.previewPipeline = compact;
+            }
             updateFrameDescriptors(frame);
+            if (frame.stabilizedStage.active) updateStabilizedDescriptors(frame);
             prepareFocusLoupe(frame, environment, packedRawBytesObject, rawUpload, cameraRawParameters, previewGeometry, ispInput);
             if (frame.shadowStrength > 0.001f) updateShadowDescriptors(frame, true);
             if (frame.previewHighlightRecovery) updatePreviewRecoveryDescriptors(frame);
@@ -1520,7 +1587,8 @@ public:
                         spektraFilmParameters.data(),
                         spektraFilmParameters.size(), timeSeconds, true,
                         &spektraError, frame.exposureZebra > 0.5f ? frame.exposureRange : VK_NULL_HANDLE,
-                        {colorView, frame.spektraView, processingImageGeneration_}, videoMode > 0.5f)) {
+                        {colorView, frame.spektraView, processingImageGeneration_},
+                        videoMode > 0.5f || frame.recordingNative || frame.recordingDownsample)) {
                     throw std::runtime_error(
                         std::string("SpektraFilm preview failed: ") +
                         (spektraError ? spektraError : "unknown native error"));
@@ -1637,6 +1705,14 @@ public:
             frameIndex_ = (frameIndex_ + 1) % kFramesInFlight;
             timing.wallMs = timing.since(timing.started);
             frame.metrics.submitted(device_, timing);
+            if (timing.enabled) __android_log_print(ANDROID_LOG_INFO, "RawPreviewPerf",
+                "path compact=%d unpack=%d cells=%d import=%d native=%d downsample=%d tile=%d stabilized=%d raster=%d lightweight=%d compat=%d hot=%d stage=%ux%u camera_rejections=%zu raw_rejections=%zu",
+                frame.compactActive, frame.unpackRaw, frame.bayerCells, static_cast<int>(frame.rawImportKind), frame.recordingNative, frame.recordingDownsample,
+                frame.recordingTile, previewGeometry.stabilization[0] > 0.5f, frame.rasterRaw, lightweightPreview,
+                compatibleRawPreview(), frame.hotPixels.enabled,
+                frame.stabilizedStage.active ? frame.stabilizedStage.width : 0u,
+                frame.stabilizedStage.active ? frame.stabilizedStage.height : 0u,
+                rejectedCameraImports_.size(), rejectedRawImports_.size());
             const char* inputDiagnostic = ispInput ? (frame.ispImageInput ? "Frame rendered from the ISP viewfinder hardware image" :
                     "Frame rendered from copied ISP viewfinder planes") :
                 frame.bayerCells ? "Frame rendered from EGL camera cells shared with Vulkan" :
@@ -2363,6 +2439,29 @@ private:
         PreviewTexture lensTexture;
         bool textureShading = false;
         PreviewTexture unpackedTexture;
+        // Live stabilization in two steps: the recording colour step fills a sensor-aligned
+        // picture of the area this frame needs, then a warp moves it by the gyro correction.
+        struct StabilizedStage {
+            bool active = false;
+            PreviewTexture source;
+            PreviewTexture grid;
+            VkBuffer rawUniform = VK_NULL_HANDLE;
+            VkDeviceMemory rawMemory = VK_NULL_HANDLE;
+            void* rawMapped = nullptr;
+            VkBuffer geometryUniform = VK_NULL_HANDLE;
+            VkDeviceMemory geometryMemory = VK_NULL_HANDLE;
+            void* geometryMapped = nullptr;
+            VkDescriptorPool pool = VK_NULL_HANDLE;
+            VkDescriptorSet colorSet = VK_NULL_HANDLE;
+            VkDescriptorSet warpSet = VK_NULL_HANDLE;
+            float origin[2]{};
+            float covered[2]{};
+            // Sensor-oriented size of the coloured area, and the upright size it is stored at.
+            uint32_t width = 0;
+            uint32_t height = 0;
+            uint32_t uprightWidth = 0;
+            uint32_t uprightHeight = 0;
+        } stabilizedStage;
         bool unpackRaw = false;
         bool bayerCells = false;
         bool recordingDownsample = false;
@@ -2414,6 +2513,13 @@ private:
         VkImageView processingView = VK_NULL_HANDLE;
         VkFramebuffer processingFramebuffer = VK_NULL_HANDLE;
         bool processingInitialized = false;
+        // While recording without later processing passes, the frame writes a 10-bit image instead
+        // of the half-float one. The inactive set is kept here and swapped back when needed.
+        bool compactActive = false;
+        VkImage stashedImage = VK_NULL_HANDLE;
+        VkDeviceMemory stashedMemory = VK_NULL_HANDLE;
+        VkImageView stashedView = VK_NULL_HANDLE;
+        bool stashedInitialized = false;
         VkImage spektraImage = VK_NULL_HANDLE;
         VkDeviceMemory spektraMemory = VK_NULL_HANDLE;
         VkImageView spektraView = VK_NULL_HANDLE;
@@ -2751,6 +2857,12 @@ private:
         const VkFormatFeatureFlags unpackFeatures = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
         unpackSupported_ = availableFeatures.shaderStorageImageExtendedFormats &&
             (unpackFormat.optimalTilingFeatures & unpackFeatures) == unpackFeatures;
+        VkFormatProperties compactFormat{};
+        vkGetPhysicalDeviceFormatProperties(physicalDevice_, VK_FORMAT_A2B10G10R10_UNORM_PACK32, &compactFormat);
+        const VkFormatFeatureFlags compactFeatures = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT;
+        compactProcessingSupported_ = availableFeatures.shaderStorageImageExtendedFormats &&
+            (compactFormat.optimalTilingFeatures & compactFeatures) == compactFeatures;
         VkPhysicalDeviceFeatures enabledFeatures{};
         // Avoid print shader faults on affected Arm drivers.
         enabledFeatures.robustBufferAccess = physicalProperties_.vendorID == 0x13b5u &&
@@ -3780,23 +3892,25 @@ private:
     }
 
     VkPipeline recordingPipeline(RawImportKind input, int32_t format, int32_t cfa,
-                                 bool& raster, bool& texture, bool& tiled, bool filtered, bool cells = false)
+                                 bool& raster, bool& texture, bool& tiled, bool filtered, bool cells = false,
+                                 bool dcp = true)
     {
         const bool compatible = compatibleRawPreview();
         const size_t source = cells ? 2u : input == RawImportKind::Image ? 1u : 0u;
         if (compatible) raster = texture = tiled = false;
         if (tiled) raster = false;
-        const size_t index = (tiled ? 576u : 0u) + (filtered ? 288u : 0u) + (compatible ? 144u : 0u) +
+        const size_t index = (dcp ? 0u : 1152u) + (tiled ? 576u : 0u) + (filtered ? 288u : 0u) + (compatible ? 144u : 0u) +
             (raster ? 72u : 0u) + (texture ? 36u : 0u) + source * 12u + format * 4u + cfa;
         if ((raster || tiled) && recordingPipelineRejected_[index]) {
             raster = tiled = false;
-            return recordingPipeline(input, format, cfa, raster, texture, tiled, filtered, cells);
+            return recordingPipeline(input, format, cfa, raster, texture, tiled, filtered, cells, dcp);
         }
         auto& pipeline = recordingPipelines_.at(index);
         if (pipeline) return pipeline;
-        const int32_t values[] = {format, cfa, texture ? 1 : 0};
-        const VkSpecializationMapEntry entries[] = {{1, 0, 4}, {2, 4, 4}, {4, 8, 4}};
-        const VkSpecializationInfo specialization{3, entries, sizeof(values), values};
+        // Without a colour profile the profile code is compiled out, which keeps registers free.
+        const int32_t values[] = {format, cfa, texture ? 1 : 0, dcp ? 1 : 0};
+        const VkSpecializationMapEntry entries[] = {{1, 0, 4}, {2, 4, 4}, {4, 8, 4}, {3, 12, 4}};
+        const VkSpecializationInfo specialization{4, entries, sizeof(values), values};
         const std::array<const uint32_t*, 9> programs{{kRecording0Spirv.data(), kRecording1Spirv.data(),
             kRecording2Spirv.data(), kRecordingCompat0Spirv.data(), kRecordingCompat1Spirv.data(), kRecordingCompat2Spirv.data(),
             kRecordingTile0Spirv.data(), kRecordingTile1Spirv.data(), kRecordingTile2Spirv.data()}};
@@ -3816,7 +3930,7 @@ private:
             recordingPipelineRejected_[index] = true;
             raster = tiled = false;
             recordNativeDiagnostic(ANDROID_LOG_WARN, "RawPreviewPerf", "Using recording compute: %s", error.what());
-            return recordingPipeline(input, format, cfa, raster, texture, tiled, filtered, cells);
+            return recordingPipeline(input, format, cfa, raster, texture, tiled, filtered, cells, dcp);
         }
         recordNativeDiagnostic(ANDROID_LOG_INFO, "RawPreviewPerf",
             "Recording tent: input=%zu format=%d cfa=%d raster=%d texture=%d tiled=%d compatible=%d filtered_device=%d",
@@ -3940,7 +4054,7 @@ private:
     }
 
     VkPipeline nativeRecordingPipeline(RawImportKind input, int32_t format, int32_t cfa,
-                                       bool& raster, bool texture, bool filtered, bool cells = false)
+                                       bool& raster, bool texture, bool filtered, bool cells = false, bool dcp = true)
     {
         const size_t source = cells ? 2u : input == RawImportKind::Image ? 1u : 0u;
         if (compatibleRawPreview() || filtered || source != 0u) raster = false;
@@ -3948,13 +4062,14 @@ private:
         if (nativeRecordingRasterRejected_.at(rasterIndex)) raster = false;
         const bool compatible = !raster && compatibleNativeRecordingCompute();
         if (compatible) texture = false;
-        const size_t index = (raster ? 288u : 0u) + (compatible ? 144u : 0u) + (filtered ? 72u : 0u) +
+        const size_t index = (dcp ? 0u : 576u) + (raster ? 288u : 0u) + (compatible ? 144u : 0u) + (filtered ? 72u : 0u) +
             (texture ? 36u : 0u) + source * 12u + format * 4u + cfa;
         auto& pipeline = nativeRecordingPipelines_.at(index);
         if (pipeline) return pipeline;
-        const int32_t values[] = {format, cfa, texture ? 1 : 0};
-        const VkSpecializationMapEntry entries[] = {{1, 0, 4}, {2, 4, 4}, {4, 8, 4}};
-        const VkSpecializationInfo specialization{3, entries, sizeof(values), values};
+        // Without a colour profile the profile lookup is compiled out, which lowers register use.
+        const int32_t values[] = {format, cfa, texture ? 1 : 0, dcp ? 1 : 0};
+        const VkSpecializationMapEntry entries[] = {{1, 0, 4}, {2, 4, 4}, {4, 8, 4}, {3, 12, 4}};
+        const VkSpecializationInfo specialization{4, entries, sizeof(values), values};
         const std::array<const uint32_t*, 12> programs{{
             kRecordingNative00Spirv.data(), kRecordingNative01Spirv.data(), kRecordingNative02Spirv.data(),
             kRecordingNative10Spirv.data(), kRecordingNative11Spirv.data(), kRecordingNative12Spirv.data(),
@@ -3978,19 +4093,28 @@ private:
                     kPreviewLightRaster1Spirv.size(), kPreviewLightRaster2Spirv.size()}};
                 pipeline = createGraphicsProgram(fragments.at(format), fragmentSizes.at(format),
                     rawRenderPass_, computePipelineLayout_, &specialization);
+            } else if (compatible) {
+                const auto fixed = compatRecordingProgram(program - 6u, dcp, false);
+                pipeline = createComputeProgram(fixed.first, fixed.second, nullptr);
             } else {
-                pipeline = createComputeProgram(programs[program], sizes[program], compatible ? nullptr : &specialization);
+                pipeline = createComputeProgram(programs[program], sizes[program], &specialization);
             }
         } catch (const std::exception& error) {
             if (raster) {
                 nativeRecordingRasterRejected_.at(rasterIndex) = true;
                 raster = false;
                 recordNativeDiagnostic(ANDROID_LOG_WARN, "RawPreviewPerf", "Using native recording compute: %s", error.what());
-                return nativeRecordingPipeline(input, format, cfa, raster, texture, filtered, cells);
+                return nativeRecordingPipeline(input, format, cfa, raster, texture, filtered, cells, dcp);
             }
+#if !defined(NDEBUG)
+            __android_log_print(ANDROID_LOG_ERROR, "RawPreviewPerf",
+                "native recording program failed: program=%zu source=%zu filtered=%d compatible=%d dcp=%d format=%d cfa=%d: %s",
+                program, source, filtered, compatible, dcp, format, cfa, error.what());
+#endif
             if (compatible) throw;
             recordNativeDiagnostic(ANDROID_LOG_WARN, "RawPreviewPerf", "Using scalar native recording: %s", error.what());
-            pipeline = createComputeProgram(programs[program + 6u], sizes[program + 6u], nullptr);
+            const auto fixed = compatRecordingProgram(program, dcp, false);
+            pipeline = createComputeProgram(fixed.first, fixed.second, nullptr);
             scalarFallback = true;
         }
         recordNativeDiagnostic(ANDROID_LOG_INFO, "RawPreviewPerf",
@@ -4059,10 +4183,10 @@ private:
                 previewPipeline(input, false, reuse, format, cfa, dcp, raster, texture, unpack,
                     false, !lightweight, area, prefilter, !lightweight, false, true);
             }
-            bool nativeRaster = lightweight && input == RawImportKind::Buffer && optimized && rawRenderPass_ != VK_NULL_HANDLE;
-            nativeRecordingPipeline(input, format, cfa, nativeRaster, lensTextureSupported_ && optimized, !lightweight);
-            nativeRaster = false;
-            nativeRecordingPipeline(input, format, cfa, nativeRaster, lensTextureSupported_ && optimized, !lightweight);
+            bool nativeRaster = false;
+            nativeRecordingPipeline(input, format, cfa, nativeRaster, lensTextureSupported_ && optimized, !lightweight,
+                false, false);
+            compactRecordingPipeline(input, format, cfa, lensTextureSupported_ && optimized, !lightweight, false, false);
             bool raster = input == RawImportKind::Buffer && optimized && rawRenderPass_ != VK_NULL_HANDLE;
             bool texture = lensTextureSupported_ && optimized;
             bool tiled = false;
@@ -4072,17 +4196,19 @@ private:
             if (recordingTileSupported()) {
                 tiled = true;
                 recordingPipeline(input, format, cfa, raster, texture, tiled, !lightweight);
+                recordingPipeline(input, format, cfa, raster, texture, tiled, !lightweight, false, false);
             }
         }
         if (optimized) {
             bool raster = false;
             bool texture = lensTextureSupported_;
             bool tiled = false;
-            nativeRecordingPipeline(RawImportKind::Image, format, cfa, raster, texture, !lightweight, true);
+            nativeRecordingPipeline(RawImportKind::Image, format, cfa, raster, texture, !lightweight, true, false);
             recordingPipeline(RawImportKind::Image, format, cfa, raster, texture, tiled, !lightweight, true);
             if (recordingTileSupported()) {
                 tiled = true;
                 recordingPipeline(RawImportKind::Image, format, cfa, raster, texture, tiled, !lightweight, true);
+                recordingPipeline(RawImportKind::Image, format, cfa, raster, texture, tiled, !lightweight, true, false);
             }
         }
         if (bayerCellRawPreview()) {
@@ -5495,6 +5621,119 @@ private:
             frame.spektraLayoutInitialized = false;
             frame.spektraInitialized = false;
         }
+    }
+
+    static void swapProcessingImages(Frame& frame)
+    {
+        std::swap(frame.processingImage, frame.stashedImage);
+        std::swap(frame.processingMemory, frame.stashedMemory);
+        std::swap(frame.processingView, frame.stashedView);
+        std::swap(frame.processingInitialized, frame.stashedInitialized);
+        frame.compactActive = !frame.compactActive;
+        frame.computeDescriptorsDirty = true;
+    }
+
+    // Selects the 10-bit processing image for this frame, creating it on first use.
+    void useCompactProcessing(Frame& frame, bool compact)
+    {
+        if (compact == frame.compactActive) return;
+        if (compact && frame.stashedImage == VK_NULL_HANDLE) {
+            VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            imageInfo.imageType = VK_IMAGE_TYPE_2D;
+            imageInfo.format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+            imageInfo.extent = {processingWidth_, processingHeight_, 1};
+            imageInfo.mipLevels = 1;
+            imageInfo.arrayLayers = 1;
+            imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+            imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+            imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+            imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            require(vkCreateImage(device_, &imageInfo, nullptr, &frame.stashedImage), "vkCreateImage for compact processing");
+            VkMemoryRequirements requirements{};
+            vkGetImageMemoryRequirements(device_, frame.stashedImage, &requirements);
+            VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            allocation.allocationSize = requirements.size;
+            allocation.memoryTypeIndex = memoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            require(vkAllocateMemory(device_, &allocation, nullptr, &frame.stashedMemory), "vkAllocateMemory for compact processing");
+            require(vkBindImageMemory(device_, frame.stashedImage, frame.stashedMemory, 0), "vkBindImageMemory for compact processing");
+            frame.stashedView = createImageView(frame.stashedImage, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+            frame.stashedInitialized = false;
+        }
+        swapProcessingImages(frame);
+    }
+
+    // Fixed native recording program for GPUs that need compatibility programs: quality and input
+    // pick the source, the colour profile and output image pick the resolved variant.
+    static std::pair<const uint32_t*, size_t> compatRecordingProgram(size_t program, bool dcp, bool compact)
+    {
+        const std::array<std::array<std::pair<const uint32_t*, size_t>, 6>, 4> programs{{
+            {{{kRecordingNativeCompat00Spirv.data(), kRecordingNativeCompat00Spirv.size()},
+              {kRecordingNativeCompat01Spirv.data(), kRecordingNativeCompat01Spirv.size()},
+              {kRecordingNativeCompat02Spirv.data(), kRecordingNativeCompat02Spirv.size()},
+              {kRecordingNativeCompat10Spirv.data(), kRecordingNativeCompat10Spirv.size()},
+              {kRecordingNativeCompat11Spirv.data(), kRecordingNativeCompat11Spirv.size()},
+              {kRecordingNativeCompat12Spirv.data(), kRecordingNativeCompat12Spirv.size()}}},
+            {{{kRecordingNativeCompatNoDcp00Spirv.data(), kRecordingNativeCompatNoDcp00Spirv.size()},
+              {kRecordingNativeCompatNoDcp01Spirv.data(), kRecordingNativeCompatNoDcp01Spirv.size()},
+              {kRecordingNativeCompatNoDcp02Spirv.data(), kRecordingNativeCompatNoDcp02Spirv.size()},
+              {kRecordingNativeCompatNoDcp10Spirv.data(), kRecordingNativeCompatNoDcp10Spirv.size()},
+              {kRecordingNativeCompatNoDcp11Spirv.data(), kRecordingNativeCompatNoDcp11Spirv.size()},
+              {kRecordingNativeCompatNoDcp12Spirv.data(), kRecordingNativeCompatNoDcp12Spirv.size()}}},
+            {{{kRecordingNativeCompatCompact00Spirv.data(), kRecordingNativeCompatCompact00Spirv.size()},
+              {kRecordingNativeCompatCompact01Spirv.data(), kRecordingNativeCompatCompact01Spirv.size()},
+              {kRecordingNativeCompatCompact02Spirv.data(), kRecordingNativeCompatCompact02Spirv.size()},
+              {kRecordingNativeCompatCompact10Spirv.data(), kRecordingNativeCompatCompact10Spirv.size()},
+              {kRecordingNativeCompatCompact11Spirv.data(), kRecordingNativeCompatCompact11Spirv.size()},
+              {kRecordingNativeCompatCompact12Spirv.data(), kRecordingNativeCompatCompact12Spirv.size()}}},
+            {{{kRecordingNativeCompatCompactNoDcp00Spirv.data(), kRecordingNativeCompatCompactNoDcp00Spirv.size()},
+              {kRecordingNativeCompatCompactNoDcp01Spirv.data(), kRecordingNativeCompatCompactNoDcp01Spirv.size()},
+              {kRecordingNativeCompatCompactNoDcp02Spirv.data(), kRecordingNativeCompatCompactNoDcp02Spirv.size()},
+              {kRecordingNativeCompatCompactNoDcp10Spirv.data(), kRecordingNativeCompatCompactNoDcp10Spirv.size()},
+              {kRecordingNativeCompatCompactNoDcp11Spirv.data(), kRecordingNativeCompatCompactNoDcp11Spirv.size()},
+              {kRecordingNativeCompatCompactNoDcp12Spirv.data(), kRecordingNativeCompatCompactNoDcp12Spirv.size()}}}}};
+        return programs.at((compact ? 2u : 0u) + (dcp ? 0u : 1u)).at(program);
+    }
+
+    // Native recording program writing the 10-bit processing image.
+    VkPipeline compactRecordingPipeline(RawImportKind input, int32_t format, int32_t cfa, bool texture, bool filtered,
+                                        bool cells, bool dcp)
+    {
+        if (!compactProcessingSupported_) return VK_NULL_HANDLE;
+        const bool compatible = compatibleRawPreview() || compatibleNativeRecordingCompute();
+        if (compatible) texture = false;
+        const size_t source = cells ? 2u : input == RawImportKind::Image ? 1u : 0u;
+        const size_t index = (compatible ? 288u : 0u) +
+            (((dcp ? 4u : 0u) + (filtered ? 2u : 0u) + (texture ? 1u : 0u)) * 3u + source) * 12u +
+            static_cast<size_t>(format) * 4u + static_cast<size_t>(cfa);
+        if (compactRecordingRejected_.at(index)) return VK_NULL_HANDLE;
+        auto& pipeline = compactRecordingPipelines_.at(index);
+        if (pipeline) return pipeline;
+        const int32_t values[] = {format, cfa, texture ? 1 : 0, dcp ? 1 : 0};
+        const VkSpecializationMapEntry entries[] = {{1, 0, 4}, {2, 4, 4}, {4, 8, 4}, {3, 12, 4}};
+        const VkSpecializationInfo specialization{4, entries, sizeof(values), values};
+        const std::array<const uint32_t*, 6> programs{{
+            kRecordingNativeCompact00Spirv.data(), kRecordingNativeCompact01Spirv.data(), kRecordingNativeCompact02Spirv.data(),
+            kRecordingNativeCompact10Spirv.data(), kRecordingNativeCompact11Spirv.data(), kRecordingNativeCompact12Spirv.data()}};
+        const std::array<size_t, 6> sizes{{
+            kRecordingNativeCompact00Spirv.size(), kRecordingNativeCompact01Spirv.size(), kRecordingNativeCompact02Spirv.size(),
+            kRecordingNativeCompact10Spirv.size(), kRecordingNativeCompact11Spirv.size(), kRecordingNativeCompact12Spirv.size()}};
+        const size_t program = source + (filtered ? 3u : 0u);
+        try {
+            if (compatible) {
+                const auto fixed = compatRecordingProgram(program, dcp, true);
+                pipeline = createComputeProgram(fixed.first, fixed.second, nullptr);
+            } else {
+                pipeline = createComputeProgram(programs[program], sizes[program], &specialization);
+            }
+        } catch (const std::exception& error) {
+            compactRecordingRejected_.at(index) = true;
+            recordNativeDiagnostic(ANDROID_LOG_WARN, "RawPreviewPerf", "Using half-float recording image: %s", error.what());
+            return VK_NULL_HANDLE;
+        }
+        recordNativeDiagnostic(ANDROID_LOG_INFO, "RawPreviewPerf",
+            "Native recording writes a 10-bit image: input=%zu format=%d cfa=%d mhc=%d dcp=%d", source, format, cfa, filtered, dcp);
+        return pipeline;
     }
 
     void ensureCaptureResources(uint32_t width, uint32_t height, bool halfFloatOutput)
@@ -7172,6 +7411,351 @@ private:
         return videoChromaPassCount(frame.videoChromaStrength) == 2 ? frame.videoChromaTemporary : frame.videoChromaOutput;
     }
 
+    struct StabilizedWarpParameters {
+        float origin[2];
+        float covered[2];
+        float rawSize[2];
+        int32_t outputSize[2];
+        int32_t sourceSize[2];
+    };
+
+    // These follow the stabilization functions in frame_geometry.glsl, so the colour step
+    // covers every sensor position the warp will read this frame.
+    static void stabilizationCameraPoint(const GeometryParameters& g, float u, float v, float& x, float& y)
+    {
+        const float* k = g.stabilizationIntrinsics;
+        y = (v - k[3]) / k[1];
+        x = (u - k[2] - g.stabilizationRadial[0] * y) / k[0];
+    }
+
+    static void stabilizationSensorPoint(const GeometryParameters& g, float x, float y, float& u, float& v)
+    {
+        const float* k = g.stabilizationIntrinsics;
+        u = k[0] * x + g.stabilizationRadial[0] * y + k[2];
+        v = k[1] * y + k[3];
+    }
+
+    static void stabilizationDistortPoint(const GeometryParameters& g, float x, float y, float& dx, float& dy)
+    {
+        const float* k = g.stabilizationRadial + 1;
+        const float* t = g.stabilizationTangential;
+        const float r2 = x * x + y * y;
+        const float radial = 1.0f + r2 * (k[0] + r2 * (k[1] + r2 * k[2]));
+        dx = x * radial + 2.0f * x * y * t[0] + t[1] * (r2 + 2.0f * x * x);
+        dy = y * radial + 2.0f * x * y * t[1] + t[0] * (r2 + 2.0f * y * y);
+    }
+
+    static void stabilizeSourceUv(const GeometryParameters& g, float& u, float& v)
+    {
+        if (g.stabilization[0] < 0.5f) return;
+        const bool distorted = g.stabilization[3] > 0.5f;
+        float px = u, py = v;
+        if (distorted) {
+            float ox = 0.0f, oy = 0.0f;
+            stabilizationCameraPoint(g, u, v, ox, oy);
+            float x = ox, y = oy;
+            const float* k = g.stabilizationRadial + 1;
+            const float* t = g.stabilizationTangential;
+            for (int iteration = 0; iteration < 6; ++iteration) {
+                const float r2 = x * x + y * y;
+                const float radial = 1.0f + r2 * (k[0] + r2 * (k[1] + r2 * k[2]));
+                const float derivative = k[0] + r2 * (2.0f * k[1] + 3.0f * r2 * k[2]);
+                float dx = 0.0f, dy = 0.0f;
+                stabilizationDistortPoint(g, x, y, dx, dy);
+                const float ex = dx - ox, ey = dy - oy;
+                const float xx = radial + 2.0f * x * x * derivative + 2.0f * t[0] * y + 6.0f * t[1] * x;
+                const float yy = radial + 2.0f * y * y * derivative + 6.0f * t[0] * y + 2.0f * t[1] * x;
+                const float xy = 2.0f * x * y * derivative + 2.0f * t[0] * x + 2.0f * t[1] * y;
+                const float determinant = std::max(xx * yy - xy * xy, 0.00000001f);
+                x -= (yy * ex - xy * ey) / determinant;
+                y -= (xx * ey - xy * ex) / determinant;
+            }
+            stabilizationSensorPoint(g, x, y, px, py);
+        }
+        float su = u, sv = v;
+        for (int iteration = 0; iteration < 3; ++iteration) {
+            const float band = std::clamp((sv - g.stabilization[1]) / g.stabilization[2] * 32.0f, 0.0f, 32.0f);
+            const int row = std::min(static_cast<int>(std::floor(band)), 31);
+            const float fraction = band - static_cast<float>(row);
+            float mixed[3][3];
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 3; ++c)
+                    mixed[r][c] = g.stabilizationRows[row][r][c] +
+                        (g.stabilizationRows[row + 1][r][c] - g.stabilizationRows[row][r][c]) * fraction;
+            const float w = std::max(mixed[2][0] * px + mixed[2][1] * py + mixed[2][2], 0.00000001f);
+            su = (mixed[0][0] * px + mixed[0][1] * py + mixed[0][2]) / w;
+            sv = (mixed[1][0] * px + mixed[1][1] * py + mixed[1][2]) / w;
+            if (distorted) {
+                float x = 0.0f, y = 0.0f, dx = 0.0f, dy = 0.0f;
+                stabilizationCameraPoint(g, su, sv, x, y);
+                stabilizationDistortPoint(g, x, y, dx, dy);
+                stabilizationSensorPoint(g, dx, dy, su, sv);
+            }
+        }
+        u = std::clamp(su, g.stabilizationBounds[0], g.stabilizationBounds[0] + g.stabilizationBounds[2]);
+        v = std::clamp(sv, g.stabilizationBounds[1], g.stabilizationBounds[1] + g.stabilizationBounds[3]);
+    }
+
+    void ensureStabilizedWarpPipeline()
+    {
+        if (!stabilizedWarpDescriptorLayout_) {
+            const VkDescriptorSetLayoutBinding bindings[] = {
+                {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+            VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            info.bindingCount = 4;
+            info.pBindings = bindings;
+            require(vkCreateDescriptorSetLayout(device_, &info, nullptr, &stabilizedWarpDescriptorLayout_),
+                "Stabilized warp descriptor layout");
+        }
+        if (!stabilizedWarpPipelineLayout_) {
+            VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(StabilizedWarpParameters)};
+            VkPipelineLayoutCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            info.setLayoutCount = 1;
+            info.pSetLayouts = &stabilizedWarpDescriptorLayout_;
+            info.pushConstantRangeCount = 1;
+            info.pPushConstantRanges = &range;
+            require(vkCreatePipelineLayout(device_, &info, nullptr, &stabilizedWarpPipelineLayout_),
+                "Stabilized warp pipeline layout");
+        }
+        if (!stabilizedWarpPipeline_)
+            stabilizedWarpPipeline_ = createComputeProgram(kStabilizedWarpSpirv.data(), kStabilizedWarpSpirv.size(),
+                nullptr, stabilizedWarpPipelineLayout_);
+        if (!stabilizedGridPipeline_)
+            stabilizedGridPipeline_ = createComputeProgram(kStabilizedWarpGridSpirv.data(), kStabilizedWarpGridSpirv.size(),
+                nullptr, stabilizedWarpPipelineLayout_);
+    }
+
+    // Finds the sensor area the stabilized output reads this frame and prepares the colour step to
+    // fill it at the output's pixel density. A native step keeps one sensor pixel per pixel.
+    void prepareStabilizedStage(Frame& frame, const GeometryParameters& geometry, const RawParameters& raw,
+                                float scale, bool native)
+    {
+        auto& stage = frame.stabilizedStage;
+        ensureStabilizedWarpPipeline();
+        float minU = std::numeric_limits<float>::max(), minV = minU;
+        float maxU = -minU, maxV = -minU;
+        constexpr int kEdgeSamples = 32;
+        for (int edge = 0; edge < 4; ++edge) {
+            for (int index = 0; index <= kEdgeSamples; ++index) {
+                const float t = static_cast<float>(index) / kEdgeSamples;
+                const float su = edge < 2 ? t : edge == 2 ? 0.0f : 1.0f;
+                const float sv = edge < 2 ? (edge == 0 ? 0.0f : 1.0f) : t;
+                float u = geometry.sourceCrop[0] + su * geometry.sourceCrop[2];
+                float v = geometry.sourceCrop[1] + sv * geometry.sourceCrop[3];
+                stabilizeSourceUv(geometry, u, v);
+                minU = std::min(minU, u);
+                maxU = std::max(maxU, u);
+                minV = std::min(minV, v);
+                maxV = std::max(maxV, v);
+            }
+        }
+        const float width = static_cast<float>(raw.dimensions[0]);
+        const float height = static_cast<float>(raw.dimensions[1]);
+        // Room for the demosaic neighborhood and the warp's filtered read.
+        const float margin = 2.0f * scale + 4.0f;
+        const int32_t rawRight = geometry.rawBounds[0] + geometry.rawBounds[2];
+        const int32_t rawBottom = geometry.rawBounds[1] + geometry.rawBounds[3];
+        const int32_t left = std::max(geometry.rawBounds[0], static_cast<int32_t>(std::floor(minU * width - margin))) & ~1;
+        const int32_t top = std::max(geometry.rawBounds[1], static_cast<int32_t>(std::floor(minV * height - margin))) & ~1;
+        const int32_t right = std::max(left + 4, std::min(rawRight, static_cast<int32_t>(std::ceil(maxU * width + margin))));
+        const int32_t bottom = std::max(top + 4, std::min(rawBottom, static_cast<int32_t>(std::ceil(maxV * height + margin))));
+        const uint32_t outputWidth = native ? static_cast<uint32_t>((right - left + 1) & ~1) :
+            static_cast<uint32_t>(std::ceil((right - left) / scale));
+        const uint32_t outputHeight = native ? static_cast<uint32_t>((bottom - top + 1) & ~1) :
+            static_cast<uint32_t>(std::ceil((bottom - top) / scale));
+
+        // The picture is stored upright like the output, so the warp reads it along its rows.
+        const bool swapsAxes = (geometry.transform[0] & 1) != 0;
+        const uint32_t uprightWidth = swapsAxes ? outputHeight : outputWidth;
+        const uint32_t uprightHeight = swapsAxes ? outputWidth : outputHeight;
+        // Size the picture for the whole stabilization range so it is not recreated as the phone moves.
+        const auto capacity = [&](float extent, float size, uint32_t required) {
+            const uint32_t range = static_cast<uint32_t>(std::ceil((extent * size + 2.0f * margin + 2.0f) / scale));
+            return (std::max(range, required) + 31u) & ~31u;
+        };
+        if (!stage.source.image || stage.source.width < uprightWidth || stage.source.height < uprightHeight) {
+            const uint32_t sensorWidth = capacity(geometry.stabilizationBounds[2], width, outputWidth);
+            const uint32_t sensorHeight = capacity(geometry.stabilizationBounds[3], height, outputHeight);
+            ensurePreviewTexture(stage.source, swapsAxes ? sensorHeight : sensorWidth, swapsAxes ? sensorWidth : sensorHeight,
+                VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+            stage.source.initialized = false;
+        }
+        // One grid point every 16 output pixels, plus the closing row and column.
+        const uint32_t gridWidth = (processingWidth_ + 15u) / 16u + 1u;
+        const uint32_t gridHeight = (processingHeight_ + 15u) / 16u + 1u;
+        if (ensurePreviewTexture(stage.grid, gridWidth, gridHeight, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT))
+            stage.grid.initialized = false;
+        if (!stage.rawUniform)
+            makeBuffer(kRawParametersSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                stage.rawUniform, stage.rawMemory, &stage.rawMapped);
+        if (!stage.geometryUniform)
+            makeBuffer(kGeometryParametersSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                stage.geometryUniform, stage.geometryMemory, &stage.geometryMapped);
+        if (!stage.pool) {
+            const VkDescriptorPoolSize sizes[] = {
+                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4},
+                {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6}};
+            VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            pool.maxSets = 2;
+            pool.poolSizeCount = 4;
+            pool.pPoolSizes = sizes;
+            require(vkCreateDescriptorPool(device_, &pool, nullptr, &stage.pool), "Stabilized descriptor pool");
+            const VkDescriptorSetLayout layouts[] = {computeDescriptorLayout_, stabilizedWarpDescriptorLayout_};
+            VkDescriptorSet sets[2]{};
+            VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            allocate.descriptorPool = stage.pool;
+            allocate.descriptorSetCount = 2;
+            allocate.pSetLayouts = layouts;
+            require(vkAllocateDescriptorSets(device_, &allocate, sets), "Stabilized descriptors");
+            stage.colorSet = sets[0];
+            stage.warpSet = sets[1];
+        }
+
+        RawParameters stageRaw = raw;
+        stageRaw.dimensions[2] = static_cast<int32_t>(uprightWidth);
+        stageRaw.dimensions[3] = static_cast<int32_t>(uprightHeight);
+        GeometryParameters stageGeometry = geometry;
+        const float coveredWidth = native ? static_cast<float>(outputWidth) : outputWidth * scale;
+        const float coveredHeight = native ? static_cast<float>(outputHeight) : outputHeight * scale;
+        stageGeometry.sourceCrop[0] = static_cast<float>(left) / width;
+        stageGeometry.sourceCrop[1] = static_cast<float>(top) / height;
+        stageGeometry.sourceCrop[2] = coveredWidth / width;
+        stageGeometry.sourceCrop[3] = coveredHeight / height;
+        stageGeometry.transform[2] = static_cast<int32_t>(uprightWidth);
+        stageGeometry.transform[3] = static_cast<int32_t>(uprightHeight);
+        stageGeometry.stabilization[0] = 0.0f;
+        std::memcpy(stage.rawMapped, &stageRaw, sizeof(stageRaw));
+        std::memcpy(stage.geometryMapped, &stageGeometry, sizeof(stageGeometry));
+        stage.origin[0] = static_cast<float>(left);
+        stage.origin[1] = static_cast<float>(top);
+        stage.covered[0] = coveredWidth;
+        stage.covered[1] = coveredHeight;
+        stage.width = outputWidth;
+        stage.height = outputHeight;
+        stage.uprightWidth = uprightWidth;
+        stage.uprightHeight = uprightHeight;
+    }
+
+    void updateStabilizedDescriptors(Frame& frame)
+    {
+        auto& stage = frame.stabilizedStage;
+        const uint32_t rawBinding = processedRawKind(frame) == RawImportKind::Image ? 5u : 0u;
+        for (uint32_t binding : {rawBinding, 3u, 4u, 8u, 10u}) {
+            VkCopyDescriptorSet copy{VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
+            copy.srcSet = frame.computeDescriptor;
+            copy.dstSet = stage.colorSet;
+            copy.srcBinding = copy.dstBinding = binding;
+            copy.descriptorCount = 1;
+            vkUpdateDescriptorSets(device_, 0, nullptr, 1, &copy);
+        }
+        const VkDescriptorBufferInfo rawUniform{stage.rawUniform, 0, kRawParametersSize};
+        const VkDescriptorBufferInfo stageGeometry{stage.geometryUniform, 0, kGeometryParametersSize};
+        const VkDescriptorBufferInfo geometry{frame.geometryUniform, 0, kGeometryParametersSize};
+        const VkDescriptorImageInfo sourceStorage{VK_NULL_HANDLE, stage.source.view, VK_IMAGE_LAYOUT_GENERAL};
+        const VkDescriptorImageInfo sourceSampled{sampler_, stage.source.view, VK_IMAGE_LAYOUT_GENERAL};
+        const VkDescriptorImageInfo output{VK_NULL_HANDLE, frame.previewHighlightRecovery ? frame.recovery.source.view :
+            frame.shadowStrength > 0.001f ? frame.shadows.source.view : frame.processingView, VK_IMAGE_LAYOUT_GENERAL};
+        const VkDescriptorImageInfo grid{VK_NULL_HANDLE, stage.grid.view, VK_IMAGE_LAYOUT_GENERAL};
+        std::array<VkWriteDescriptorSet, 7> writes{};
+        const auto set = [&](size_t index, VkDescriptorSet target, uint32_t binding, VkDescriptorType type,
+                             const VkDescriptorBufferInfo* buffer, const VkDescriptorImageInfo* image) {
+            auto& write = writes[index];
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = target;
+            write.dstBinding = binding;
+            write.descriptorCount = 1;
+            write.descriptorType = type;
+            write.pBufferInfo = buffer;
+            write.pImageInfo = image;
+        };
+        set(0, stage.colorSet, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, &rawUniform, nullptr);
+        set(1, stage.colorSet, 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, nullptr, &sourceStorage);
+        set(2, stage.colorSet, 6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, &stageGeometry, nullptr);
+        set(3, stage.warpSet, 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, nullptr, &sourceSampled);
+        set(4, stage.warpSet, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, nullptr, &output);
+        set(5, stage.warpSet, 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, &geometry, nullptr);
+        set(6, stage.warpSet, 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, nullptr, &grid);
+        vkUpdateDescriptorSets(device_, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
+
+    void recordStabilizedStage(Frame& frame, camera_gpu::ComputeRecorder& recorder)
+    {
+        auto& stage = frame.stabilizedStage;
+        const VkCommandBuffer command = frame.rawCommandBuffer;
+        std::array<VkImageMemoryBarrier, 2> prepare{};
+        PreviewTexture* const images[] = {&stage.source, &stage.grid};
+        for (size_t index = 0; index < prepare.size(); ++index) {
+            auto& barrier = prepare[index];
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barrier.srcAccessMask = images[index]->initialized ? VK_ACCESS_SHADER_READ_BIT : 0;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.oldLayout = images[index]->initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+            barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = images[index]->image;
+            barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            images[index]->initialized = true;
+        }
+        vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+            static_cast<uint32_t>(prepare.size()), prepare.data());
+
+        const auto raw = static_cast<const RawParameters*>(frame.rawMapped);
+        const StabilizedWarpParameters parameters{{stage.origin[0], stage.origin[1]}, {stage.covered[0], stage.covered[1]},
+            {static_cast<float>(raw->dimensions[0]), static_cast<float>(raw->dimensions[1])},
+            {static_cast<int32_t>(processingWidth_), static_cast<int32_t>(processingHeight_)},
+            {static_cast<int32_t>(stage.uprightWidth), static_cast<int32_t>(stage.uprightHeight)}};
+        recorder.bindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, stabilizedGridPipeline_);
+        recorder.bindDescriptors(command, VK_PIPELINE_BIND_POINT_COMPUTE, stabilizedWarpPipelineLayout_, 0, 1,
+            &stage.warpSet, 0, nullptr);
+        recorder.push(command, stabilizedWarpPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+            sizeof(parameters), &parameters);
+        // The grid and the warp are light, so they run whole instead of in bounded slices.
+        vkCmdDispatch(command, (stage.grid.width + 7) / 8, (stage.grid.height + 7) / 8, 1);
+
+        recorder.bindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, frame.previewPipeline);
+        recorder.bindDescriptors(command, VK_PIPELINE_BIND_POINT_COMPUTE, computePipelineLayout_, 0, 1,
+            &stage.colorSet, 0, nullptr);
+        // The native step works on sensor-oriented pixel pairs; the filter step on upright output pixels.
+        if (frame.recordingNative)
+            recorder.dispatch(command, (stage.width + 15) / 16, (stage.height + 15) / 16, 1);
+        else
+            recorder.dispatch(command, (stage.uprightWidth + 7) / 8, (stage.uprightHeight + 7) / 8, 1);
+
+        VkMemoryBarrier ready{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        ready.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        ready.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &ready, 0, nullptr, 0, nullptr);
+
+        recorder.bindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, stabilizedWarpPipeline_);
+        recorder.bindDescriptors(command, VK_PIPELINE_BIND_POINT_COMPUTE, stabilizedWarpPipelineLayout_, 0, 1,
+            &stage.warpSet, 0, nullptr);
+        recorder.push(command, stabilizedWarpPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+            sizeof(parameters), &parameters);
+        vkCmdDispatch(command, (processingWidth_ + 15) / 16, (processingHeight_ + 15) / 16, 1);
+    }
+
+    void destroyStabilizedStage(Frame& frame)
+    {
+        auto& stage = frame.stabilizedStage;
+        destroyPreviewTexture(stage.source);
+        destroyPreviewTexture(stage.grid);
+        if (stage.rawMapped) vkUnmapMemory(device_, stage.rawMemory);
+        if (stage.rawUniform) vkDestroyBuffer(device_, stage.rawUniform, nullptr);
+        if (stage.rawMemory) vkFreeMemory(device_, stage.rawMemory, nullptr);
+        if (stage.geometryMapped) vkUnmapMemory(device_, stage.geometryMemory);
+        if (stage.geometryUniform) vkDestroyBuffer(device_, stage.geometryUniform, nullptr);
+        if (stage.geometryMemory) vkFreeMemory(device_, stage.geometryMemory, nullptr);
+        if (stage.pool) vkDestroyDescriptorPool(device_, stage.pool, nullptr);
+        stage = {};
+    }
+
     void ensureVideoChromaPipeline()
     {
         if (!videoChromaDescriptorLayout_) {
@@ -8265,7 +8849,9 @@ private:
             vkCmdBindPipeline(frame.rawCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, frame.unpackPipeline);
             vkCmdBindDescriptorSets(frame.rawCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                 computePipelineLayout_, 0, 1, &frame.computeDescriptor, 0, nullptr);
-            uint32_t width = frame.areaPrefilter ? frame.unpackedTexture.width / 2 : frame.unpackedTexture.width;
+            // The plain unpack handles four samples per invocation.
+            uint32_t width = frame.areaPrefilter ? frame.unpackedTexture.width / 2 :
+                frame.mhcPrefilter ? frame.unpackedTexture.width : (frame.unpackedTexture.width + 3) / 4;
             uint32_t height = frame.unpackedTexture.height;
             if (frame.areaPrefilter || frame.mhcPrefilter) {
                 const auto& raw = *static_cast<const RawParameters*>(frame.rawMapped);
@@ -8308,6 +8894,8 @@ private:
                 computePipelineLayout_, 0, 1, &frame.computeDescriptor, 0, nullptr);
             vkCmdDraw(frame.rawCommandBuffer, 3, 1, 0, 0);
             vkCmdEndRenderPass(frame.rawCommandBuffer);
+        } else if (frame.stabilizedStage.active && !frame.ispActive) {
+            recordStabilizedStage(frame, recorder);
         } else {
             recorder.bindPipeline(
                 frame.rawCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -8539,6 +9127,7 @@ private:
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         require(vkBeginCommandBuffer(frame.commandBuffer, &begin),
                 "vkBeginCommandBuffer for presentation");
+        frame.metrics.beginPresentGpu(frame.commandBuffer);
 
         if (frame.focusStrength > 0.5f && processFocus)
             recordFocusPreview(frame);
@@ -8603,7 +9192,7 @@ private:
             std::clamp(blurStrength, 0.0f, 1.0f),
             presentation.crop[0], presentation.crop[1],
             presentation.crop[2], presentation.crop[3],
-            frame.exposureZebra, frame.focusStrength > 0.5f ? 1.0f : 0.0f,
+            frame.exposureZebra, frame.focusStrength > 0.5f ? 1.0f : frame.compactActive ? 2.0f : 0.0f,
             std::max(6.0f, std::min(swapchainExtent_.width, swapchainExtent_.height) / 80.0f),
             frame.useSpektraOutput ? 1.0f : 0.0f};
         vkCmdPushConstants(
@@ -8613,6 +9202,7 @@ private:
         vkCmdDraw(frame.commandBuffer, 3, 1, 0, 0);
         if (loupe) recordFocusLoupeDraw(frame);
         vkCmdEndRenderPass(frame.commandBuffer);
+        frame.metrics.endPresentGpu(frame.commandBuffer);
         if (videoAcquired && videoOutput_) {
             if (frame.focusStrength > 0.5f) {
                 VkMemoryBarrier videoReady{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -8738,6 +9328,7 @@ private:
             frame.videoChromaStrength = 0.0f;
             destroyPreviewTexture(frame.videoChromaOutput);
             destroyPreviewTexture(frame.videoChromaTemporary);
+            destroyStabilizedStage(frame);
             destroyPreviewRecoveryResources(frame);
             frame.previewHighlightRecovery = false;
             destroyShadowResources(frame);
@@ -8757,6 +9348,14 @@ private:
                 vkDestroyImage(device_, frame.spektraImage, nullptr);
             if (frame.spektraMemory != VK_NULL_HANDLE)
                 vkFreeMemory(device_, frame.spektraMemory, nullptr);
+            if (frame.compactActive) swapProcessingImages(frame);
+            if (frame.stashedView != VK_NULL_HANDLE) vkDestroyImageView(device_, frame.stashedView, nullptr);
+            if (frame.stashedImage != VK_NULL_HANDLE) vkDestroyImage(device_, frame.stashedImage, nullptr);
+            if (frame.stashedMemory != VK_NULL_HANDLE) vkFreeMemory(device_, frame.stashedMemory, nullptr);
+            frame.stashedView = VK_NULL_HANDLE;
+            frame.stashedImage = VK_NULL_HANDLE;
+            frame.stashedMemory = VK_NULL_HANDLE;
+            frame.stashedInitialized = false;
             if (frame.processingView != VK_NULL_HANDLE)
                 vkDestroyImageView(device_, frame.processingView, nullptr);
             if (frame.processingImage != VK_NULL_HANDLE)
@@ -8796,6 +9395,14 @@ private:
         videoChromaPipeline_ = VK_NULL_HANDLE;
         videoChromaPipelineLayout_ = VK_NULL_HANDLE;
         videoChromaDescriptorLayout_ = VK_NULL_HANDLE;
+        if (stabilizedWarpPipeline_) vkDestroyPipeline(device_, stabilizedWarpPipeline_, nullptr);
+        if (stabilizedGridPipeline_) vkDestroyPipeline(device_, stabilizedGridPipeline_, nullptr);
+        stabilizedGridPipeline_ = VK_NULL_HANDLE;
+        if (stabilizedWarpPipelineLayout_) vkDestroyPipelineLayout(device_, stabilizedWarpPipelineLayout_, nullptr);
+        if (stabilizedWarpDescriptorLayout_) vkDestroyDescriptorSetLayout(device_, stabilizedWarpDescriptorLayout_, nullptr);
+        stabilizedWarpPipeline_ = VK_NULL_HANDLE;
+        stabilizedWarpPipelineLayout_ = VK_NULL_HANDLE;
+        stabilizedWarpDescriptorLayout_ = VK_NULL_HANDLE;
         if (focusPipeline_) vkDestroyPipeline(device_, focusPipeline_, nullptr);
         if (focusOverlayPipeline_) vkDestroyPipeline(device_, focusOverlayPipeline_, nullptr);
         if (focusPipelineLayout_) vkDestroyPipelineLayout(device_, focusPipelineLayout_, nullptr);
@@ -8880,6 +9487,7 @@ private:
             frame.metrics.destroy(device_);
             destroyPreviewTexture(frame.lensTexture);
             destroyPreviewTexture(frame.unpackedTexture);
+            destroyStabilizedStage(frame);
             if (frame.areaWeights) vkDestroyBuffer(device_, frame.areaWeights, nullptr);
             if (frame.areaWeightsMemory) vkFreeMemory(device_, frame.areaWeightsMemory, nullptr);
             frame.areaWeights = VK_NULL_HANDLE;
@@ -9004,6 +9612,11 @@ private:
             if (pipeline) vkDestroyPipeline(device_, pipeline, nullptr);
             pipeline = VK_NULL_HANDLE;
         }
+        for (VkPipeline& pipeline : compactRecordingPipelines_) {
+            if (pipeline) vkDestroyPipeline(device_, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+        compactRecordingRejected_.fill(false);
         nativeRecordingRasterRejected_.fill(false);
         recordingPipelineRejected_.fill(false);
         for (VkPipeline& pipeline : previewPipelines_) {
@@ -9198,10 +9811,13 @@ private:
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkPipelineLayout computePipelineLayout_ = VK_NULL_HANDLE;
     std::array<VkPipeline, 768> bayerCellPipelines_{};
-    std::array<VkPipeline, 1152> recordingPipelines_{};
-    std::array<VkPipeline, 576> nativeRecordingPipelines_{};
+    std::array<VkPipeline, 2304> recordingPipelines_{};
+    std::array<VkPipeline, 1152> nativeRecordingPipelines_{};
+    std::array<VkPipeline, 576> compactRecordingPipelines_{};
+    std::array<bool, 576> compactRecordingRejected_{};
+    bool compactProcessingSupported_ = false;
     std::array<bool, 24> nativeRecordingRasterRejected_{};
-    std::array<bool, 1152> recordingPipelineRejected_{};
+    std::array<bool, 2304> recordingPipelineRejected_{};
     std::array<bool, 768> bayerCellRasterRejected_{};
     std::vector<std::array<uint64_t, 12>> rejectedRawImports_;
     std::array<uint64_t, 12> validatedRawImageLayout_{};
@@ -9270,6 +9886,10 @@ private:
     VkPipelineLayout averagePipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline averagePipeline_ = VK_NULL_HANDLE;
     VkPipeline videoChromaPipeline_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout stabilizedWarpDescriptorLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout stabilizedWarpPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline stabilizedWarpPipeline_ = VK_NULL_HANDLE;
+    VkPipeline stabilizedGridPipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout videoChromaPipelineLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout videoChromaDescriptorLayout_ = VK_NULL_HANDLE;
     PreviewTexture averageHistory_;

@@ -1,6 +1,7 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 #include "SpektraStorageBuffer.glsl"
+#include "SpektraFourStageLutConfig.h"
 
 layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
 
@@ -29,9 +30,9 @@ layout(std430, binding = 8) readonly buffer InputToReferenceXyzMatrices {
   float inputToReferenceXyz[];
 };
 
-layout(std430, binding = 9) readonly buffer HanatosRawResponse {
-  vec4 hanatosRawResponse[];
-};
+// Rows of the raw response table; texel fetches are much faster than buffer reads for these
+// scattered lookups on some GPUs.
+layout(binding = SPEKTRA_HANATOS_RESPONSE_TEXTURE_BINDING) uniform sampler2D hanatosRawResponse;
 
 layout(std430, binding = 30) readonly buffer AutoExposureResult {
   float autoExposureEv[];
@@ -90,6 +91,14 @@ bool colorAdaptationEnabled(uint flag) {
   return (params._pad1 & flag) != 0u;
 }
 
+#if defined(SPEKTRA_FOUR_STAGE_LUT)
+// The input transfer kind is the same for every pixel and is read once per workgroup.
+shared uint groupTransferKind;
+#define inputTransferKind(colorSpace) groupTransferKind
+#else
+#define inputTransferKind(colorSpace) read_colorTransferKinds(colorSpace)
+#endif
+
 float sampleDecodeLut(float value, uint colorSpace) {
   const uint lutSize = max(params.transferLutSize, 2u);
   const float decodeMin = params.colorDecodeMin;
@@ -116,7 +125,7 @@ float sampleDecodeLut(float value, uint colorSpace) {
 }
 
 vec3 decodeInputRgb(vec3 rgb, uint colorSpace) {
-  if (read_colorTransferKinds(colorSpace) == 0u) {
+  if (inputTransferKind(colorSpace) == 0u) {
     return rgb;
   }
   return vec3(
@@ -216,17 +225,14 @@ vec3 hanatosRaw(vec3 xyz) {
 
   vec3 raw = vec3(0.0);
   float weightSum = 0.0;
-  const uint responseOffset = colorAdaptationEnabled(kColorAdaptationInputCompression)
-    ? params.hanatosWidth * params.hanatosHeight
-    : 0u;
+  const uint responseRow = colorAdaptationEnabled(kColorAdaptationInputCompression) ? params.hanatosWidth : 0u;
   for (uint i = 0u; i < 4u; ++i) {
     const uint xi = safeIndex(xBase - 1 + int(i), params.hanatosWidth);
     for (uint j = 0u; j < 4u; ++j) {
       const uint yj = safeIndex(yBase - 1 + int(j), params.hanatosHeight);
       const float weight = wx[i] * wy[j];
       weightSum += weight;
-      const uint lutOffset = responseOffset + xi * params.hanatosHeight + yj;
-      raw += weight * hanatosRawResponse[lutOffset].xyz;
+      raw += weight * texelFetch(hanatosRawResponse, ivec2(yj, responseRow + xi), 0).xyz;
     }
   }
   if (weightSum != 0.0) {
@@ -237,6 +243,7 @@ vec3 hanatosRaw(vec3 xyz) {
 
 #if defined(SPEKTRA_FOUR_STAGE_LUT)
 #define SPEKTRA_FOUR_STAGE_LUT_BINDING 10
+#define SPEKTRA_FOUR_STAGE_HEADER_SHARED 1
 #include "SpektraFourStageLut.glsl"
 #if defined(SPEKTRA_COMPOSED_PREVIEW_COLOR)
 layout(binding = SPEKTRA_COMPOSED_LUT_TEXTURE_BINDING) uniform sampler3D composedLutTexture;
@@ -256,7 +263,22 @@ vec3 previewFilmLogExposure(vec3 decoded) {
 }
 #endif
 
+#if defined(SPEKTRA_FOUR_STAGE_LUT)
+// The automatic exposure value is read once per workgroup instead of once per pixel.
+shared float groupAutoExposureEv;
+#define autoExposureOffset() groupAutoExposureEv
+#else
+#define autoExposureOffset() autoExposureEv[0]
+#endif
+
 void main() {
+#if defined(SPEKTRA_FOUR_STAGE_LUT)
+  if (gl_LocalInvocationIndex == 0u) {
+    groupAutoExposureEv = (params._pad1 & kAutoExposureEnabled) != 0u ? autoExposureEv[0] : 0.0;
+    groupTransferKind = read_colorTransferKinds(colorSpaceIndex());
+  }
+  loadFourStageShared();
+#endif
   const uvec2 activeGid = gl_GlobalInvocationID.xy;
   const uint activeWidth = params.activeWidth == 0u ? params.width : params.activeWidth;
   const uint activeHeight = params.activeHeight == 0u ? params.height : params.activeHeight;
@@ -277,7 +299,7 @@ void main() {
     : index;
   const float exposure = exp2(
     params.filmExposureEv +
-    ((params._pad1 & kAutoExposureEnabled) != 0u ? autoExposureEv[0] : 0.0)
+    ((params._pad1 & kAutoExposureEnabled) != 0u ? autoExposureOffset() : 0.0)
   );
   const uint colorSpace = colorSpaceIndex();
 #if defined(SPEKTRA_PREVIEW_IMAGE_INPUT)
@@ -290,14 +312,14 @@ void main() {
 #if defined(SPEKTRA_COMPOSED_PREVIEW_COLOR)
   const float size = float(params._pad0);
   const vec3 logExposure = previewFilmLogExposure(decoded) +
-    (params.filmExposureEv + ((params._pad1 & kAutoExposureEnabled) != 0u ? autoExposureEv[0] : 0.0)) * 0.3010299956639812;
+    (params.filmExposureEv + ((params._pad1 & kAutoExposureEnabled) != 0u ? autoExposureOffset() : 0.0)) * 0.3010299956639812;
   const vec3 density = applyFourStageCouplers(logExposure,
     max(fourStageDecodeDensity(sampleFourStageLut(fourStageEncodeLog(logExposure, 0u), 1u)), vec3(0.0)));
   const vec3 coordinate = (fourStageEncodeDensity(density) * (size - 1.0) + 0.5) / size;
   storePreviewImage(index, vec4(textureLod(composedLutTexture, coordinate, 0.0).rgb, source.a));
 #else
   const vec3 logExposure = previewFilmLogExposure(decoded) +
-    (params.filmExposureEv + ((params._pad1 & kAutoExposureEnabled) != 0u ? autoExposureEv[0] : 0.0)) * 0.3010299956639812;
+    (params.filmExposureEv + ((params._pad1 & kAutoExposureEnabled) != 0u ? autoExposureOffset() : 0.0)) * 0.3010299956639812;
 #if defined(SPEKTRA_PREVIEW_COLOR)
   const vec3 density = applyFourStageCouplers(logExposure,
     max(fourStageDecodeDensity(sampleFourStageLut(fourStageEncodeLog(logExposure, 0u), 1u)), vec3(0.0)));

@@ -351,6 +351,9 @@ public final class Camera2RawSession implements AutoCloseable {
     private volatile boolean opticalStabilizationSupported;
     private volatile boolean opticalStabilizationLive = true;
     private long opticalStabilizationChangedNs;
+    private boolean opticalStabilizationUnconfirmed;
+    private long opticalStabilizationUnconfirmedSinceNs;
+    private Integer opticalStabilizationFallbackMode;
     private RawStillCaptureCallback stillCaptureCallback;
     private boolean stillFrameDelivered;
     private Runnable stillCaptureTimeout;
@@ -529,9 +532,13 @@ public final class Camera2RawSession implements AutoCloseable {
         if (!opticalStabilizationSupported || !opticalStabilizationLive) return false;
         Handler handler = cameraHandler;
         return handler != null && handler.post(() -> {
-            opticalStabilizationEnabled = enabled;
-            opticalStabilizationMode = enabled ? CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
+            Integer next = enabled ? CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
                     : CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF;
+            opticalStabilizationEnabled = enabled;
+            if (next.equals(opticalStabilizationMode)) return;
+            InternalLogRecorder.event("CameraStreams", "route=" + route.routeId + " ois_change state=" + state
+                    + " requested_ois=" + next + " reported_ois=" + reportedOpticalStabilizationMode);
+            opticalStabilizationMode = next;
             opticalStabilizationChangedNs = SystemClock.elapsedRealtimeNanos();
             applyControlUpdate(false);
         });
@@ -2289,6 +2296,10 @@ public final class Camera2RawSession implements AutoCloseable {
                     + " initial_session_fps=" + parameters.get(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE)
                     + " initial_session_ae=" + parameters.get(CaptureRequest.CONTROL_AE_MODE)
                     + " initial_session_ois=" + parameters.get(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE)
+                    + " app_ois=" + opticalStabilizationMode
+                    + " selected_ois_modes=" + Arrays.toString(OpticalStabilizationSupport.modes(selected))
+                    + " open_ois_modes=" + Arrays.toString(OpticalStabilizationSupport.modes(opened))
+                    + " ois_unconfirmed=" + opticalStabilizationUnconfirmed
                     + " selected_fps_ranges=" + Arrays.toString(selected.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES))
                     + " open_fps_ranges=" + Arrays.toString(opened.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES))
                     + " fps_session_key=" + (sessionKeys != null && sessionKeys.contains(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE)));
@@ -2445,7 +2456,13 @@ public final class Camera2RawSession implements AutoCloseable {
                 noiseProfile[i * 2 + 1] = sensorNoise[i].second.floatValue();
             }
         }
-        reportedOpticalStabilizationMode = sensorResult.get(CaptureResult.LENS_OPTICAL_STABILIZATION_MODE);
+        Integer reportedOis = sensorResult.get(CaptureResult.LENS_OPTICAL_STABILIZATION_MODE);
+        if (!Objects.equals(reportedOpticalStabilizationMode, reportedOis)) {
+            InternalLogRecorder.event("CameraStreams", "route=" + route.routeId + " requested_ois="
+                    + opticalStabilizationMode + " reported_ois=" + reportedOis);
+        }
+        reportedOpticalStabilizationMode = reportedOis;
+        confirmUnadvertisedOpticalStabilization(reportedOis);
         if (opticalStabilizationChangedNs != 0L) {
             if (Objects.equals(opticalStabilizationMode, reportedOpticalStabilizationMode))
                 opticalStabilizationChangedNs = 0L;
@@ -2576,11 +2593,20 @@ public final class Camera2RawSession implements AutoCloseable {
         CameraCharacteristics selected = characteristics(route.characteristicsCameraId);
         CameraCharacteristics opened = route.characteristicsCameraId.equals(route.openCameraId)
                 ? null : characteristics(route.openCameraId);
-        opticalStabilizationMode = preferredOpticalStabilizationMode(
-                characteristic(selected, CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION, null),
-                characteristic(opened, CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION, null));
+        int[] routeOisModes = OpticalStabilizationSupport.modes(selected);
+        int[] openOisModes = OpticalStabilizationSupport.modes(opened);
+        Integer facing = OpticalStabilizationSupport.facing(selected);
+        if (facing == null) facing = OpticalStabilizationSupport.facing(opened);
+        boolean requestUnadvertisedOis = OpticalStabilizationSupport.requestsUnadvertisedOis(Build.MANUFACTURER, facing);
+        opticalStabilizationMode = OpticalStabilizationSupport.preferredMode(
+                routeOisModes, openOisModes, requestUnadvertisedOis);
         opticalStabilizationSupported = Integer.valueOf(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)
                 .equals(opticalStabilizationMode);
+        opticalStabilizationUnconfirmed = opticalStabilizationSupported
+                && !OpticalStabilizationSupport.advertised(routeOisModes, openOisModes);
+        opticalStabilizationUnconfirmedSinceNs = 0L;
+        opticalStabilizationFallbackMode = OpticalStabilizationSupport.preferredMode(
+                routeOisModes, openOisModes, false);
         if (opticalStabilizationSupported && !opticalStabilizationEnabled)
             opticalStabilizationMode = CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF;
         opticalStabilizationLive = true;
@@ -3462,13 +3488,31 @@ public final class Camera2RawSession implements AutoCloseable {
     }
 
     static Integer preferredOpticalStabilizationMode(int[] routeModes, int[] openCameraModes) {
-        // A physical lens's advertised modes take precedence over its logical camera.
-        int[] modes = routeModes != null ? routeModes : openCameraModes;
-        if (supportsMode(modes, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)) {
-            return CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON;
+        return OpticalStabilizationSupport.preferredMode(routeModes, openCameraModes, false);
+    }
+
+    // Drops OIS from a lens that does not advertise it when the camera keeps reporting it as off.
+    private void confirmUnadvertisedOpticalStabilization(Integer reported) {
+        if (!opticalStabilizationUnconfirmed || !opticalStabilizationSupported) return;
+        if (!Integer.valueOf(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON).equals(opticalStabilizationMode)) {
+            opticalStabilizationUnconfirmedSinceNs = 0L;
+            return;
         }
-        return supportsMode(modes, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF)
-                ? CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF : null;
+        if (reported == null) return;
+        if (reported == CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON) {
+            opticalStabilizationUnconfirmed = false;
+            return;
+        }
+        long now = SystemClock.elapsedRealtimeNanos();
+        if (opticalStabilizationUnconfirmedSinceNs == 0L) {
+            opticalStabilizationUnconfirmedSinceNs = now;
+        } else if (now - opticalStabilizationUnconfirmedSinceNs > 2_000_000_000L) {
+            opticalStabilizationUnconfirmed = false;
+            opticalStabilizationSupported = false;
+            opticalStabilizationMode = opticalStabilizationFallbackMode;
+            InternalLogRecorder.event("CameraStreams", "route=" + route.routeId
+                    + " unadvertised_ois=unavailable reported_ois=" + reported);
+        }
     }
 
     static boolean shouldRequestLensShadingMap(int[] routeModes, int[] openCameraModes) {

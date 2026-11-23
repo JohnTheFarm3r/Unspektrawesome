@@ -42,8 +42,8 @@ fun CameraPreferences.withAeBalance(value: Float): CameraPreferences = copy(lens
     if (it.id == activeLensProfileId) it.copy(aeBalance = AeBalance.normalize(value)) else it
 })
 
-/** Exposure range of [camera], with the top ISO measured by the lens scan when [profile] has one. */
-fun readExposureBounds(context: Context, camera: CameraDescriptor, profile: LensProfile? = null): ExposureBounds? = runCatching {
+/** Exposure range of [camera], with [measured] as the top ISO when the lens scan found one above the advertised range. */
+fun readExposureBounds(context: Context, camera: CameraDescriptor, measured: Int = 0): ExposureBounds? = runCatching {
     val manager = context.getSystemService(CameraManager::class.java)
     val opened = manager.getCameraCharacteristics(camera.route.openCameraId)
     val selected = manager.getCameraCharacteristics(camera.route.characteristicsCameraId)
@@ -54,7 +54,6 @@ fun readExposureBounds(context: Context, camera: CameraDescriptor, profile: Lens
     val iso = selected.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
         ?: opened.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE) ?: return null
     val time = SensorExposureLimits.read(selected, opened) ?: return null
-    val measured = profile?.verification?.takeIf { it.configuration.routeId == camera.route.routeId }?.isoMax ?: 0
     val advertised = maxOf(iso.lower, com.unspektrawesome.camera.session.IsoRangeDebug.advertisedMax(iso.upper))
     ExposureBounds(iso.lower, maxOf(advertised, measured), time.minimumNs, time.maximumNs, advertised)
 }.getOrNull()

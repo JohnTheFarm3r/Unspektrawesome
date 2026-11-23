@@ -1,0 +1,95 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+
+// Moves a finished picture by the gyro correction. The colour step has already
+// processed the sensor area this frame needs. The correction changes smoothly across the frame,
+// so it is evaluated on a coarse grid and each output pixel blends the four nearest grid points.
+#define UNSPEKTRA_LIVE_STABILIZATION 1
+#define RAW_GEOMETRY_BINDING 2
+#include "frame_geometry.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D stabilizedSource;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D stabilizedOutput;
+layout(set = 0, binding = 3, rgba32f) uniform image2D stabilizedGrid;
+
+layout(push_constant) uniform WarpParameters {
+    vec2 origin;      // sensor pixel of the area the source picture covers
+    vec2 covered;     // size of that sensor area in sensor pixels
+    vec2 rawSize;     // full sensor frame size in pixels
+    ivec2 outputSize;
+    ivec2 sourceSize; // upright pixels of the source picture that hold the area
+} warp;
+
+const int gridSpacing = 16;
+
+#ifdef STABILIZED_WARP_GRID
+// Same mapping as geometrySourceUv, for a continuous output position in pixels.
+vec2 stabilizedSensorPosition(vec2 position)
+{
+    vec2 orientedUv = position / vec2(frameGeometry.transform.zw);
+    if (frameGeometry.transform.y != 0)
+        orientedUv.x = 1.0 - orientedUv.x;
+    vec2 sourceUv;
+    if (frameGeometry.transform.x == 1)
+        sourceUv = vec2(orientedUv.y, 1.0 - orientedUv.x);
+    else if (frameGeometry.transform.x == 2)
+        sourceUv = vec2(1.0) - orientedUv;
+    else if (frameGeometry.transform.x == 3)
+        sourceUv = vec2(1.0 - orientedUv.y, orientedUv.x);
+    else
+        sourceUv = orientedUv;
+    return geometryStabilize(frameGeometry.sourceCrop.xy + sourceUv * frameGeometry.sourceCrop.zw) * warp.rawSize;
+}
+
+// The source picture is stored upright like the output, so turn the sensor position the same way.
+vec2 stabilizedSourceCoordinate(vec2 sensor)
+{
+    vec2 area = (sensor - warp.origin) / warp.covered;
+    vec2 upright;
+    if (frameGeometry.transform.x == 1)
+        upright = vec2(1.0 - area.y, area.x);
+    else if (frameGeometry.transform.x == 2)
+        upright = vec2(1.0) - area;
+    else if (frameGeometry.transform.x == 3)
+        upright = vec2(area.y, 1.0 - area.x);
+    else
+        upright = area;
+    if (frameGeometry.transform.y != 0)
+        upright.x = 1.0 - upright.x;
+    return upright * vec2(warp.sourceSize) / vec2(textureSize(stabilizedSource, 0));
+}
+
+void main()
+{
+    ivec2 point = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(point, imageSize(stabilizedGrid)))) return;
+    imageStore(stabilizedGrid, point,
+        vec4(stabilizedSourceCoordinate(stabilizedSensorPosition(vec2(point * gridSpacing))), 0.0, 0.0));
+}
+#else
+// Each invocation writes a 2x2 pixel block, so an 8x8 workgroup covers exactly one 16x16 grid
+// cell. Its four corners are read once and shared.
+shared vec2 cellCorners[4];
+
+void main()
+{
+    ivec2 cellIndex = ivec2(gl_WorkGroupID.xy);
+    if (gl_LocalInvocationIndex < 4u) {
+        ivec2 last = imageSize(stabilizedGrid) - 1;
+        ivec2 offset = ivec2(int(gl_LocalInvocationIndex & 1u), int(gl_LocalInvocationIndex >> 1u));
+        cellCorners[gl_LocalInvocationIndex] = imageLoad(stabilizedGrid, min(cellIndex + offset, last)).xy;
+    }
+    barrier();
+    ivec2 base = ivec2(gl_GlobalInvocationID.xy) * 2;
+    [[unroll]] for (int index = 0; index < 4; ++index) {
+        ivec2 position = base + ivec2(index & 1, index >> 1);
+        if (any(greaterThanEqual(position, warp.outputSize))) continue;
+        vec2 weight = ((vec2(position) + 0.5) - vec2(cellIndex * gridSpacing)) / float(gridSpacing);
+        vec2 coordinate = mix(mix(cellCorners[0], cellCorners[1], weight.x),
+            mix(cellCorners[2], cellCorners[3], weight.x), weight.y);
+        imageStore(stabilizedOutput, position, textureLod(stabilizedSource, coordinate, 0.0));
+    }
+}
+#endif

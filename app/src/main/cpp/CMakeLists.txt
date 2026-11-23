@@ -166,6 +166,9 @@ embed_shader_variant(
     UNSPEKTRA_PREVIEW_DEMOSAIC=1 PREVIEW_MHC_SHADER_HEADER)
 embed_shader(post_chroma_denoise.comp compute kPostChromaDenoiseSpirv CHROMA_DENOISE_SHADER_HEADER)
 embed_shader(video_chroma.comp compute kVideoChromaSpirv VIDEO_CHROMA_SHADER_HEADER)
+embed_shader(stabilized_warp.comp compute kStabilizedWarpSpirv STABILIZED_WARP_SHADER_HEADER)
+embed_shader_variant(stabilized_warp.comp compute kStabilizedWarpGridSpirv grid
+    STABILIZED_WARP_GRID=1 STABILIZED_WARP_GRID_SHADER_HEADER)
 embed_shader(raw_hot_pixels.comp compute kRawHotPixelsBufferSpirv RAW_HOT_PIXELS_BUFFER_SHADER_HEADER)
 embed_shader_variant(raw_hot_pixels.comp compute kRawHotPixelsImageSpirv image
     UNSPEKTRA_RAW_IMAGE_INPUT=1 RAW_HOT_PIXELS_IMAGE_SHADER_HEADER)
@@ -446,26 +449,53 @@ foreach(quality RANGE 0 1)
         if(input EQUAL 2)
             list(APPEND native_recording_definitions "UNSPEKTRA_RAW_CELL_INPUT=1")
         endif()
+        # The shared RAW tile and the per-pixel loop keep register use low on every GPU.
+        set(native_recording_tiled_definitions ${native_recording_definitions})
+        list(APPEND native_recording_tiled_definitions "UNSPEKTRA_NATIVE_PIXEL_LOOP=1")
+        if(input EQUAL 0)
+            list(APPEND native_recording_tiled_definitions "UNSPEKTRA_RAW_SHARED_TILE=1")
+        endif()
         embed_shader_variant(recording_native.comp compute kRecordingNative${quality}${input}Spirv input_${quality}_${input}
-            "${native_recording_definitions}" NATIVE_RECORDING_HEADER)
+            "${native_recording_tiled_definitions}" NATIVE_RECORDING_HEADER)
         list(APPEND PREVIEW_FAST_SHADER_HEADERS "${NATIVE_RECORDING_HEADER}")
-        embed_shader_variant(recording_native.comp compute kRecordingNativeCompat${quality}${input}Spirv compat_${quality}_${input}
-            "${native_recording_definitions}" NATIVE_RECORDING_COMPAT_INPUT_HEADER)
-        set(native_recording_spirv "${SHADER_OUTPUT_DIR}/recording_native_compat_${quality}_${input}_fixed_compute.spv")
-        set(native_recording_header "${SHADER_OUTPUT_DIR}/recording_native_compat_${quality}_${input}_fixed_compute_spv.h")
-        add_custom_command(
-            OUTPUT "${native_recording_header}"
-            BYPRODUCTS "${native_recording_spirv}"
-            COMMAND "${SPIRV_OPT}" --freeze-spec-const --fold-spec-const-op-composite
-                --eliminate-dead-branches --eliminate-dead-functions
-                "${SHADER_OUTPUT_DIR}/recording_native_compat_${quality}_${input}_compute.spv" -o "${native_recording_spirv}"
-            COMMAND "${SPIRV_VAL}" --target-env vulkan1.1 "${native_recording_spirv}"
-            COMMAND "${CMAKE_COMMAND}" "-DINPUT_FILE=${native_recording_spirv}" "-DOUTPUT_FILE=${native_recording_header}"
-                "-DSYMBOL_NAME=kRecordingNativeCompat${quality}${input}Spirv" -P "${CMAKE_CURRENT_LIST_DIR}/EmbedSpirv.cmake"
-            DEPENDS "${NATIVE_RECORDING_COMPAT_INPUT_HEADER}" "${SPIRV_OPT}" "${SPIRV_VAL}"
-                "${CMAKE_CURRENT_LIST_DIR}/EmbedSpirv.cmake"
-            VERBATIM)
-        list(APPEND PREVIEW_FAST_SHADER_HEADERS "${native_recording_header}")
+        set(native_recording_compact_definitions ${native_recording_tiled_definitions})
+        list(APPEND native_recording_compact_definitions "UNSPEKTRA_RECORDING_COMPACT=1")
+        embed_shader_variant(recording_native.comp compute kRecordingNativeCompact${quality}${input}Spirv compact_${quality}_${input}
+            "${native_recording_compact_definitions}" NATIVE_RECORDING_HEADER)
+        list(APPEND PREVIEW_FAST_SHADER_HEADERS "${NATIVE_RECORDING_HEADER}")
+        # Fixed programs for GPUs whose compilers fail on optimized code: built without -O and with
+        # every specialization option resolved offline. Variants cover colour profiles and the
+        # 10-bit recording image.
+        foreach(compat_kind "" "nodcp_" "compact_" "compact_nodcp_")
+            set(compat_definitions ${native_recording_tiled_definitions})
+            set(compat_symbol "")
+            if(compat_kind MATCHES "compact")
+                list(APPEND compat_definitions "UNSPEKTRA_RECORDING_COMPACT=1")
+                set(compat_symbol "${compat_symbol}Compact")
+            endif()
+            if(compat_kind MATCHES "nodcp")
+                list(APPEND compat_definitions "UNSPEKTRA_PREVIEW_NO_DCP=1")
+                set(compat_symbol "${compat_symbol}NoDcp")
+            endif()
+            set(compat_variant "compat_${compat_kind}${quality}_${input}")
+            embed_shader_variant(recording_native.comp compute kRecordingNativeCompatInput${compat_symbol}${quality}${input}Spirv
+                ${compat_variant} "${compat_definitions}" NATIVE_RECORDING_COMPAT_INPUT_HEADER)
+            set(native_recording_spirv "${SHADER_OUTPUT_DIR}/recording_native_${compat_variant}_fixed_compute.spv")
+            set(native_recording_header "${SHADER_OUTPUT_DIR}/recording_native_${compat_variant}_fixed_compute_spv.h")
+            add_custom_command(
+                OUTPUT "${native_recording_header}"
+                BYPRODUCTS "${native_recording_spirv}"
+                COMMAND "${SPIRV_OPT}" --freeze-spec-const --fold-spec-const-op-composite
+                    --eliminate-dead-branches --eliminate-dead-functions
+                    "${SHADER_OUTPUT_DIR}/recording_native_${compat_variant}_compute.spv" -o "${native_recording_spirv}"
+                COMMAND "${SPIRV_VAL}" --target-env vulkan1.1 "${native_recording_spirv}"
+                COMMAND "${CMAKE_COMMAND}" "-DINPUT_FILE=${native_recording_spirv}" "-DOUTPUT_FILE=${native_recording_header}"
+                    "-DSYMBOL_NAME=kRecordingNativeCompat${compat_symbol}${quality}${input}Spirv" -P "${CMAKE_CURRENT_LIST_DIR}/EmbedSpirv.cmake"
+                DEPENDS "${NATIVE_RECORDING_COMPAT_INPUT_HEADER}" "${SPIRV_OPT}" "${SPIRV_VAL}"
+                    "${CMAKE_CURRENT_LIST_DIR}/EmbedSpirv.cmake"
+                VERBATIM)
+            list(APPEND PREVIEW_FAST_SHADER_HEADERS "${native_recording_header}")
+        endforeach()
     endforeach()
 endforeach()
 embed_shader_variant(preview_bilinear.comp compute kCellMeterSpirv cells_meter
@@ -832,6 +862,8 @@ set(PIPELINE_CACHE_SHADER_HEADERS
     "${PREVIEW_METER_REMOSAIC_SHADER_HEADER}"
     "${CHROMA_DENOISE_SHADER_HEADER}"
     "${VIDEO_CHROMA_SHADER_HEADER}"
+    "${STABILIZED_WARP_SHADER_HEADER}"
+    "${STABILIZED_WARP_GRID_SHADER_HEADER}"
     "${RAW_HOT_PIXELS_BUFFER_SHADER_HEADER}"
     "${RAW_HOT_PIXELS_IMAGE_SHADER_HEADER}"
     "${HISTOGRAM_SHADER_HEADER}"
@@ -906,7 +938,11 @@ add_custom_command(
         "${CMAKE_CURRENT_LIST_DIR}/GeneratePipelineCacheIdentity.cmake"
     VERBATIM)
 
-add_subdirectory(third_party/c-blosc)
+# Lossless RAW tile codec for burst and panorama frames. Always built optimized, also in debug builds.
+add_library(unspektra_raw STATIC uraw/codec.cpp uraw/codec_realtime.cpp uraw/crc32c.cpp uraw/frame.cpp
+    uraw/samples.cpp uraw/thread_pool.cpp)
+set_target_properties(unspektra_raw PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_options(unspektra_raw PRIVATE -O3 -Wall -Wextra -Wno-unused-parameter)
 
 add_library(unspektra_archive SHARED burst/RawFrameCompression.cpp burst/Panorama.cpp burst/PanoramaGpu.cpp
     burst/MultiFrameMerge.cpp NativeHost.cpp NativeDiagnostics.cpp ${PANORAMA_SHADER_HEADERS} ${MULTIFRAME_SHADER_HEADERS})
@@ -928,6 +964,8 @@ add_library(
     "${PREVIEW_METER_REMOSAIC_SHADER_HEADER}"
     "${CHROMA_DENOISE_SHADER_HEADER}"
     "${VIDEO_CHROMA_SHADER_HEADER}"
+    "${STABILIZED_WARP_SHADER_HEADER}"
+    "${STABILIZED_WARP_GRID_SHADER_HEADER}"
     "${RAW_HOT_PIXELS_BUFFER_SHADER_HEADER}"
     "${RAW_HOT_PIXELS_IMAGE_SHADER_HEADER}"
     "${HISTOGRAM_SHADER_HEADER}"
@@ -1009,7 +1047,7 @@ find_library(NATIVE_WINDOW_LIBRARY nativewindow REQUIRED)
 find_library(LOG_LIBRARY log REQUIRED)
 find_library(VULKAN_LIBRARY vulkan REQUIRED)
 find_library(JNIGRAPHICS_LIBRARY jnigraphics REQUIRED)
-target_link_libraries(unspektra_archive PRIVATE spektra_blosc "${JNIGRAPHICS_LIBRARY}" "${LOG_LIBRARY}" "${VULKAN_LIBRARY}")
+target_link_libraries(unspektra_archive PRIVATE unspektra_raw "${JNIGRAPHICS_LIBRARY}" "${LOG_LIBRARY}" "${VULKAN_LIBRARY}")
 find_library(EGL_LIBRARY EGL REQUIRED)
 find_library(GLES_LIBRARY GLESv3 REQUIRED)
 

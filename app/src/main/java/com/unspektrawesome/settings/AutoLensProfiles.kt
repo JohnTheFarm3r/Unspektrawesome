@@ -76,7 +76,14 @@ object AutoLensProfiles {
                 it.enabled && LensProfiles.available(it, cameras)
         } ?: generated.getValue(mode).firstOrNull { it.enabled }
         val photo = startup(LensProfileMode.PHOTO)
-        return LensProfiles.normalize(preferences.copy(lensProfiles = profiles,
+        // A fresh scan replaces the stored ISO ceiling of every lens it verified; normalize shares it across the lens's camera IDs.
+        val scanned = report.results.filter { it.status == LensProbeStatus.VERIFIED && it.resourcesReleased }
+            .groupBy { it.configuration.routeId }
+        val scannedLenses = SensorProfileCatalog.group(cameras).map { it.routeIds }.filter { routes -> routes.any(scanned::containsKey) }
+            .flatten().toSet() + scanned.keys
+        val measuredIso = preferences.measuredIsoMax.filterKeys { it !in scannedLenses } +
+            scanned.mapNotNull { (route, results) -> results.mapNotNull { it.isoMax }.maxOrNull()?.let { route to it } }
+        return LensProfiles.normalize(preferences.copy(lensProfiles = profiles, measuredIsoMax = measuredIso,
             autoLensDiscoveryConfigured = preferences.autoLensDiscoveryConfigured || verified.isNotEmpty(),
             activeLensProfileId = active?.id, defaultLensProfileId = photo?.id, defaultLensId = photo?.routeId,
             defaultVideoLensProfileId = startup(LensProfileMode.VIDEO)?.id), cameras)

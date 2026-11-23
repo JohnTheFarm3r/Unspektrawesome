@@ -96,7 +96,6 @@ Beyond spektrafilm, this project uses or adapts work from:
 - **[RawTherapee](https://github.com/Beep6581/RawTherapee):** the AMaZE color reconstruction for saved photos, by Emil Martinec
 - **[darktable](https://github.com/darktable-org/darktable):** the highlight recovery ("inpaint opposed") and the Shadows control
 - **[Gyroflow / telemetry-parser](https://github.com/AdrianEddy/telemetry-parser)** by AdrianEddy: the motion data format written into videos
-- **[c-blosc](https://github.com/Blosc/c-blosc)** with zstd, zlib-ng, FastLZ and bitshuffle for compression
 - **[JetBrains Mono](https://github.com/JetBrains/JetBrainsMono)** as the app's font, and **[Lucide](https://lucide.dev)** icons
 
 Credits and license notices are kept next to the code that uses them.

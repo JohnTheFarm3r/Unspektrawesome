@@ -2759,8 +2759,8 @@ class RawVulkanPreviewController(
         session.setOpticalStabilization(mutableVideoState.value.requestedOis)
         session.setExternalAutoExposure(configuredPreferences.aeEngine == AeEngine.SPEKTRA)
         session.setIsoCeilingSource { route, _ ->
-            configuredPreferences.lensProfiles.firstOrNull { it.id == key.lensProfileId }?.verification
-                ?.takeIf { it.configuration.routeId == route.routeId }?.isoMax ?: 0
+            configuredPreferences.measuredIsoMax(route.routeId,
+                configuredPreferences.lensProfiles.firstOrNull { it.id == key.lensProfileId })
         }
         session.setFaceTracking(configuredPreferences.faceFocusActive(), configuredPreferences.faceExposureActive())
         session.setInitialControls(retainedControls)

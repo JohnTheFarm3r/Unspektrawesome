@@ -128,8 +128,8 @@ data class VideoEncoding(
                     maxOf(2, video.widthAlignment), maxOf(2, video.heightAlignment)) ?: return@runCatching null
                 if (MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface !in capabilities.colorFormats ||
                     !video.areSizeAndRateSupported(size.width, size.height, frameRate)) return@runCatching null
-                // Reserve processing headroom to drain brief input backlogs at the selected frame rate.
-                val operatingRate = minOf(frameRate * 2, video.getSupportedFrameRatesFor(size.width, size.height).upper)
+                // The encoder runs at the recording rate; its input buffers absorb brief backlogs.
+                val operatingRate = minOf(frameRate, video.getSupportedFrameRatesFor(size.width, size.height).upper)
                 val level = capabilities.profileLevels
                     .filter { it.profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain }
                     .maxOfOrNull { it.level } ?: return@runCatching null

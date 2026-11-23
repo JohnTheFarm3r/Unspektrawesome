@@ -2813,8 +2813,8 @@ private:
       return false;
     }
 
-    VkDescriptorSetLayoutBinding bindings[SPEKTRA_COMPOSED_LUT_TEXTURE_BINDING + 1u]{};
-    for (uint32_t bindingIndex = 0; bindingIndex <= SPEKTRA_COMPOSED_LUT_TEXTURE_BINDING; ++bindingIndex) {
+    VkDescriptorSetLayoutBinding bindings[SPEKTRA_HANATOS_RESPONSE_TEXTURE_BINDING + 1u]{};
+    for (uint32_t bindingIndex = 0; bindingIndex <= SPEKTRA_HANATOS_RESPONSE_TEXTURE_BINDING; ++bindingIndex) {
       bindings[bindingIndex].binding = bindingIndex;
       bindings[bindingIndex].descriptorType = bindingIndex < kCoreStorageBufferBindingCount ?
         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -2823,6 +2823,7 @@ private:
     }
     bindings[SPEKTRA_FOUR_STAGE_LUT_TEXTURE_BINDING].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     bindings[SPEKTRA_COMPOSED_LUT_TEXTURE_BINDING].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[SPEKTRA_HANATOS_RESPONSE_TEXTURE_BINDING].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 
     VkDescriptorSetLayoutCreateInfo descriptorInfo{};
     descriptorInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -3901,6 +3902,10 @@ struct VulkanRenderer::Impl {
     VkImageView fourStageTextureView = VK_NULL_HANDLE;
     VkSampler fourStageTextureSampler = VK_NULL_HANDLE;
     VkDeviceSize fourStageTextureBytes = 0;
+    // GPUs without filtering for 32-bit float textures sample a half-float copy. The 32-bit
+    // tables are copied into a staging image and converted by a blit.
+    VkImage fourStageStaging = VK_NULL_HANDLE;
+    VkDeviceMemory fourStageStagingMemory = VK_NULL_HANDLE;
     bool fourStageTextureReady = false;
     uint64_t fourStageTextureGeneration = 0;
     struct ComposedLut {
@@ -4030,6 +4035,14 @@ struct VulkanRenderer::Impl {
     ScratchBuffer colorTransferKinds;
     ScratchBuffer mallettRawMatrix;
     ScratchBuffer hanatosRawResponse;
+    // The same response as a texture: scattered reads through the texture cache are much
+    // faster than buffer reads on some GPUs.
+    VkImage hanatosImage = VK_NULL_HANDLE;
+    VkDeviceMemory hanatosImageMemory = VK_NULL_HANDLE;
+    VkImageView hanatosImageView = VK_NULL_HANDLE;
+    VkSampler hanatosSampler = VK_NULL_HANDLE;
+    VkExtent2D hanatosExtent{};
+    bool hanatosImageReady = false;
     ScratchBuffer paperHanatosResponse;
     ScratchBuffer preflashPaperHanatosResponse;
     ScratchBuffer paperLogExposure;
@@ -4482,6 +4495,8 @@ struct VulkanRenderer::Impl {
   };
   bool recordVideoEffects(const VideoEffectInputs &inputs);
   void destroyFourStageTexture();
+  bool uploadHanatosTexture(const std::vector<float> &response, uint32_t rowTexels);
+  void destroyHanatosTexture();
   void destroyScratchBuffer(ScratchBuffer &scratch);
   void destroyStaticFilmResources();
   void destroyCopyFrameResources();
@@ -5071,6 +5086,7 @@ void VulkanRenderer::Impl::destroyStaticFilmResources() {
   destroyScratchBuffer(staticFilm.paperDensityCurves);
   destroyScratchBuffer(staticFilm.paperLogExposure);
   destroyScratchBuffer(staticFilm.hanatosRawResponse);
+  destroyHanatosTexture();
   destroyScratchBuffer(staticFilm.paperHanatosResponse);
   destroyScratchBuffer(staticFilm.preflashPaperHanatosResponse);
   destroyScratchBuffer(staticFilm.mallettRawMatrix);
@@ -5783,6 +5799,7 @@ bool VulkanRenderer::Impl::prepareStaticFilmResources(
     staticFilm.colorTransferKinds.buffer != VK_NULL_HANDLE &&
     staticFilm.mallettRawMatrix.buffer != VK_NULL_HANDLE &&
     staticFilm.hanatosRawResponse.buffer != VK_NULL_HANDLE &&
+    staticFilm.hanatosImageView != VK_NULL_HANDLE &&
     staticFilm.paperHanatosResponse.buffer != VK_NULL_HANDLE &&
     staticFilm.preflashPaperHanatosResponse.buffer != VK_NULL_HANDLE;
   const bool printScanResourcesCached =
@@ -6000,9 +6017,9 @@ bool VulkanRenderer::Impl::prepareStaticFilmResources(
       })) {
     return false;
   }
-  if (!coreResourcesCached && !uploadStaticBuffers({
+  if (!coreResourcesCached && (!uploadStaticBuffers({
         {&staticFilm.hanatosRawResponse, hanatosRawResponse.data(), hanatosRawResponseBytes, "Hanatos raw response"},
-      })) {
+      }) || !uploadHanatosTexture(hanatosRawResponse, needsHanatos ? hanatos.height : 0u))) {
     return false;
   }
   if (includeGrainResources &&
@@ -6182,6 +6199,10 @@ void VulkanRenderer::Impl::destroyFourStageTexture() {
   if (coreFrame.fourStageTextureView != VK_NULL_HANDLE) vkDestroyImageView(device, coreFrame.fourStageTextureView, nullptr);
   if (coreFrame.fourStageTexture != VK_NULL_HANDLE) vkDestroyImage(device, coreFrame.fourStageTexture, nullptr);
   if (coreFrame.fourStageTextureMemory != VK_NULL_HANDLE) vkFreeMemory(device, coreFrame.fourStageTextureMemory, nullptr);
+  if (coreFrame.fourStageStaging != VK_NULL_HANDLE) vkDestroyImage(device, coreFrame.fourStageStaging, nullptr);
+  if (coreFrame.fourStageStagingMemory != VK_NULL_HANDLE) vkFreeMemory(device, coreFrame.fourStageStagingMemory, nullptr);
+  coreFrame.fourStageStaging = VK_NULL_HANDLE;
+  coreFrame.fourStageStagingMemory = VK_NULL_HANDLE;
   coreFrame.fourStageTextureSampler = VK_NULL_HANDLE;
   coreFrame.fourStageTextureView = VK_NULL_HANDLE;
   coreFrame.fourStageTexture = VK_NULL_HANDLE;
@@ -6191,30 +6212,218 @@ void VulkanRenderer::Impl::destroyFourStageTexture() {
   coreFrame.fourStageTextureGeneration = 0;
 }
 
+void VulkanRenderer::Impl::destroyHanatosTexture() {
+  auto &film = staticFilm;
+  if (film.hanatosSampler != VK_NULL_HANDLE) vkDestroySampler(device, film.hanatosSampler, nullptr);
+  if (film.hanatosImageView != VK_NULL_HANDLE) vkDestroyImageView(device, film.hanatosImageView, nullptr);
+  if (film.hanatosImage != VK_NULL_HANDLE) vkDestroyImage(device, film.hanatosImage, nullptr);
+  if (film.hanatosImageMemory != VK_NULL_HANDLE) vkFreeMemory(device, film.hanatosImageMemory, nullptr);
+  film.hanatosSampler = VK_NULL_HANDLE;
+  film.hanatosImageView = VK_NULL_HANDLE;
+  film.hanatosImage = VK_NULL_HANDLE;
+  film.hanatosImageMemory = VK_NULL_HANDLE;
+  film.hanatosExtent = {};
+  film.hanatosImageReady = false;
+}
+
+// Each image row holds one row of the response table, so a table index maps to (column, row).
+bool VulkanRenderer::Impl::uploadHanatosTexture(const std::vector<float> &response, uint32_t rowTexels) {
+  auto &film = staticFilm;
+  auto fail = [&](const char *operation, VkResult result) {
+    lastError = vkError(operation, result);
+    destroyHanatosTexture();
+    return false;
+  };
+  const uint32_t texels = static_cast<uint32_t>(response.size() / 4u);
+  if (texels == 0u) return fail("Hanatos response data", VK_ERROR_INITIALIZATION_FAILED);
+  const uint32_t width = rowTexels > 0u && texels % rowTexels == 0u ? rowTexels : texels;
+  const uint32_t height = texels / width;
+  constexpr VkFormat format = VK_FORMAT_R32G32B32A32_SFLOAT;
+  if (film.hanatosImage == VK_NULL_HANDLE || film.hanatosExtent.width != width || film.hanatosExtent.height != height) {
+    destroyHanatosTexture();
+    VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = format;
+    info.extent = {width, height, 1u};
+    info.mipLevels = info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    VkResult result = vkCreateImage(device, &info, nullptr, &film.hanatosImage);
+    if (result != VK_SUCCESS) return fail("Create Hanatos response image", result);
+    VkMemoryRequirements requirements{};
+    vkGetImageMemoryRequirements(device, film.hanatosImage, &requirements);
+    const uint32_t memoryType = findMemoryTypeIndex(physicalDevice, requirements.memoryTypeBits,
+      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (memoryType == std::numeric_limits<uint32_t>::max()) return fail("Hanatos response memory type", VK_ERROR_FEATURE_NOT_PRESENT);
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = requirements.size;
+    allocation.memoryTypeIndex = memoryType;
+    result = vkAllocateMemory(device, &allocation, nullptr, &film.hanatosImageMemory);
+    if (result != VK_SUCCESS) return fail("Allocate Hanatos response image", result);
+    result = vkBindImageMemory(device, film.hanatosImage, film.hanatosImageMemory, 0);
+    if (result != VK_SUCCESS) return fail("Bind Hanatos response image", result);
+    VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view.image = film.hanatosImage;
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = format;
+    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    result = vkCreateImageView(device, &view, nullptr, &film.hanatosImageView);
+    if (result != VK_SUCCESS) return fail("Create Hanatos response view", result);
+    VkSamplerCreateInfo sampler{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sampler.magFilter = sampler.minFilter = VK_FILTER_NEAREST;
+    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sampler.addressModeU = sampler.addressModeV = sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    result = vkCreateSampler(device, &sampler, nullptr, &film.hanatosSampler);
+    if (result != VK_SUCCESS) return fail("Create Hanatos response sampler", result);
+    film.hanatosExtent = {width, height};
+  }
+
+  const VkDeviceSize bytes = static_cast<VkDeviceSize>(width) * height * 4u * sizeof(float);
+  VkBuffer staging = VK_NULL_HANDLE;
+  VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+  VkDeviceSize stagingBytes = 0;
+  VkMemoryPropertyFlags stagingFlags = 0;
+  auto releaseStaging = [&]() {
+    if (staging != VK_NULL_HANDLE) vkDestroyBuffer(device, staging, nullptr);
+    if (stagingMemory != VK_NULL_HANDLE) vkFreeMemory(device, stagingMemory, nullptr);
+  };
+  if (!createBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, staging, stagingMemory, &stagingBytes, &stagingFlags)) {
+    releaseStaging();
+    destroyHanatosTexture();
+    return false;
+  }
+  void *mapped = nullptr;
+  VkResult result = vkMapMemory(device, stagingMemory, 0, stagingBytes, 0, &mapped);
+  if (result != VK_SUCCESS) {
+    releaseStaging();
+    return fail("Map Hanatos response staging", result);
+  }
+  std::memcpy(mapped, response.data(), static_cast<size_t>(bytes));
+  if ((stagingFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == 0u) {
+    VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+    range.memory = stagingMemory;
+    range.size = VK_WHOLE_SIZE;
+    vkFlushMappedMemoryRanges(device, 1, &range);
+  }
+  vkUnmapMemory(device, stagingMemory);
+
+  VkCommandBufferAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  allocateInfo.commandPool = commandPool;
+  allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  allocateInfo.commandBufferCount = 1;
+  VkCommandBuffer commands = VK_NULL_HANDLE;
+  result = vkAllocateCommandBuffers(device, &allocateInfo, &commands);
+  if (result != VK_SUCCESS) {
+    releaseStaging();
+    return fail("Allocate Hanatos response upload", result);
+  }
+  VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  result = vkBeginCommandBuffer(commands, &begin);
+  if (result == VK_SUCCESS) {
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.srcAccessMask = film.hanatosImageReady ? VK_ACCESS_SHADER_READ_BIT : 0u;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = film.hanatosImage;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    VkBufferImageCopy copy{};
+    copy.bufferRowLength = width;
+    copy.bufferImageHeight = height;
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageExtent = {width, height, 1u};
+    vkCmdCopyBufferToImage(commands, staging, film.hanatosImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      0, 0, nullptr, 0, nullptr, 1, &barrier);
+    result = vkEndCommandBuffer(commands);
+  }
+  VkFence fence = VK_NULL_HANDLE;
+  if (result == VK_SUCCESS) {
+    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    result = vkCreateFence(device, &fenceInfo, nullptr, &fence);
+  }
+  if (result == VK_SUCCESS) {
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &commands;
+    result = backend ? backend->submit(queueIndex, submit, fence) : VK_ERROR_INITIALIZATION_FAILED;
+  }
+  if (result == VK_SUCCESS) result = vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+  if (fence != VK_NULL_HANDLE) vkDestroyFence(device, fence, nullptr);
+  vkFreeCommandBuffers(device, commandPool, 1, &commands);
+  releaseStaging();
+  if (result != VK_SUCCESS) return fail("Upload Hanatos response image", result);
+  film.hanatosImageReady = true;
+  return true;
+}
+
 bool VulkanRenderer::Impl::ensureFourStageTexture() {
   if (coreFrame.fourStageTextureView != VK_NULL_HANDLE) return true;
-  constexpr VkFormat format = VK_FORMAT_R32G32B32A32_SFLOAT;
+  constexpr VkFormat fullFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
+  constexpr VkFormat halfFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
   constexpr uint32_t size = CoreFrameResources::kFourStageLutSize;
-  constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-  VkFormatProperties properties{};
-  vkGetPhysicalDeviceFormatProperties(physicalDevice, format, &properties);
   constexpr VkFormatFeatureFlags required = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
     VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-  VkImageFormatProperties imageProperties{};
-  if (physicalDeviceProperties.limits.subTexelPrecisionBits < 8u ||
-      (properties.optimalTilingFeatures & required) != required ||
-      vkGetPhysicalDeviceImageFormatProperties(physicalDevice, format, VK_IMAGE_TYPE_3D,
-        VK_IMAGE_TILING_OPTIMAL, usage, 0, &imageProperties) != VK_SUCCESS ||
-      imageProperties.maxExtent.width < size || imageProperties.maxExtent.height < size ||
-      imageProperties.maxExtent.depth < size * 4u) {
+  const auto supports = [&](VkFormat candidate, VkFormatFeatureFlags features, VkImageUsageFlags usage) {
+    VkFormatProperties properties{};
+    vkGetPhysicalDeviceFormatProperties(physicalDevice, candidate, &properties);
+    VkImageFormatProperties imageProperties{};
+    return (properties.optimalTilingFeatures & features) == features &&
+      vkGetPhysicalDeviceImageFormatProperties(physicalDevice, candidate, VK_IMAGE_TYPE_3D,
+        VK_IMAGE_TILING_OPTIMAL, usage, 0, &imageProperties) == VK_SUCCESS &&
+      imageProperties.maxExtent.width >= size && imageProperties.maxExtent.height >= size &&
+      imageProperties.maxExtent.depth >= size * 4u;
+  };
+  const bool full = supports(fullFormat, required, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+  const bool half = !full &&
+    supports(halfFormat, required | VK_FORMAT_FEATURE_BLIT_DST_BIT, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT) &&
+    supports(fullFormat, VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT,
+      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+  if (physicalDeviceProperties.limits.subTexelPrecisionBits < 8u || (!full && !half)) {
     lastError = vkError("Filtered colour tables", VK_ERROR_FORMAT_NOT_SUPPORTED);
     return false;
   }
+  const VkFormat format = full ? fullFormat : halfFormat;
+  constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
   auto fail = [&](const char *operation, VkResult result) {
     lastError = vkError(operation, result);
     destroyFourStageTexture();
     return false;
   };
+  if (half) {
+    VkImageCreateInfo staging{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    staging.imageType = VK_IMAGE_TYPE_3D;
+    staging.format = fullFormat;
+    staging.extent = {size, size, size * 4u};
+    staging.mipLevels = staging.arrayLayers = 1;
+    staging.samples = VK_SAMPLE_COUNT_1_BIT;
+    staging.tiling = VK_IMAGE_TILING_OPTIMAL;
+    staging.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    VkResult created = vkCreateImage(device, &staging, nullptr, &coreFrame.fourStageStaging);
+    if (created != VK_SUCCESS) return fail("Create colour table staging image", created);
+    VkMemoryRequirements stagingRequirements{};
+    vkGetImageMemoryRequirements(device, coreFrame.fourStageStaging, &stagingRequirements);
+    const uint32_t stagingType = findMemoryTypeIndex(physicalDevice, stagingRequirements.memoryTypeBits,
+      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (stagingType == std::numeric_limits<uint32_t>::max()) return fail("Colour table staging memory type", VK_ERROR_FEATURE_NOT_PRESENT);
+    VkMemoryAllocateInfo stagingAllocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    stagingAllocation.allocationSize = stagingRequirements.size;
+    stagingAllocation.memoryTypeIndex = stagingType;
+    created = vkAllocateMemory(device, &stagingAllocation, nullptr, &coreFrame.fourStageStagingMemory);
+    if (created != VK_SUCCESS) return fail("Allocate colour table staging image", created);
+    created = vkBindImageMemory(device, coreFrame.fourStageStaging, coreFrame.fourStageStagingMemory, 0);
+    if (created != VK_SUCCESS) return fail("Bind colour table staging image", created);
+  }
   VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   info.imageType = VK_IMAGE_TYPE_3D;
   info.format = format;
@@ -6770,7 +6979,7 @@ bool VulkanRenderer::Impl::ensureCoreFrameResources() {
     const VkDescriptorPoolSize poolSizes[]{
       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (kCoreStorageBufferBindingCount + 8u * (backend->storageChunkCount() - 1u)) * kCoreDescriptorSetCount},
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, SPEKTRA_PREVIEW_IMAGE_BINDING_COUNT * kCoreDescriptorSetCount},
-      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2u * kCoreDescriptorSetCount}};
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3u * kCoreDescriptorSetCount}};
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -7920,6 +8129,20 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
   const uint32_t printGroupWidth = (splitPrint || previewColorLut) ? 8u : 32u;
   bool previewDevelopment = fourStageLut || (previewColorLut && previewDevelopmentAvailable &&
     std::max(sourceByteCount, pixelStorageByteCount) <= backend->storageChunkBytes());
+#if defined(__ANDROID__) && !defined(NDEBUG)
+  {
+    static std::string lastPath;
+    char pathText[256];
+    std::snprintf(pathText, sizeof(pathText),
+      "size=%dx%d external=%d optimize=%d color_lut=%d four_stage=%d texture_lut=%d compact_print=%d split_print=%d development=%d lut_texture_available=%d",
+      width, height, externalImages, previewOptimizations, previewColorLut, fourStageLut, textureLut, compactPrint,
+      splitPrint, previewDevelopment, previewLutTextureAvailable);
+    if (lastPath != pathText) {
+      lastPath = pathText;
+      __android_log_print(ANDROID_LOG_INFO, "SpektraPreviewTiming", "path %s", pathText);
+    }
+  }
+#endif
   if (previewDevelopment && !fourStageLut && !backend->preparePreviewDevelopment()) {
 #if defined(__ANDROID__)
     recordNativeDiagnostic(ANDROID_LOG_WARN, "SpektraColorLut", "Using full film development: %s", backend->lastError.c_str());
@@ -8016,6 +8239,20 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     lastError.clear();
   }
   const bool composedPreviewColor = composedPrintColor && fusedPreviewColor;
+#if defined(__ANDROID__) && !defined(NDEBUG)
+  {
+    static std::string lastFusion;
+    char fusionText[256];
+    std::snprintf(fusionText, sizeof(fusionText),
+      "size=%dx%d direct_images=%d fused_color=%d composed_print=%d composed_size=%u pre_exposure_raw=%d dir_pass=%d grain=%d print_diffusion=%d scanner=%d video_effects=%d",
+      width, height, directPreviewImages, fusedPreviewColor, composedPrintColor, composedLutSize, preExposureRawPath,
+      dirPath, grainPath, printDiffusionPath, scannerPostPath, videoEffectsRequested);
+    if (lastFusion != fusionText) {
+      lastFusion = fusionText;
+      __android_log_print(ANDROID_LOG_INFO, "SpektraPreviewTiming", "fusion %s", fusionText);
+    }
+  }
+#endif
 #if defined(__ANDROID__) && !defined(NDEBUG)
   if (composedProperty[0] != '\0' && composedProperty[0] != 'a') recordNativeDiagnostic(ANDROID_LOG_INFO,
     "SpektraCompose", "active=%d size=%u", composedPrintColor, composedLutSize);
@@ -9074,6 +9311,21 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     write.pBufferInfo = &writeBufferInfos[writeCount];
     ++writeCount;
   };
+  const VkDescriptorImageInfo hanatosTextureInfo{staticFilm.hanatosSampler, staticFilm.hanatosImageView,
+    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  auto writeHanatosTexture = [&](VkDescriptorSet set) {
+    if (writeCount >= writes.size()) {
+      writesOverflowed = true;
+      return;
+    }
+    VkWriteDescriptorSet &write = writes[writeCount++];
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = set;
+    write.dstBinding = SPEKTRA_HANATOS_RESPONSE_TEXTURE_BINDING;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &hanatosTextureInfo;
+  };
   if (params.autoExposure) {
     const VkDescriptorBufferInfo exposureSourceInfo = externalImages
       ? VkDescriptorBufferInfo{coreFrame.autoExposureSource.buffer, 0, coreFrame.autoExposureSource.capacity}
@@ -9095,6 +9347,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
   writeStorageBuffer(coreFrame.exposureDescriptorSet, 7, mallettRawMatrixBufferInfo);
   writeStorageBuffer(coreFrame.exposureDescriptorSet, 8, inputToReferenceXyzBufferInfo);
   writeStorageBuffer(coreFrame.exposureDescriptorSet, 9, hanatosRawResponseBufferInfo);
+  writeHanatosTexture(coreFrame.exposureDescriptorSet);
   writeStorageBuffer(coreFrame.exposureDescriptorSet, 30, autoExposureResultBufferInfo);
   writeStorageBuffer(coreFrame.developDescriptorSet, 0, developInputBufferInfo);
   writeStorageBuffer(coreFrame.developDescriptorSet, 1, developOutputBufferInfo);
@@ -10133,8 +10386,32 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     copy.bufferOffset = sizeof(float) * 4u * (SPEKTRA_FOUR_STAGE_LUT_METADATA_COUNT + 3u * probe * probe * probe);
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.imageExtent = {size, size, size * 4u};
-    vkCmdCopyBufferToImage(commandBuffer, coreFrame.fourStageLut.buffer, coreFrame.fourStageTexture,
-      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    if (coreFrame.fourStageStaging != VK_NULL_HANDLE) {
+      // Copy the 32-bit tables, then convert them into the filterable half-float texture.
+      VkImageMemoryBarrier staging = imageBarrier;
+      staging.srcAccessMask = 0u;
+      staging.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      staging.image = coreFrame.fourStageStaging;
+      vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &staging);
+      vkCmdCopyBufferToImage(commandBuffer, coreFrame.fourStageLut.buffer, coreFrame.fourStageStaging,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+      staging.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      staging.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      staging.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+      staging.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &staging);
+      VkImageBlit blit{};
+      blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      blit.srcOffsets[1] = blit.dstOffsets[1] = {static_cast<int32_t>(size), static_cast<int32_t>(size),
+        static_cast<int32_t>(size * 4u)};
+      vkCmdBlitImage(commandBuffer, coreFrame.fourStageStaging, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        coreFrame.fourStageTexture, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+    } else {
+      vkCmdCopyBufferToImage(commandBuffer, coreFrame.fourStageLut.buffer, coreFrame.fourStageTexture,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    }
     imageBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     imageBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     imageBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -11413,7 +11690,7 @@ bool VulkanRenderer::Impl::computeHalationBoostMilestone(
       frameFloatsBufferInfo.offset = 0;
       frameFloatsBufferInfo.range = coreFrame.frameFloats.capacity;
 
-      std::array<VkWriteDescriptorSet, 20> writes{};
+      std::array<VkWriteDescriptorSet, 21> writes{};
       uint32_t writeCount = 0;
       auto writeStorageBuffer = [&](VkDescriptorSet set, uint32_t binding, const VkDescriptorBufferInfo &bufferInfo) {
         VkWriteDescriptorSet &write = writes[writeCount++];
@@ -11434,6 +11711,17 @@ bool VulkanRenderer::Impl::computeHalationBoostMilestone(
       writeStorageBuffer(coreFrame.exposureDescriptorSet, 7, mallettRawMatrixBufferInfo);
       writeStorageBuffer(coreFrame.exposureDescriptorSet, 8, inputToReferenceXyzBufferInfo);
       writeStorageBuffer(coreFrame.exposureDescriptorSet, 9, hanatosRawResponseBufferInfo);
+      const VkDescriptorImageInfo hanatosTextureInfo{staticFilm.hanatosSampler, staticFilm.hanatosImageView,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+      {
+        VkWriteDescriptorSet &write = writes[writeCount++];
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = coreFrame.exposureDescriptorSet;
+        write.dstBinding = SPEKTRA_HANATOS_RESPONSE_TEXTURE_BINDING;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &hanatosTextureInfo;
+      }
       writeStorageBuffer(coreFrame.halationDescriptorSets[10], 0, filmRawBufferInfo);
       writeStorageBuffer(coreFrame.halationDescriptorSets[10], 1, halationBoostChunksBufferInfo);
       writeStorageBuffer(coreFrame.halationDescriptorSets[10], 2, halationBoostInfoBufferInfo);
@@ -12504,7 +12792,7 @@ bool VulkanRenderer::recordAutoExposure(
     const VkDescriptorPoolSize sizes[] = {
       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kCoreStorageBufferBindingCount + 8u * (chunks - 1u)},
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, SPEKTRA_PREVIEW_IMAGE_BINDING_COUNT},
-      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2u}
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3u}
     };
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     poolInfo.maxSets = 1;

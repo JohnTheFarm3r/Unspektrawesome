@@ -28,7 +28,9 @@ internal class BurstRecorder(context: Context, private val onWindowClosed: () ->
     private val onSaved: (Result<Uri>) -> Unit) : AutoCloseable {
     private val context = context.applicationContext
     private val worker = Executors.newSingleThreadScheduledExecutor { Thread(it, "burst-frames") }
+    // Waiting frames are only copied, so two copy threads are plenty.
     private val encoders = Executors.newFixedThreadPool(2) { Thread(it, "burst-encode") }
+    // Saved frames are compressed on at most two cores so a save does not heat the phone or slow the viewfinder.
     private val compressors = Executors.newFixedThreadPool(2) { Thread(it, "burst-compress") }
     private val inputLock = Any()
     private val writer = Executors.newSingleThreadExecutor { Thread(it, "burst-storage") }
@@ -52,15 +54,19 @@ internal class BurstRecorder(context: Context, private val onWindowClosed: () ->
     @Volatile private var seconds = 1
     @Volatile private var plannedSeconds = 0
     @Volatile private var frameBytes = 0L
-    @Volatile private var averageFrameBytes = 0L
     @Volatile private var memory = BurstMemoryPlan(0, 0, true)
+    // Compressed size as a fraction of the 16-bit samples, learned from encoded frames.
+    @Volatile private var compressedRatio = 0.55
+    @Volatile private var sampleBytes = 0L
+    private var plannedCompressedBytes = 0L
     private val buffers = BurstBufferPool(0)
+    private val statistics = Statistics()
     val work: BurstBufferWork get() = BurstBufferWork(copiedFrames.get(), compressedFrames.get(), allocated.get() + buffers.allocatedBytes)
 
     fun configureHistory(value: Int) {
         if (closed || seconds == value.coerceIn(1, BurstMemoryPlan.MAX_SECONDS)) return
         seconds = value.coerceIn(1, BurstMemoryPlan.MAX_SECONDS)
-        if (frameBytes > 0) updateMemory(frameBytes)
+        if (frameBytes > 0) updateMemory(frameBytes, sampleBytes)
         synchronized(inputLock) {
             if (!closed) worker.execute {
                 trimHistory()
@@ -80,25 +86,38 @@ internal class BurstRecorder(context: Context, private val onWindowClosed: () ->
         }
     }
 
-    private fun updateMemory(bytes: Long) = synchronized(memoryLock) {
-        if (bytes == frameBytes && seconds == plannedSeconds) return@synchronized
+    private fun compressedEstimate() = (sampleBytes * compressedRatio).toLong().coerceAtLeast(1)
+
+    private fun learnCompression(encodedBytes: Long) {
+        if (sampleBytes <= 0) return
+        compressedRatio = (compressedRatio * 0.8 + encodedBytes.toDouble() / sampleBytes * 0.2).coerceIn(0.05, 1.0)
+    }
+
+    private fun updateMemory(bytes: Long, samples: Long) = synchronized(memoryLock) {
+        if (samples != sampleBytes) { sampleBytes = samples; compressedRatio = 0.55 }
+        val compressed = compressedEstimate()
+        val drifted = kotlin.math.abs(compressed - plannedCompressedBytes) > plannedCompressedBytes / 10
+        if (bytes == frameBytes && seconds == plannedSeconds && !drifted) return@synchronized
         val info = ActivityManager.MemoryInfo()
         context.getSystemService(ActivityManager::class.java).getMemoryInfo(info)
-        val plan = BurstMemoryPlan.calculate(seconds, bytes, info.availMem + allocated.get() + buffers.allocatedBytes, info.totalMem)
-        if (memory.keepPacked && !plan.keepPacked) buffers.reset()
+        val available = info.availMem + allocated.get() + buffers.allocatedBytes
+        val plan = BurstMemoryPlan.calculate(seconds, bytes, available, info.totalMem, compressed)
         memory = plan
         frameBytes = bytes
         plannedSeconds = seconds
+        plannedCompressedBytes = compressed
         buffers.resize(plan.limitBytes)
+        com.unspektrawesome.diagnostics.InternalLogRecorder.event("Burst", "plan seconds=$seconds frame_bytes=$bytes " +
+            "compressed_bytes=$compressed full_history=${plan.fullHistory} limit_mb=${plan.limitBytes / MB} history_mb=${plan.historyBytes / MB} " +
+            "available_mb=${info.availMem / MB} total_mb=${info.totalMem / MB}")
     }
 
     private fun publishMemoryState() {
         val pending = pendingSaves.get()
         val spare = memory.limitBytes - allocated.get() - buffers.inUseBytes
-        val nextFrameBytes = if (memory.keepPacked) frameBytes else averageFrameBytes
-        val full = pending >= BurstMemoryPlan.MAX_SAVES || pending > 0 && spare < nextFrameBytes * (BurstMemoryPlan.FPS + 4)
+        val full = pending >= BurstMemoryPlan.MAX_SAVES || pending > 0 && spare < frameBytes * (BurstMemoryPlan.FPS + 4)
         mutableStatus.update { it.copy(saving = pending, queueFull = full, preShutterSeconds = seconds,
-            memoryBytes = memory.limitBytes, memoryLimited = !memory.keepPacked) }
+            memoryBytes = memory.limitBytes, memoryLimited = !memory.fullHistory) }
     }
 
     fun setEnabled(enabled: Boolean) {
@@ -116,6 +135,7 @@ internal class BurstRecorder(context: Context, private val onWindowClosed: () ->
             finish()
             ring.forEach { it.close() }; ring.clear()
             buffers.reset()
+            if (inFlight.get() == 0) RawFrameCompression.releaseScratch()
             mutableStatus.update { it.copy(buffered = 0) }
         }
     }
@@ -125,6 +145,7 @@ internal class BurstRecorder(context: Context, private val onWindowClosed: () ->
         if (closed || !status.value.enabled || frame.metadata.sensorTimestampNs - lastTimestamp < 30_000_000L) return
         if (inFlight.get() >= 4) {
             mutableStatus.update { it.copy(dropped = it.dropped + 1) }
+            statistics.busy()
             return
         }
         val recipe = capture() ?: return
@@ -136,7 +157,9 @@ internal class BurstRecorder(context: Context, private val onWindowClosed: () ->
             val encodedFrame = java.util.concurrent.CompletableFuture<BurstFrame?>()
             encoders.execute {
                 try {
+                    val started = android.os.SystemClock.elapsedRealtimeNanos()
                     val retained = keepFrame(frame, recipe)
+                    statistics.kept(retained != null, android.os.SystemClock.elapsedRealtimeNanos() - started)
                     if (retained == null) mutableStatus.update { it.copy(dropped = it.dropped + 1) }
                     encodedFrame.complete(retained)
                 } catch (error: Throwable) { encodedFrame.completeExceptionally(error) }
@@ -155,8 +178,8 @@ internal class BurstRecorder(context: Context, private val onWindowClosed: () ->
                         }
                         if (encoded.timestamp >= save.anchor + SECOND || save.count >= save.maximumFrames) finish()
                     }
-                    averageFrameBytes = ringBytes / ring.size.coerceAtLeast(1)
                     mutableStatus.update { it.copy(buffered = ring.size) }
+                    statistics.report(ring.size, ringBytes, memory)
                 } catch (error: Exception) {
                     com.unspektrawesome.diagnostics.InternalLogRecorder.error("Burst", "buffer_failed", error)
                     mutableStatus.update { it.copy(message = "Unable to buffer BURST") }
@@ -171,26 +194,20 @@ internal class BurstRecorder(context: Context, private val onWindowClosed: () ->
         val format = recipe.raw.getInt(20)
         val rowBytes = when (format) { 1 -> width / 4 * 5; 2 -> width / 2 * 3; else -> width * 2 }
         val size = rowBytes.toLong() * height
-        updateMemory(size)
-        if (memory.keepPacked) {
-            val input = synchronized(memoryLock) {
-                if (allocated.get() + buffers.inUseBytes + size > memory.limitBytes) null else buffers.acquire(size.toInt())
-            } ?: return null
-            try {
-                RawFrameCompression.copy(frame.packedRawBytes, input.pixels, width, height, frame.rowStrideBytes, format)
-                copiedFrames.incrementAndGet()
-                return BurstFrame(input, recipe, rowBytes, onEncoded = {
-                    allocated.addAndGet(it)
-                    compressedFrames.incrementAndGet()
-                }, onReleased = { allocated.addAndGet(-it) })
-            } catch (error: Throwable) { input.close(); throw error }
-        }
-        val handle = RawFrameCompression.encode(frame.packedRawBytes, width, height, frame.rowStrideBytes, format, recipe.raw.getInt(64))
-        val encoded = BurstFrame(handle, recipe) { allocated.addAndGet(-it) }
-        allocated.addAndGet(encoded.bytes)
-        if (allocated.get() + buffers.inUseBytes > memory.limitBytes) { encoded.close(); return null }
-        compressedFrames.incrementAndGet()
-        return encoded
+        updateMemory(size, width.toLong() * height * 2)
+        // Waiting frames are only copied. Compressing every frame while waiting keeps several cores busy.
+        val input = synchronized(memoryLock) {
+            if (allocated.get() + buffers.inUseBytes + size > memory.limitBytes) null else buffers.acquire(size.toInt())
+        } ?: return null
+        try {
+            RawFrameCompression.copy(frame.packedRawBytes, input.pixels, width, height, frame.rowStrideBytes, format)
+            copiedFrames.incrementAndGet()
+            return BurstFrame(input, recipe, rowBytes, onEncoded = {
+                allocated.addAndGet(it)
+                learnCompression(it)
+                compressedFrames.incrementAndGet()
+            }, onReleased = { allocated.addAndGet(-it) })
+        } catch (error: Throwable) { input.close(); throw error }
     }
 
     fun capture(): Boolean = synchronized(inputLock) {
@@ -212,6 +229,9 @@ internal class BurstRecorder(context: Context, private val onWindowClosed: () ->
                 recording = save
                 previous.forEach { save.append(it.retain()) }
                 mutableStatus.update { it.copy(captured = save.count) }
+                com.unspektrawesome.diagnostics.InternalLogRecorder.event("Burst", "capture history_frames=${previous.size} " +
+                    "expected=${historySeconds * BurstMemoryPlan.FPS} history_ms=${(previous.last().timestamp - previous.first().timestamp) / 1_000_000} " +
+                    "full_history=${memory.fullHistory} pending=${pendingSaves.get()}")
                 worker.schedule({ if (recording === save) finish() }, 1500, TimeUnit.MILLISECONDS)
             } catch (error: Exception) { endWindow(); completed(Result.failure(error)) }
         }
@@ -221,6 +241,7 @@ internal class BurstRecorder(context: Context, private val onWindowClosed: () ->
     private fun finish() {
         val save = recording ?: return
         recording = null
+        com.unspektrawesome.diagnostics.InternalLogRecorder.event("Burst", "window_closed frames=${save.count} maximum=${save.maximumFrames}")
         save.finish()
         endWindow()
     }
@@ -233,7 +254,11 @@ internal class BurstRecorder(context: Context, private val onWindowClosed: () ->
     }
 
     private fun completed(result: Result<Uri>) {
-        if (pendingSaves.decrementAndGet() == 0) buffers.trimUnused(frameBytes * 4)
+        if (pendingSaves.decrementAndGet() == 0) {
+            buffers.trimUnused(frameBytes * 4)
+            // Rows are only expanded while saving, so the expansion buffers are not needed until the next save.
+            RawFrameCompression.releaseScratch()
+        }
         publishMemoryState()
         mutableStatus.update { it.copy(message = if (result.isSuccess) null else "Unable to save BURST") }
         onSaved(result)
@@ -298,6 +323,7 @@ internal class BurstRecorder(context: Context, private val onWindowClosed: () ->
             finish()
             ring.forEach { it.close() }; ring.clear()
             buffers.close()
+            compressors.execute { RawFrameCompression.releaseScratch() }
             compressors.shutdown()
             writer.execute {
                 thumbnails.execute { thumbnailRenderer?.close(); thumbnailRenderer = null }
@@ -308,5 +334,43 @@ internal class BurstRecorder(context: Context, private val onWindowClosed: () ->
         worker.shutdown()
     }
 
-    companion object { private const val SECOND = 1_000_000_000L }
+    /** Summarizes buffering every few seconds so diagnostic reports show whether frames keep up. */
+    private class Statistics {
+        private val kept = AtomicInteger()
+        private val rejected = AtomicInteger()
+        private val busy = AtomicInteger()
+        private val workNs = AtomicLong()
+        private val slowestNs = AtomicLong()
+        private var windowStart = android.os.SystemClock.elapsedRealtime()
+
+        fun kept(success: Boolean, elapsedNs: Long) {
+            (if (success) kept else rejected).incrementAndGet()
+            workNs.addAndGet(elapsedNs)
+            slowestNs.accumulateAndGet(elapsedNs, ::maxOf)
+        }
+
+        fun busy() { busy.incrementAndGet() }
+
+        fun report(buffered: Int, ringBytes: Long, plan: BurstMemoryPlan) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            val window = now - windowStart
+            if (window < 5_000) return
+            windowStart = now
+            val keptFrames = kept.getAndSet(0)
+            val rejectedFrames = rejected.getAndSet(0)
+            val busyFrames = busy.getAndSet(0)
+            val handled = (keptFrames + rejectedFrames).coerceAtLeast(1)
+            com.unspektrawesome.diagnostics.InternalLogRecorder.event("Burst", "buffer window_ms=$window " +
+                "kept_fps=${"%.1f".format(java.util.Locale.ROOT, keptFrames * 1000.0 / window)} " +
+                "memory_drops=$rejectedFrames busy_drops=$busyFrames buffered=$buffered ring_mb=${ringBytes / MB} " +
+                "history_mb=${plan.historyBytes / MB} full_history=${plan.fullHistory} " +
+                "frame_ms=${"%.1f".format(java.util.Locale.ROOT, workNs.getAndSet(0) / 1e6 / handled)} " +
+                "slowest_ms=${"%.1f".format(java.util.Locale.ROOT, slowestNs.getAndSet(0) / 1e6)}")
+        }
+    }
+
+    companion object {
+        private const val SECOND = 1_000_000_000L
+        private const val MB = 1024L * 1024
+    }
 }

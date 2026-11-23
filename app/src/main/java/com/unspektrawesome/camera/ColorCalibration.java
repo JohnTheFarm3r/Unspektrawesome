@@ -19,10 +19,26 @@ public final class ColorCalibration {
         this.colorMatrix2 = matrix(colorMatrix2);
         this.forwardMatrix1 = matrix(forwardMatrix1);
         this.forwardMatrix2 = matrix(forwardMatrix2);
-        this.calibrationMatrix1 = matrix(calibrationMatrix1);
-        this.calibrationMatrix2 = matrix(calibrationMatrix2);
+        this.calibrationMatrix1 = plausibleCalibration(matrix(calibrationMatrix1));
+        this.calibrationMatrix2 = plausibleCalibration(matrix(calibrationMatrix2));
         this.illuminant1 = illuminant1;
         this.illuminant2 = illuminant2;
+    }
+
+    /**
+     * A per-unit calibration only nudges the reference sensor by a few percent. Some cameras report
+     * transforms far from that, which contradict their own white balance and turn manual color
+     * temperatures magenta, so those are treated as no calibration.
+     */
+    private static float[] plausibleCalibration(float[] value) {
+        if (value == null) return null;
+        for (int index = 0; index < 9; index++) {
+            float entry = value[index];
+            if (!Float.isFinite(entry)) return null;
+            boolean diagonal = index / 3 == index % 3;
+            if (diagonal ? entry < 0.8f || entry > 1.25f : Math.abs(entry) > 0.1f) return null;
+        }
+        return value;
     }
 
     private static float[] matrix(float[] value) {

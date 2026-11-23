@@ -228,10 +228,14 @@ vec3 developFilmDensity(vec3 logRaw) {
 
 #if defined(SPEKTRA_FOUR_STAGE_LUT)
 #define SPEKTRA_FOUR_STAGE_LUT_BINDING 10
+#define SPEKTRA_FOUR_STAGE_HEADER_SHARED 1
 #include "SpektraFourStageLut.glsl"
 #endif
 
 void main() {
+#if defined(SPEKTRA_FOUR_STAGE_LUT)
+  loadFourStageShared();
+#endif
   const uvec2 activeGid = gl_GlobalInvocationID.xy;
   const uint activeWidth = params.activeWidth == 0u ? params.width : params.activeWidth;
   const uint activeHeight = params.activeHeight == 0u ? params.height : params.activeHeight;

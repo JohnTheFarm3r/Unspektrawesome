@@ -24,9 +24,11 @@ vec3 exposureZebra(vec4 displayed, vec2 uv)
     if (presentation.zebra.x < 0.5 || presentation.blurStrength > 0.001)
         return displayed.rgb;
     // Peaking colors must not change exposure warnings. Its input is linear RGB.
-    bool linearInput = presentation.zebra.y > 0.5;
+    bool linearInput = presentation.zebra.y > 0.5 && presentation.zebra.y < 1.5;
+    // The 10-bit recording image marks sensor clipping with alpha 1 instead of 2.
+    bool compactAlpha = presentation.zebra.y > 1.5;
     vec4 original = linearInput || presentation.zebra.w > 0.5 ? texture(exposureImage, uv) : displayed;
-    bool sensorHighlights = original.a > 1.5;
+    bool sensorHighlights = original.a > (compactAlpha ? 0.5 : 1.5);
     vec3 measured = linearInput ? original.rgb : displayed.rgb;
     if (presentation.zebra.w > 0.5 && exposureRange.black.w > 0.5) {
         vec3 range = exposureRange.white.rgb - exposureRange.black.rgb;

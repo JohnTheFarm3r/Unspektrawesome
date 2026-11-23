@@ -15,6 +15,8 @@ internal class RenderPerformanceHints(
         fun updateTarget(durationNs: Long)
         fun reportCpu(durationNs: Long)
         fun reportGpu(startedNs: Long, durationNs: Long)
+        /** Asks the system to favour efficient cores and clocks over finishing early. */
+        fun preferPowerEfficiency(enabled: Boolean) = Unit
     }
 
     private var session: Session? = null
@@ -50,6 +52,7 @@ internal class RenderPerformanceHints(
             if (!attempted) {
                 attempted = true
                 session = createSession(tid, targetDurationNs)
+                session?.preferPowerEfficiency(recording)
                 targetNs = targetDurationNs
                 acceptGpuAfterNs = clock()
                 log("session active=$active tid=$tid target_ns=$targetNs gpu=$measuresGpu recording=$recording")
@@ -136,9 +139,8 @@ internal class RenderPerformanceHints(
                 averageFrames !in 1..frameInterval) return 0
             // Averaged frames arrive consecutively and each needs one sensor frame's budget.
             val interval = if (averageFrames > 1) 1 else frameInterval
-            // Finish recording work early enough to leave room for camera and encoder scheduling spikes.
-            val margin = if (recording) .75 else 1.0
-            val duration = max(1_000_000_000.0 / sourceFrameRate, minimumFrameDurationNs.toDouble()) * interval * margin
+            // Recording frames are buffered before the encoder, so the full frame interval is the budget.
+            val duration = max(1_000_000_000.0 / sourceFrameRate, minimumFrameDurationNs.toDouble()) * interval
             return if (duration >= Long.MAX_VALUE.toDouble()) 0 else duration.roundToLong().coerceAtLeast(1)
         }
     }

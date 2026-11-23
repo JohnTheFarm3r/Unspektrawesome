@@ -1,5 +1,6 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
 
 #define UNSPEKTRA_PREVIEW_SCALAR_SHADING 1
 #define UNSPEKTRA_PREVIEW_SHADING_REUSE 1
@@ -12,7 +13,63 @@
 #endif
 
 layout(local_size_x = 8, local_size_y = 8) in;
+#ifdef UNSPEKTRA_RECORDING_COMPACT
+// Display-referred 10-bit output; the two alpha bits mark sensor clipping.
+layout(set = 0, binding = 2, rgb10_a2) uniform writeonly image2D recordingOutput;
+const float recordingClippedAlpha = 1.0;
+const float recordingAlphaBase = 0.0;
+#else
 layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D recordingOutput;
+const float recordingClippedAlpha = 1.0;
+const float recordingAlphaBase = 1.0;
+#endif
+
+#if defined(UNSPEKTRA_RAW_SHARED_TILE) && !defined(UNSPEKTRA_RAW_IMAGE_INPUT)
+// Each workgroup covers 16x16 RAW samples plus a two-sample border. Reading every sample once
+// into shared memory avoids repeating the packed buffer reads for each neighborhood. The tile
+// starts on a four-sample boundary so RAW10 groups can be decoded whole.
+const int nativeTileWidth = 24;
+const int nativeTileHeight = 20;
+shared float nativeTile[nativeTileWidth * nativeTileHeight];
+ivec2 nativeTileOrigin;
+
+void loadNativeTile(ivec2 workgroupOrigin)
+{
+    nativeTileOrigin = ivec2((workgroupOrigin.x - 2) & ~3, workgroupOrigin.y - 2);
+    ivec2 boundsEnd = frameGeometry.rawBounds.xy + frameGeometry.rawBounds.zw;
+    bool interior = all(greaterThanEqual(nativeTileOrigin, frameGeometry.rawBounds.xy)) &&
+        all(lessThanEqual(nativeTileOrigin + ivec2(nativeTileWidth, nativeTileHeight), boundsEnd));
+    if (interior && UNSPEKTRA_INPUT_FORMAT == RAW_FORMAT_10) {
+        const uint groupsPerRow = uint(nativeTileWidth / 4);
+        for (uint group = gl_LocalInvocationIndex; group < groupsPerRow * uint(nativeTileHeight); group += 64u) {
+            ivec2 local = ivec2(int(group % groupsPerRow) * 4, int(group / groupsPerRow));
+            ivec2 position = nativeTileOrigin + local;
+            uint offset = uint(position.y * rawParams.layoutInfo.x) + uint(position.x >> 2) * 5u;
+            uint low = rawInput.words[offset >> 2u];
+            uint high = rawInput.words[(offset >> 2u) + 1u];
+            uint shift = (offset & 3u) * 8u;
+            uint bytes = shift == 0u ? low : (low >> shift) | (high << (32u - shift));
+            uint lowBits = (high >> shift) & 255u;
+            int base = local.y * nativeTileWidth + local.x;
+            for (int index = 0; index < 4; ++index)
+                nativeTile[base + index] = float(((bytes >> uint(index * 8)) & 255u) * 4u +
+                    ((lowBits >> uint(index * 2)) & 3u));
+        }
+    } else {
+        for (uint index = gl_LocalInvocationIndex; index < uint(nativeTileWidth * nativeTileHeight); index += 64u) {
+            ivec2 offset = ivec2(int(index % uint(nativeTileWidth)), int(index / uint(nativeTileWidth)));
+            nativeTile[index] = float(rawInteger(nativeTileOrigin + offset));
+        }
+    }
+    barrier();
+}
+
+float nativeTileValue(ivec2 position)
+{
+    ivec2 local = position - nativeTileOrigin;
+    return nativeTile[local.y * nativeTileWidth + local.x];
+}
+#endif
 
 vec4 nativeCell(ivec2 origin, ivec4 levels)
 {
@@ -21,8 +78,13 @@ vec4 nativeCell(ivec2 origin, ivec4 levels)
         clamp(origin / 2, ivec2(0), textureSize(rawCellImage, 0) - 1), 0);
     return vec4(values[levels.x], values[levels.y], values[levels.z], values[levels.w]);
 #else
+#ifdef UNSPEKTRA_RAW_SHARED_TILE
+    vec4 values = vec4(nativeTileValue(origin), nativeTileValue(origin + ivec2(1, 0)),
+        nativeTileValue(origin + ivec2(0, 1)), nativeTileValue(origin + 1));
+#else
     vec4 values = vec4(rawInteger(origin), rawInteger(origin + ivec2(1, 0)),
         rawInteger(origin + ivec2(0, 1)), rawInteger(origin + 1));
+#endif
     vec4 black = vec4(rawParams.blackLevel[levels.x], rawParams.blackLevel[levels.y],
         rawParams.blackLevel[levels.z], rawParams.blackLevel[levels.w]);
     vec4 white = vec4(rawParams.whiteLevel[levels.x], rawParams.whiteLevel[levels.y],
@@ -62,7 +124,7 @@ void nativePixel(ivec2 source, ivec2 center, vec4 shading, float clipped,
 #endif
         vec3 processed = rawColor.reserved1.w > 0.001 || rawColor.geometryControls.x > 0.5 ? rgb :
             rawColorProcessWithShading(rgb, shading, true);
-        imageStore(recordingOutput, outputPosition, vec4(processed, 1.0 + clipped));
+        imageStore(recordingOutput, outputPosition, vec4(processed, recordingAlphaBase + recordingClippedAlpha * clipped));
     }
 }
 
@@ -72,6 +134,10 @@ void main()
     ivec2 origin = (cropOrigin & ~ivec2(1)) + ivec2(gl_GlobalInvocationID.xy) * 2;
     ivec2 source = origin - cropOrigin;
     ivec2 size = (frameGeometry.transform.x & 1) != 0 ? rawParams.dimensions.wz : rawParams.dimensions.zw;
+#if defined(UNSPEKTRA_RAW_SHARED_TILE) && !defined(UNSPEKTRA_RAW_IMAGE_INPUT)
+    // Every invocation helps load the tile before any of them can return.
+    loadNativeTile((cropOrigin & ~ivec2(1)) + ivec2(gl_WorkGroupID.xy) * 16);
+#endif
     if (any(greaterThanEqual(source, size))) return;
     ivec4 levels = ivec4(cfaLevelIndex(ivec2(0, 0)), cfaLevelIndex(ivec2(1, 0)),
         cfaLevelIndex(ivec2(0, 1)), cfaLevelIndex(ivec2(1, 1)));
@@ -96,6 +162,37 @@ void main()
     top *= cellScale;
     bottom *= cellScale;
     outer *= cellScale.wzyx;
+#ifdef UNSPEKTRA_NATIVE_PIXEL_LOOP
+    // One call site keeps a single copy of the colour processing live, which keeps the
+    // compiled program small enough to avoid spilling registers.
+    [[dont_unroll]] for (int site = 0; site < 4; ++site) {
+        float value;
+        vec4 axial, distant, corners;
+        if (site == 0) {
+            value = center.x;
+            axial = vec4(left.y, center.y, top.z, center.z);
+            distant = vec4(left.x, right.x, top.x, bottom.x);
+            corners = vec4(outer.x, top.w, left.w, center.w);
+        } else if (site == 1) {
+            value = center.y;
+            axial = vec4(center.x, right.x, top.w, center.w);
+            distant = vec4(left.y, right.y, top.y, bottom.y);
+            corners = vec4(top.z, outer.y, center.z, right.z);
+        } else if (site == 2) {
+            value = center.z;
+            axial = vec4(left.w, center.w, center.x, bottom.x);
+            distant = vec4(left.z, right.z, top.z, bottom.z);
+            corners = vec4(left.y, center.y, outer.z, bottom.y);
+        } else {
+            value = center.w;
+            axial = vec4(center.z, right.z, center.y, bottom.y);
+            distant = vec4(left.w, right.w, top.w, bottom.w);
+            corners = vec4(center.x, right.x, bottom.x, outer.w);
+        }
+        ivec2 offset = ivec2(site & 1, site >> 1);
+        nativePixel(source + offset, origin + offset, shading, clipped, value, axial, distant, corners);
+    }
+#else
     nativePixel(source, origin, shading, clipped, center.x, vec4(left.y, center.y, top.z, center.z),
         vec4(left.x, right.x, top.x, bottom.x), vec4(outer.x, top.w, left.w, center.w));
     nativePixel(source + ivec2(1, 0), origin + ivec2(1, 0), shading, clipped, center.y,
@@ -106,4 +203,5 @@ void main()
         vec4(left.y, center.y, outer.z, bottom.y));
     nativePixel(source + 1, origin + 1, shading, clipped, center.w, vec4(center.z, right.z, center.y, bottom.y),
         vec4(left.w, right.w, top.w, bottom.w), vec4(center.x, right.x, bottom.x, outer.w));
+#endif
 }

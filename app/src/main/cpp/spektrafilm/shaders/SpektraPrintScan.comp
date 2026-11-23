@@ -244,6 +244,9 @@ uint u(uint index) {
 #include "SpektraPreviewColorLut.glsl"
 #endif
 
+#if defined(SPEKTRA_FOUR_STAGE_LUT) && !defined(SPEKTRA_FOUR_STAGE_LUT_BUILD) &&     !defined(SPEKTRA_PREVIEW_LUT_BUILD) && !defined(SPEKTRA_PRINT_CONSTANTS_ONLY)
+#define SPEKTRA_FOUR_STAGE_HEADER_SHARED 1
+#endif
 #if defined(SPEKTRA_FOUR_STAGE_LUT) || defined(SPEKTRA_FOUR_STAGE_LUT_BUILD)
 #include "SpektraFourStageLut.glsl"
 #endif
@@ -1770,6 +1773,9 @@ void main() {
     : scanDensityToOutputRgbLinearY(density, 0.0, u(0u) != 1u).xyz;
   previewColorLut[table * kPreviewColorLutCount + index] = vec4(response, 0.0);
 #else
+#if defined(SPEKTRA_FOUR_STAGE_HEADER_SHARED)
+  loadFourStageShared();
+#endif
   const uvec2 activeGid = gl_GlobalInvocationID.xy;
 #if defined(SPEKTRA_PRINT_DIAGNOSTICS)
   const bool tracePixel = activeGid.x == 0u && activeGid.y == 0u;
