@@ -6,6 +6,8 @@ layout(constant_id = 0) const int BIN_SIZE = 2;
 layout(constant_id = 1) const bool IDENTITY_LEVELS = false;
 layout(constant_id = 3) const bool ALIGNED_RAW16 = false;
 layout(constant_id = 4) const bool PREVIEW_SIZED = false;
+// Output a Bayer frame 1/BIN_SIZE the sensor size for reduced recordings.
+layout(constant_id = 5) const bool REDUCED = false;
 
 #include "raw_source.glsl"
 #include "frame_geometry.glsl"
@@ -187,7 +189,23 @@ ivec2 clampSampleCoordinate(ivec2 position) {
     return clamp(position, minimum, maximum);
 }
 
+// The sensor site near position * BIN_SIZE whose Bayer colour and block colour both match the
+// reduced site, so the copy is correct for block and ordinary Bayer data alike.
+int reducedSite(int position) {
+    int start = position * BIN_SIZE;
+    for (int offset = 0; offset < 4; ++offset) {
+        int site = start + offset;
+        if ((site & 1) == (position & 1) && ((site / BIN_SIZE) & 1) == (position & 1)) return site;
+    }
+    return start;
+}
+
 uint outputSample(ivec2 position) {
+    if (REDUCED) {
+        ivec2 site = min(ivec2(reducedSite(position.x), reducedSite(position.y)), rawParams.dimensions.xy - 1);
+        int level = levelAt(position & 1, rawParams.layoutInfo.z);
+        return uint(int(encodeRawAt(site.x, site.y, level)));
+    }
     if (PREVIEW_SIZED) {
         ivec2 cropOrigin = ivec2(round(frameGeometry.sourceCrop.xy * vec2(rawParams.dimensions.xy)));
         ivec2 cropSize = ivec2(round(frameGeometry.sourceCrop.zw * vec2(rawParams.dimensions.xy)));
@@ -203,7 +221,7 @@ uint outputSample(ivec2 position) {
 void main() {
     int pairX = int(gl_GlobalInvocationID.x);
     int y = int(gl_GlobalInvocationID.y);
-    ivec2 dimensions = PREVIEW_SIZED ? rawParams.dimensions.zw : rawParams.dimensions.xy;
+    ivec2 dimensions = PREVIEW_SIZED || REDUCED ? rawParams.dimensions.zw : rawParams.dimensions.xy;
     int pairsPerRow = (dimensions.x + 1) / 2;
     if (pairX >= pairsPerRow || y >= dimensions.y) return;
     int index = (y * pairsPerRow + pairX) * 2;

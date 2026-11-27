@@ -530,7 +530,8 @@ public:
                 prepareRawImageProbe();
             } else if (step >= 38 && step <= 40) {
                 for (size_t input = 0; input < 3; ++input) for (bool identity : {false, true})
-                    prepareRemosaicPipeline(step - 36, identity, input, preview);
+                    for (int mode : preview ? std::array<int, 2>{1, 2} : std::array<int, 2>{0, 0})
+                        prepareRemosaicPipeline(step - 36, identity, input, mode);
             } else if (step >= 41 && step <= 52 && preview) {
                 prepareRawPreviewPipelines((step - 41) / 4, (step - 41) % 4);
             } else if (step == 53 && preview) {
@@ -1112,11 +1113,24 @@ public:
             const bool swapsAxes = (previewGeometry.transform[0] & 1) != 0;
             const int32_t sourceWidth = swapsAxes ? processingHeight : processingWidth;
             const int32_t sourceHeight = swapsAxes ? processingWidth : processingHeight;
+            // When a recording is at most 1/block of the sensor size, copying one matching sensor site per
+            // reduced site gives a Bayer frame at that size with a fraction of the remosaic work.
+            const int32_t remosaicBlock = rawParameters.remosaic[0];
+            const bool reducedRemosaic = videoOutput_ && !ispInput && remosaicBlock > 1 &&
+                rawParameters.remosaic[1] == rawParameters.layoutInfo[2] &&
+                rawParameters.remosaic[2] == 0 && rawParameters.remosaic[3] == 0 &&
+                previewGeometry.sourceCrop[2] * rawParameters.dimensions[0] >= sourceWidth * remosaicBlock * 0.9999f &&
+                previewGeometry.sourceCrop[3] * rawParameters.dimensions[1] >= sourceHeight * remosaicBlock * 0.9999f;
+            const int32_t pathWidth = reducedRemosaic ? rawParameters.dimensions[0] / remosaicBlock : rawParameters.dimensions[0];
+            const int32_t pathHeight = reducedRemosaic ? rawParameters.dimensions[1] / remosaicBlock : rawParameters.dimensions[1];
+            GeometryParameters processingGeometry = previewGeometry;
             const bool downsamplingRaw =
-                previewGeometry.sourceCrop[2] * rawParameters.dimensions[0] > sourceWidth * 1.0001f ||
-                previewGeometry.sourceCrop[3] * rawParameters.dimensions[1] > sourceHeight * 1.0001f;
-            // The viewfinder uses the recording programs and film step at every size.
-            const bool recordingProcessing = true;
+                previewGeometry.sourceCrop[2] * pathWidth > sourceWidth * 1.0001f ||
+                previewGeometry.sourceCrop[3] * pathHeight > sourceHeight * 1.0001f;
+            // The viewfinder uses the recording programs and film step at every size. Photo preview
+            // remosaics only the displayed area, which the recording programs cannot read, and
+            // remosaicking the full frame instead is too slow on older devices.
+            const bool recordingProcessing = videoOutput_ || rawParameters.remosaic[0] <= 1;
             // On the lightweight path, live stabilization colours the sensor area it needs with the same
             // recording programs, then moves the finished picture by the gyro correction. The filtered
             // path's single-step warp with its prefiltered input measured faster than the extra picture.
@@ -1127,8 +1141,8 @@ public:
             if (warpOverride[0] == '0') stabilizedTwoStage = false;
 #endif
             const float footprint = std::max(
-                previewGeometry.sourceCrop[2] * rawParameters.dimensions[0] / sourceWidth,
-                previewGeometry.sourceCrop[3] * rawParameters.dimensions[1] / sourceHeight);
+                previewGeometry.sourceCrop[2] * pathWidth / sourceWidth,
+                previewGeometry.sourceCrop[3] * pathHeight / sourceHeight);
             const bool recordingDownsample = recordingProcessing && downsamplingRaw;
             const bool recordingNative = recordingProcessing && !downsamplingRaw && (!stabilized || stabilizedTwoStage);
             frame.computeDescriptorsDirty |= frame.stabilizedStage.active != stabilizedTwoStage;
@@ -1150,8 +1164,8 @@ public:
             frame.recordingTile = recordingTile;
             frame.useSharedRawTile =
                 !stabilized &&
-                std::abs(previewGeometry.sourceCrop[2] * rawParameters.dimensions[0] - sourceWidth) < 0.01f &&
-                std::abs(previewGeometry.sourceCrop[3] * rawParameters.dimensions[1] - sourceHeight) < 0.01f;
+                std::abs(previewGeometry.sourceCrop[2] * pathWidth - sourceWidth) < 0.01f &&
+                std::abs(previewGeometry.sourceCrop[3] * pathHeight - sourceHeight) < 0.01f;
             frame.reusePreviewShading = optimizedRawPreview() && !ispInput;
             const bool stabilizationPrefilter = stabilized && !stabilizedTwoStage && videoOutput_ && !downsamplingRaw &&
                 !lightweightRawPreview() && frame.reusePreviewShading;
@@ -1291,7 +1305,20 @@ public:
                 timing.since(uploadStarted) * 1000.0);
 #endif
             prepareHotPixels(frame, rawParameters, hotPixelRemoval > 0.5f && !frame.bayerCells);
-            prepareRemosaic(frame, rawParameters, videoOutput_ ? nullptr : &previewGeometry);
+            prepareRemosaic(frame, rawParameters, videoOutput_ ? nullptr : &previewGeometry, reducedRemosaic);
+            if (frame.remosaic.reduced) {
+                // Later steps see the reduced frame, so sensor-pixel bounds shrink with it.
+                auto& bounds = processingGeometry.rawBounds;
+                const int32_t left = (bounds[0] + remosaicBlock - 1) / remosaicBlock;
+                const int32_t top = (bounds[1] + remosaicBlock - 1) / remosaicBlock;
+                const int32_t right = (bounds[0] + bounds[2]) / remosaicBlock;
+                const int32_t bottom = (bounds[1] + bounds[3]) / remosaicBlock;
+                bounds[0] = left;
+                bounds[1] = top;
+                bounds[2] = right - left;
+                bounds[3] = bottom - top;
+                validateRawBounds(processingGeometry, rawParameters);
+            }
             if (recordingDownsample && frame.bayerCells && !frame.cellLinearSupported) frame.textureShading = false;
             frame.useSharedRawTile &= !frame.remosaic.previewSized;
             timing.uploadMs = timing.since(uploadStarted);
@@ -1448,7 +1475,7 @@ public:
             frame.averageCount = averageCount;
             if (averageCount > 1) ensureAverageResources(frame);
             const bool averageComplete = prepareAverage(frame, averageGroup, averageIndex, averageCount,
-                averageRevision, previewGeometry, lightweightPreview);
+                averageRevision, processingGeometry, lightweightPreview);
             if (frame.videoChromaStrength > 0.001f) ensureVideoChromaResources(frame);
             int64_t workPeriodStartNs = 0;
             const double pipelineMs = frame.metrics.prepare(device_, physicalDevice_, queueFamily_,
@@ -1480,10 +1507,10 @@ public:
             }
             previewRecovery = frame.previewHighlightRecovery ? 1.0f : 0.0f;
             std::memcpy(static_cast<uint8_t*>(frame.spektraMapped) + 128, &previewRecovery, sizeof(float));
-            std::memcpy(frame.geometryMapped, &previewGeometry,
+            std::memcpy(frame.geometryMapped, &processingGeometry,
                         static_cast<size_t>(kGeometryParametersSize));
             if (frame.stabilizedStage.active)
-                prepareStabilizedStage(frame, previewGeometry, rawParameters, std::max(footprint, 1.0f), frame.recordingNative);
+                prepareStabilizedStage(frame, processingGeometry, rawParameters, std::max(footprint, 1.0f), frame.recordingNative);
             {
                 float directSdrValue = 0.0f;
                 std::memcpy(&directSdrValue, spektraParameters.data() + 64, sizeof(float));
@@ -2379,6 +2406,7 @@ private:
         uint32_t height = 0;
         bool enabled = false;
         bool previewSized = false;
+        bool reduced = false;
     };
 
     struct FocusLoupeFrame {
@@ -3474,7 +3502,7 @@ private:
         resources = {};
     }
 
-    VkPipeline prepareRemosaicPipeline(int32_t factor, bool identityLevels, size_t input, bool previewSized)
+    VkPipeline prepareRemosaicPipeline(int32_t factor, bool identityLevels, size_t input, int mode)
     {
         if (!remosaicDescriptorLayout_) {
             const std::array<VkDescriptorSetLayoutBinding, 5> bindings{{
@@ -3497,11 +3525,11 @@ private:
         const bool alignedRaw16 = input == 1;
         const int inputVariant = image ? 2 : alignedRaw16 ? 1 : 0;
         const int variant = ((factor - 2) * 2 + (identityLevels ? 1 : 0)) * 3 + inputVariant;
-        auto& pipeline = remosaicPipelines_.at(variant * 2 + (previewSized ? 1 : 0));
+        auto& pipeline = remosaicPipelines_.at(variant * 3 + mode);
         if (!pipeline) {
-            const int32_t constants[] = {factor, identityLevels ? 1 : 0, alignedRaw16 ? 1 : 0, previewSized ? 1 : 0};
-            const VkSpecializationMapEntry entries[] = {{0, 0, 4}, {1, 4, 4}, {3, 8, 4}, {4, 12, 4}};
-            const VkSpecializationInfo specialization{4, entries, sizeof(constants), constants};
+            const int32_t constants[] = {factor, identityLevels ? 1 : 0, alignedRaw16 ? 1 : 0, mode == 1 ? 1 : 0, mode == 2 ? 1 : 0};
+            const VkSpecializationMapEntry entries[] = {{0, 0, 4}, {1, 4, 4}, {3, 8, 4}, {4, 12, 4}, {5, 16, 4}};
+            const VkSpecializationInfo specialization{5, entries, sizeof(constants), constants};
             pipeline = image
                 ? createComputeProgram(kRemosaicImageSpirv.data(), kRemosaicImageSpirv.size(), &specialization, remosaicPipelineLayout_)
                 : createComputeProgram(kRemosaicBufferSpirv.data(), kRemosaicBufferSpirv.size(), &specialization, remosaicPipelineLayout_);
@@ -3509,13 +3537,15 @@ private:
         return pipeline;
     }
 
-    void prepareRemosaic(Frame& frame, RawParameters& raw, const GeometryParameters* preview = nullptr)
+    void prepareRemosaic(Frame& frame, RawParameters& raw, const GeometryParameters* preview = nullptr, bool reduced = false)
     {
         auto& resources = frame.remosaic;
         const bool enabled = raw.remosaic[0] > 1;
         frame.computeDescriptorsDirty |= resources.enabled != enabled;
         resources.enabled = enabled;
-        resources.previewSized = enabled && preview != nullptr;
+        resources.previewSized = enabled && preview != nullptr && !reduced;
+        frame.computeDescriptorsDirty |= resources.reduced != (enabled && reduced);
+        resources.reduced = enabled && reduced;
         if (!enabled) return;
         const bool previewSized = resources.previewSized;
         const bool image = !frame.hotPixels.enabled && frame.rawImportKind == RawImportKind::Image;
@@ -3527,15 +3557,18 @@ private:
                 raw.whiteLevel[i] == std::floor(raw.whiteLevel[i]);
         }
         const auto pipeline = prepareRemosaicPipeline(raw.remosaic[0], identityLevels,
-            image ? 2 : alignedRaw16 ? 1 : 0, previewSized);
+            image ? 2 : alignedRaw16 ? 1 : 0, reduced ? 2 : previewSized ? 1 : 0);
         const bool swapsAxes = previewSized && (preview->transform[0] & 1) != 0;
-        const uint32_t width = previewSized ? raw.dimensions[swapsAxes ? 3 : 2] : raw.dimensions[0];
-        const uint32_t height = previewSized ? raw.dimensions[swapsAxes ? 2 : 3] : raw.dimensions[1];
+        const uint32_t width = previewSized ? raw.dimensions[swapsAxes ? 3 : 2] :
+            reduced ? raw.dimensions[0] / raw.remosaic[0] : raw.dimensions[0];
+        const uint32_t height = previewSized ? raw.dimensions[swapsAxes ? 2 : 3] :
+            reduced ? raw.dimensions[1] / raw.remosaic[0] : raw.dimensions[1];
         const VkDeviceSize bytes = ((static_cast<VkDeviceSize>(width) * height + 1) / 2) * 4;
         if (resources.capacity < bytes) {
             destroyRawBufferResources(resources);
             resources.enabled = true;
             resources.previewSized = previewSized;
+            resources.reduced = reduced;
             makeBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                 resources.output, resources.memory, nullptr);
             resources.capacity = bytes;
@@ -3593,6 +3626,10 @@ private:
         vkUpdateDescriptorSets(device_, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
         raw.layoutInfo[0] = static_cast<int32_t>(width) * 2;
         raw.layoutInfo[1] = 0;
+        if (reduced) {
+            raw.dimensions[0] = static_cast<int32_t>(width);
+            raw.dimensions[1] = static_cast<int32_t>(height);
+        }
         raw.remosaic[0] = 1;
     }
 
@@ -9868,7 +9905,7 @@ private:
     std::array<VkPipeline, 3> previewRecoveryPipelines_{};
     std::array<VkPipeline, 1536> previewRasterPipelines_{};
     std::array<bool, 1536> previewRasterRejected_{};
-    std::array<VkPipeline, 36> remosaicPipelines_{};
+    std::array<VkPipeline, 54> remosaicPipelines_{};
     VkPipelineLayout remosaicPipelineLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout remosaicDescriptorLayout_ = VK_NULL_HANDLE;
     std::array<VkPipeline, 2> hotPixelPipelines_{};
