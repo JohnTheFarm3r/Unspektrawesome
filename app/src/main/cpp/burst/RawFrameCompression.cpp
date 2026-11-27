@@ -299,6 +299,7 @@ jbyteArray Java_com_unspektrawesome_burst_RawFrameCompression_preview(JNIEnv* en
 
 bool registerPanorama(JNIEnv* environment);
 bool registerMultiFrameMerge(JNIEnv* environment);
+bool registerDngPreview(JNIEnv* environment);
 
 extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
     JNIEnv* env = nullptr;
@@ -313,6 +314,6 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
         {"preview", "([B)[B", reinterpret_cast<void*>(Java_com_unspektrawesome_burst_RawFrameCompression_preview)},
     };
     if (!authorizeNativeHost(env) || !registerNativeMethods(env, "com/unspektrawesome/burst/RawFrameCompression", methods) ||
-        !registerPanorama(env) || !registerMultiFrameMerge(env)) return JNI_ERR;
+        !registerPanorama(env) || !registerMultiFrameMerge(env) || !registerDngPreview(env)) return JNI_ERR;
     return initializeNativeDiagnostics(vm, env) ? JNI_VERSION_1_6 : JNI_ERR;
 }

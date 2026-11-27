@@ -945,7 +945,7 @@ set_target_properties(unspektra_raw PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_options(unspektra_raw PRIVATE -O3 -Wall -Wextra -Wno-unused-parameter)
 
 add_library(unspektra_archive SHARED burst/RawFrameCompression.cpp burst/Panorama.cpp burst/PanoramaGpu.cpp
-    burst/MultiFrameMerge.cpp NativeHost.cpp NativeDiagnostics.cpp ${PANORAMA_SHADER_HEADERS} ${MULTIFRAME_SHADER_HEADERS})
+    burst/MultiFrameMerge.cpp burst/DngPreview.cpp NativeHost.cpp NativeDiagnostics.cpp ${PANORAMA_SHADER_HEADERS} ${MULTIFRAME_SHADER_HEADERS})
 target_include_directories(unspektra_archive PRIVATE "${SHADER_OUTPUT_DIR}")
 target_compile_options(unspektra_archive PRIVATE -O3 -Wno-missing-field-initializers)
 

@@ -77,6 +77,8 @@ class GalleryProcessingService : Service() {
         task.run()
     }, "UnspektrawesomeGalleryExport") }
     private val notifications by lazy { getSystemService(NotificationManager::class.java) }
+    @Volatile private var photoEstimate: PhotoProgressEstimate? = null
+    @Volatile private var largeIcon: Pair<String, android.graphics.Bitmap>? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -87,7 +89,7 @@ class GalleryProcessingService : Service() {
             if (!GalleryProcessing.state.value.running) stopSelf()
             return START_NOT_STICKY
         }
-        notifications.createNotificationChannel(NotificationChannel(CHANNEL, AppLanguage.text("Photo processing"), NotificationManager.IMPORTANCE_LOW))
+        ensureProcessingChannel(this)
         try {
             val type = if (Build.VERSION.SDK_INT >= 35) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING else ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
             startForeground(NOTIFICATION, notification(ProcessingStatus(running = true, message = "Preparing exports")), type)
@@ -111,8 +113,14 @@ class GalleryProcessingService : Service() {
         val power = getSystemService(PowerManager::class.java)
         val wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:gallery-export")
         var endMessage = "Exports finished. Review your photos in Gallery."
+        val ticker = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { Thread(it, "UnspektrawesomeExportNotice") }
         try {
             wakeLock.acquire(6 * 60 * 60 * 1000L)
+            ticker.scheduleWithFixedDelay({
+                val status = GalleryProcessing.state.value
+                if (status.running && !status.waitingForCooling && status.currentId != null && photoEstimate != null)
+                    runCatching { notifications.notify(NOTIFICATION, notification(status)) }
+            }, 500, 500, java.util.concurrent.TimeUnit.MILLISECONDS)
             val store = GalleryStore.get(this)
             fun waitUntilReady(id: String): Boolean {
                 while (true) {
@@ -206,6 +214,9 @@ class GalleryProcessingService : Service() {
                                 DeferredCaptureWriter.requireSpace(this, capture.width.toLong() * capture.height * 4)
                                 val pixels = store.readPixels(job)
                                 ImageDiagnostics.input(job.id, capture, pixels)
+                                photoEstimate = PhotoProgressEstimate(this, "gallery-${priority.name}").also {
+                                    it.begin(capture.width.toLong() * capture.height)
+                                }
                                 stage(job.id, if (capture.metadata.spektra?.enabled == true) "Processing spektrafilm" else "Processing RAW")
                                 val processor = renderer ?: (application as UnspektrawesomeApplication).shaderWarmup
                                     .takeRenderer(forExport = true).also { renderer = it }
@@ -217,6 +228,7 @@ class GalleryProcessingService : Service() {
                                     InternalLogRecorder.event("GalleryExport", "render_complete id=${job.id} diagnostic=${processor.diagnostics()}")
                                     stage(job.id, "Saving JPEG")
                                     writer.write(bitmap, capture.metadata, capturedAtMillis = capture.capturedAtMillis, captureId = job.id)
+                                        .also { photoEstimate?.finish(true) }
                                 } finally { bitmap.recycle() }
                             }
                             store.update(job.id, ExportState.EXPORTED, jpegUri = uri)
@@ -228,6 +240,7 @@ class GalleryProcessingService : Service() {
                             }
                             InternalLogRecorder.event("GalleryExport", "completed id=${job.id} recovered=${alreadySaved != null}")
                             writer.forgetCapture(job.id)
+                            photoEstimate = null
                             GalleryProcessing.state.update { it.copy(completed = it.completed + 1) }
                             true
                         }
@@ -246,6 +259,7 @@ class GalleryProcessingService : Service() {
                         endMessage = "Panorama export paused. RAWs are kept."
                         return
                     } catch (error: Exception) {
+                        photoEstimate = null
                         InternalLogRecorder.error("GalleryExport", "failed id=${job.id} attempt=$attempts stage=${GalleryProcessing.state.value.stage}", error)
                         store.update(job.id, ExportState.FAILED, error.message ?: error.javaClass.simpleName)
                         runCatching { renderer?.close() }; renderer = null
@@ -254,6 +268,7 @@ class GalleryProcessingService : Service() {
                             repeat(attempts * 20) { if (!GalleryProcessing.state.value.pauseRequested && !GalleryProcessing.cameraVisible) Thread.sleep(100) }
                         }
                     } catch (error: OutOfMemoryError) {
+                        photoEstimate = null
                         InternalLogRecorder.error("GalleryExport", "out_of_memory id=${job.id}", error)
                         store.update(job.id, ExportState.FAILED, "Not enough memory. Close other apps and retry.")
                         endMessage = "Paused because memory is low. RAWs for unfinished exports are kept."
@@ -270,6 +285,9 @@ class GalleryProcessingService : Service() {
             endMessage = "Processing paused: ${error.message.orEmpty()}"
         } finally {
             InternalLogRecorder.event("GalleryExport", "batch_finished message=$endMessage")
+            ticker.shutdownNow()
+            runCatching { ticker.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS) }
+            photoEstimate = null
             runCatching { renderer?.close() }
             if (wakeLock.isHeld) wakeLock.release()
             GalleryProcessing.state.update { it.copy(running = false, pauseRequested = false, waitingForCooling = false,
@@ -292,6 +310,9 @@ class GalleryProcessingService : Service() {
         val builder = Notification.Builder(this, CHANNEL).setSmallIcon(R.drawable.ic_gallery)
             .setContentIntent(open).setOnlyAlertOnce(true).setOngoing(true)
             .addAction(Notification.Action.Builder(null, AppLanguage.text(if (status.waitingForCooling) "Stop automatic resume" else "Pause after photo"), pause).build())
+        val fraction = if (status.total > 0)
+            ((status.completed + (photoEstimate?.fraction() ?: 0f)) / status.total).coerceIn(0f, 1f) else null
+        builder.promoteWithPercent(fraction.takeIf { detailed })
         if (status.waitingForCooling) return builder.setContentTitle(AppLanguage.text("Photo exports paused for heat"))
             .setContentText(AppLanguage.text("Will resume automatically when your phone cools"))
             .setStyle(Notification.BigTextStyle().bigText(AppLanguage.text(HEAT_PAUSE_MESSAGE)))
@@ -300,12 +321,15 @@ class GalleryProcessingService : Service() {
         val shot = status.currentId?.let { id -> GalleryStore.get(this).shots.value.firstOrNull { it.id == id } }
         if (shot != null) {
             builder.setStyle(Notification.BigTextStyle().bigText("${AppLanguage.text(status.stage)}\n${shot.lens}\n${shot.width} × ${shot.height} · ${shot.look}"))
-            android.graphics.BitmapFactory.decodeFile(GalleryStore.get(this).thumbnail(shot.id).absolutePath)?.let { builder.setLargeIcon(it) }
+            val thumbnail = largeIcon?.takeIf { it.first == shot.id }?.second
+                ?: android.graphics.BitmapFactory.decodeFile(GalleryStore.get(this).thumbnail(shot.id).absolutePath)
+                    ?.also { largeIcon = shot.id to it }
+            thumbnail?.let { builder.setLargeIcon(it) }
         }
         return builder
-            .setContentTitle(AppLanguage.format("spektrafilm · {completed} of {total} exported", mapOf("completed" to (status.completed), "total" to (status.total))))
-            .setContentText(AppLanguage.text(status.stage.ifEmpty { status.message })).setContentIntent(open)
-            .setOnlyAlertOnce(true).setOngoing(true).setProgress(status.total.coerceAtLeast(1), status.completed, status.total == 0)
+            .setContentTitle(developingTitle(status.completed, status.total))
+            .setContentText(developingStage(status.stage.ifEmpty { status.message })).setContentIntent(open)
+            .setOnlyAlertOnce(true).setOngoing(true).setProgress(PROGRESS_SCALE, ((fraction ?: 0f) * PROGRESS_SCALE).toInt(), status.total == 0)
             .build()
     }
 
@@ -322,7 +346,8 @@ class GalleryProcessingService : Service() {
     }
 
     companion object {
-        private const val CHANNEL = "gallery-processing"
+        private const val CHANNEL = PROCESSING_CHANNEL
+        private const val PROGRESS_SCALE = 1000
         private const val NOTIFICATION = 601
         private const val MAX_ATTEMPTS = 3
         internal fun validate(capture: PersistedCapture) {

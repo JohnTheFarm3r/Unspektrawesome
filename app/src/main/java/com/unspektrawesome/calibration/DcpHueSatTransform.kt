@@ -35,6 +35,10 @@ class DcpHueSatTransform private constructor(
         if (first == second) a else a * weight + number(second * 4 + entry) * (1f - weight)
     }
 
+    /** Hue, saturation and value divisions, plus 1 when values are looked up in sRGB-encoded brightness. */
+    internal val tableDimensions: IntArray get() = intArrayOf(hue, saturation, value, if (encoded) 1 else 0)
+    internal val tableValues: FloatArray get() = table
+
     fun apply(rgb: FloatArray): FloatArray = FloatArray(3).also { apply(rgb, it) }
 
     fun apply(rgb: FloatArray, output: FloatArray) {

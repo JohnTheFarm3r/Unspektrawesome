@@ -289,10 +289,13 @@ class RawVulkanPreviewController(
     )
     private val applicationContext = context.applicationContext
     private val deferredWriter = com.unspektrawesome.gallery.DeferredCaptureWriter(applicationContext)
+    private val processingNotifier = com.unspektrawesome.gallery.ImmediateProcessingNotifier(applicationContext)
+    // Two photos are saved at once. Background priority would confine saving to the slow cores while photos wait.
     private val deferredBuffers: BufferedRawCaptureQueue = BufferedRawCaptureQueue(
-        Executors.newSingleThreadExecutor { task ->
+        Executors.newFixedThreadPool(2) { task ->
             Thread({
-                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DEFAULT +
+                    android.os.Process.THREAD_PRIORITY_LESS_FAVORABLE)
                 task.run()
             }, "UnspektrawesomeRawSave")
         }, ::onDeferredBufferChanged,
@@ -2236,6 +2239,7 @@ class RawVulkanPreviewController(
         stopVideoLocked()
         InternalLogRecorder.event("Preview", "close generation=$surfaceGeneration")
         diagnosticWorker.shutdownNow()
+        processingNotifier.close()
         closed = true
         previewFrames.close()
         galleryUpdates.cancel()
@@ -2549,6 +2553,7 @@ class RawVulkanPreviewController(
         }
         InternalLogRecorder.event("ImmediateExport", "start id=${file.nameWithoutExtension}")
         InternalLogRecorder.resources("immediate_export")
+        processingNotifier.begin(waitingShots(file), "Reading original RAW")
         val saved = runCatching {
             gallery.shots.value.firstOrNull { it.id == id && it.state == com.unspektrawesome.gallery.ExportState.EXPORTED }
                 ?.jpegUri?.takeIf { uri ->
@@ -2557,6 +2562,8 @@ class RawVulkanPreviewController(
                 }?.let { return@runCatching finish(it) }
             jpegWriter.findSavedCapture(id)?.let { return@runCatching finish(it) }
             val (shot, pixels) = PersistedCapture.read(file)
+            processingNotifier.size(shot.width.toLong() * shot.height,
+                if (shot.metadata.spektra?.enabled == true) "Processing spektrafilm" else "Processing RAW")
             if (shot.saveOriginalDng) {
                 deferredWriter.save(shot, pixels, id = id, forGallery = false)
                 gallery.update(id, com.unspektrawesome.gallery.ExportState.PROCESSING)
@@ -2569,6 +2576,7 @@ class RawVulkanPreviewController(
                     shot.film, shot.shading, bitmap, shot.timeSeconds)) { currentRenderer.diagnostics() }
                 ImageDiagnostics.output(file.nameWithoutExtension, bitmap)
                 InternalLogRecorder.event("ImmediateExport", "saving_jpeg id=${file.nameWithoutExtension} diagnostic=${currentRenderer.diagnostics()}")
+                processingNotifier.stage("Saving JPEG")
                 jpegWriter.write(bitmap, shot.metadata, capturedAtMillis = shot.capturedAtMillis,
                     captureId = file.nameWithoutExtension)
             } finally { bitmap.recycle() }
@@ -2591,6 +2599,14 @@ class RawVulkanPreviewController(
                 publishCaptureErrorLocked("Export paused: $lastExportError")
             }
         }
+        processingNotifier.finish(saved.isSuccess, waitingShots(file))
+    }
+
+    /** Photos still queued for processing, not counting [current] or photos that failed and wait for a retry. */
+    private fun waitingShots(current: java.io.File): Int = synchronized(lock) {
+        captureBufferDirectory.listFiles { candidate ->
+            candidate.extension == "shot" && candidate != current && candidate !in failedExports
+        }?.size ?: 0
     }
 
     private fun bufferedShotCount(): Int =

@@ -7,7 +7,7 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
-val telemetryProtoc by configurations.creating
+val telemetryProtoc = configurations.create("telemetryProtoc")
 val protocPlatform = when {
     System.getProperty("os.name").startsWith("Windows") -> "windows-x86_64"
     System.getProperty("os.name").startsWith("Mac") -> "osx-" + if (System.getProperty("os.arch") == "aarch64") "aarch_64" else "x86_64"
@@ -88,7 +88,7 @@ abstract class NativeIdentityTask : DefaultTask() {
 android {
     namespace = "com.unspektrawesome"
     compileSdk {
-        version = release(36) {
+        version = release(37) {
             minorApiLevel = 1
         }
     }
@@ -158,8 +158,8 @@ android {
             externalNativeBuild.cmake.arguments += "-DUNSPEKTRA_VULKAN_VALIDATION=${if (vulkanValidationDir != null) "ON" else "OFF"}"
         }
         if (vulkanValidationDir != null) {
-            sourceSets.getByName(variant).jniLibs.srcDir(vulkanValidationDir.resolve("jniLibs"))
-            sourceSets.getByName(variant).assets.srcDir(vulkanValidationDir.resolve("assets"))
+            sourceSets.getByName(variant).jniLibs.directories.add(vulkanValidationDir.resolve("jniLibs").toString())
+            sourceSets.getByName(variant).assets.directories.add(vulkanValidationDir.resolve("assets").toString())
         }
     }
     buildTypes.all {
@@ -263,13 +263,12 @@ androidComponents {
 
 composeCompiler {
     includeSourceInformation = false
-    generateFunctionKeyMetaClasses = false
 }
 
 dependencies {
-    implementation("androidx.media3:media3-exoplayer:1.11.1")
-    implementation("androidx.media3:media3-ui:1.11.1")
-    implementation("androidx.exifinterface:exifinterface:1.4.2")
+    implementation(libs.androidx.media3.exoplayer)
+    implementation(libs.androidx.media3.ui)
+    implementation(libs.androidx.exifinterface)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
     implementation(platform(libs.androidx.compose.bom))
@@ -280,12 +279,12 @@ dependencies {
     implementation(libs.kotlinx.coroutines.core)
     debugImplementation(libs.androidx.compose.ui.tooling)
     testImplementation(libs.junit)
-    testImplementation("org.json:json:20250517")
+    testImplementation(libs.json)
     testImplementation(libs.kotlinx.coroutines.test)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))
-    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
-    debugImplementation("androidx.compose.ui:ui-test-manifest")
+    androidTestImplementation(libs.androidx.compose.ui.test.junit4)
+    debugImplementation(libs.androidx.compose.ui.test.manifest)
     add("qaImplementation", "androidx.compose.ui:ui-test-manifest")
 }

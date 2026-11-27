@@ -44,16 +44,27 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.graphics.nativePaint
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.nativePaint
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.nativePaint
 import androidx.compose.ui.graphics.FilterQuality
+import androidx.compose.ui.graphics.nativePaint
 import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.graphics.nativePaint
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.nativePaint
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.nativePaint
 import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.graphics.nativePaint
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.nativePaint
 import androidx.compose.ui.graphics.drawOutline
+import androidx.compose.ui.graphics.nativePaint
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.nativePaint
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.layout.LayoutCoordinates
@@ -256,12 +267,12 @@ internal class AmbientFramePainter(tint: Color = Color.Transparent) {
     private var layers = emptyList<AmbientTextureShader>()
     private val paint = androidx.compose.ui.graphics.Paint().apply {
         filterQuality = FilterQuality.Low
-        asFrameworkPaint().isDither = false
+        nativePaint.isDither = false
         val neutral = CameraColors.Muted
         val accent = CameraColors.Accent
         val visible = 1f - tint.alpha
         // Combine the card tint before dithering, avoiding an intermediate dark gradient.
-        asFrameworkPaint().colorFilter = ColorMatrixColorFilter(floatArrayOf(
+        nativePaint.colorFilter = ColorMatrixColorFilter(floatArrayOf(
             neutral.red * .265f * visible, accent.red * .018f * visible, 1f / 255f, 0f, (neutral.red * .012f * visible + tint.red * tint.alpha) * 255f - .5f,
             neutral.green * .265f * visible, accent.green * .018f * visible, 1f / 255f, 0f, (neutral.green * .012f * visible + tint.green * tint.alpha) * 255f - .5f,
             neutral.blue * .265f * visible, accent.blue * .018f * visible, 1f / 255f, 0f, (neutral.blue * .012f * visible + tint.blue * tint.alpha) * 255f - .5f,
@@ -271,7 +282,7 @@ internal class AmbientFramePainter(tint: Color = Color.Transparent) {
 
     fun draw(canvas: NativeCanvas, frame: AmbientTextures, width: Float, height: Float, seconds: Float) {
         val paint = prepare(frame, IntSize(width.roundToInt(), height.roundToInt()), seconds = seconds)
-        canvas.drawRect(0f, 0f, width, height, paint.asFrameworkPaint())
+        canvas.drawRect(0f, 0f, width, height, paint.nativePaint)
     }
 
     fun prepare(frame: AmbientTextures, viewport: IntSize, offset: Offset = Offset.Zero, seconds: Float = 0f): androidx.compose.ui.graphics.Paint {
@@ -281,7 +292,7 @@ internal class AmbientFramePainter(tint: Color = Color.Transparent) {
             val fields = layers.drop(1).fold(layers.first().shader as Shader) { combined, layer ->
                 ComposeShader(combined, layer.shader, BlendMode.PLUS)
             }
-            paint.asFrameworkPaint().shader = ComposeShader(fields, noiseShader, BlendMode.PLUS)
+            paint.nativePaint.shader = ComposeShader(fields, noiseShader, BlendMode.PLUS)
         }
         layers.forEach { it.update(viewport, offset, seconds) }
         return paint

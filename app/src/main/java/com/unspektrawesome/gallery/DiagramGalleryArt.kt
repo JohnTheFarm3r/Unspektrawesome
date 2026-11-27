@@ -384,12 +384,12 @@ internal fun GalleryNotificationStage(detailed: Boolean, status: ProcessingStatu
                 shot?.let { PhotoImage(it.jpegUri ?: it.rawUri, it.id.takeIf { _ -> it.jpegUri == null }, Modifier.fillMaxSize()) }
             }
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                if (status.total > 0) Text("spektrafilm · {completed} of {total} exported",
+                if (status.total > 1) Text("Developing photos · {completed} of {total}",
                     arguments = mapOf("completed" to status.completed, "total" to status.total), color = CameraColors.Text,
                     fontSize = 9.5.sp, lineHeight = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                else Text("spektrafilm", translate = false, color = CameraColors.Text, fontSize = 9.5.sp, lineHeight = 12.sp,
-                    fontWeight = FontWeight.SemiBold)
-                if (status.running) Text(status.stage.ifEmpty { status.message }, color = Diagram.Hint, fontSize = 8.5.sp,
+                else Text("Developing photo", color = CameraColors.Text, fontSize = 9.5.sp, lineHeight = 12.sp,
+                    fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (status.running) Text(developingStageKey(status.stage.ifEmpty { status.message }), color = Diagram.Hint, fontSize = 8.5.sp,
                     lineHeight = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 else Box(Modifier.padding(vertical = 3.dp).fillMaxWidth(.7f).height(4.dp).background(Wire, RoundedCornerShape(2.dp)))
                 Box(Modifier.fillMaxWidth().height(3.dp).background(Diagram.Border, RoundedCornerShape(2.dp))) {

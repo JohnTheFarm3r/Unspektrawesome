@@ -75,10 +75,13 @@ internal class GalleryStore private constructor(context: Context) {
     }.apply { setWriteAheadLoggingEnabled(true) }.writableDatabase
     private val mutableShots = MutableStateFlow<List<GalleryShot>>(emptyList())
     val shots = mutableShots.asStateFlow()
-    val thumbnailDirectory = File(context.filesDir, "gallery-thumbnails-v4").apply { mkdirs() }
-    private val previousThumbnailDirectory = File(context.filesDir, "gallery-thumbnails-v3")
+    // Raise the version when thumbnail rendering changes so older thumbnails are redrawn.
+    val thumbnailDirectory = File(context.filesDir, "gallery-thumbnails-v5").apply { mkdirs() }
 
     init {
+        Thread({
+            listOf("gallery-thumbnails-v3", "gallery-thumbnails-v4").forEach { File(applicationContext.filesDir, it).deleteRecursively() }
+        }, "GalleryThumbnailCleanup").apply { isDaemon = true }.start()
         database.execSQL("UPDATE shots SET state = 'WAITING', detail = 'Export interrupted. Ready to resume.' WHERE state = 'PROCESSING'")
         reload()
         mutableShots.value.filter { it.rawRetention == RawRetention.DELETING }.forEach { shot ->
@@ -173,7 +176,6 @@ internal class GalleryStore private constructor(context: Context) {
             require(this.recipe(previous.id).toJson().toString() == recipe.capture.toJson().toString())
             database.update("shots", values, "id = ?", arrayOf(recipe.id))
             thumbnail(previous.id).delete()
-            File(previousThumbnailDirectory, "${previous.id}.jpg").delete()
         }
         reload()
         return true
@@ -294,11 +296,7 @@ internal class GalleryStore private constructor(context: Context) {
                 return@synchronized file
             }
             if (shot.state == ExportState.SAVING_RAW) return@synchronized file
-            val capture = recipe(id)
-            val previous = File(previousThumbnailDirectory, "$id.jpg")
-            if (capture.color.getFloat(96) == 0f && com.unspektrawesome.vulkan.params.RawMosaic(capture.raw).blockSize == 1 && previous.isFile) {
-                previous.copyTo(file)
-            } else if (!shot.hasRaw && shot.jpegUri != null) {
+            if (!shot.hasRaw && shot.jpegUri != null) {
                 val options = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
                 resolver.openInputStream(shot.jpegUri)?.use { android.graphics.BitmapFactory.decodeStream(it, null, options) }
                 options.inJustDecodeBounds = false
@@ -307,7 +305,7 @@ internal class GalleryStore private constructor(context: Context) {
                     ?: error("Exported thumbnail is unavailable")
                 try { file.outputStream().use { check(bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, it)) } }
                 finally { bitmap.recycle() }
-            } else DeferredCaptureWriter(applicationContext).writeQueueThumbnail(capture, readPixels(shot), file)
+            } else DeferredCaptureWriter(applicationContext).writeQueueThumbnail(recipe(id), readPixels(shot), file)
         }
         file
     }

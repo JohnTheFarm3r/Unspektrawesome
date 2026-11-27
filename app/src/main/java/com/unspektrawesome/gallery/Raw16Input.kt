@@ -6,12 +6,12 @@ import java.nio.ByteBuffer
 
 /** Unpacks one row at a time, keeping full-resolution RAW copies off the Java heap. */
 internal class Raw16Input(
-    private val pixels: ByteBuffer,
-    private val width: Int,
-    private val height: Int,
-    private val stride: Int,
-    private val format: Int,
-    private val region: Rect2d = Rect2d(0, 0, width, height),
+    internal val pixels: ByteBuffer,
+    internal val width: Int,
+    internal val height: Int,
+    internal val stride: Int,
+    internal val format: Int,
+    internal val region: Rect2d = Rect2d(0, 0, width, height),
 ) : InputStream() {
     private val row = ByteArray(region.width() * 2)
     private var rowIndex = 0
