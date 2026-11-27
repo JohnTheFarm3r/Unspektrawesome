@@ -218,9 +218,13 @@ internal class ImmediateProcessingNotifier(context: Context) {
         val open = launch?.let { PendingIntent.getActivity(context, 2, it, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE) }
         val builder = Notification.Builder(context, PROCESSING_CHANNEL).setSmallIcon(R.drawable.ic_gallery)
             .setOnlyAlertOnce(true).setOngoing(true).setShowWhen(false)
-            // Android may hold back a new service notice for a few seconds; progress updates show right away.
-            .setForegroundServiceBehavior(if (immediate) Notification.FOREGROUND_SERVICE_IMMEDIATE else Notification.FOREGROUND_SERVICE_DEFAULT)
-            .apply { open?.let { setContentIntent(it) } }
+            .apply {
+                // Android 12+ may hold back a new service notice for a few seconds; progress updates show right away.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    setForegroundServiceBehavior(if (immediate) Notification.FOREGROUND_SERVICE_IMMEDIATE else Notification.FOREGROUND_SERVICE_DEFAULT)
+                }
+                open?.let { setContentIntent(it) }
+            }
         if (!progressNotificationsEnabled(context)) return builder
             .setContentTitle(AppLanguage.text("Photo processing is running"))
             .setContentText(AppLanguage.text("Open Gallery to see progress")).build()
